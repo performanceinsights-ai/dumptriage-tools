@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>dotnet-DumpTriageAgent-2b2a5c47-dcb5-4547-a582-2538a1011225</UserSecretsId>
+    <RootNamespace>DumpTriageAgent</RootNamespace>
+    <!--
+      Not net8.0-windows: the service host, watcher, policy engine, and queue
+      are all cross-platform .NET. Only Security/DpapiApiKeyProtector.cs and
+      Idle/Win32IdleTimeProvider.cs touch Windows-only APIs (DPAPI,
+      GetLastInputInfo), guarded by OperatingSystem.IsWindows() at the call
+      site — on Linux it runs headless under systemd (no tray). Keeping the TFM
+      plain net8.0 keeps it buildable/testable on any dev machine.
+    -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Http" Version="8.0.1" />
+    <PackageReference Include="Serilog.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="Serilog.Sinks.File" Version="5.0.0" />
+    <PackageReference Include="Serilog.Sinks.EventLog" Version="4.0.0" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DumpTriage.Common\DumpTriage.Common.csproj" />
+  </ItemGroup>
+
+</Project>

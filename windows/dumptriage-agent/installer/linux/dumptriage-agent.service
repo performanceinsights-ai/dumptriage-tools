@@ -1,0 +1,25 @@
+[Unit]
+Description=DumpTriage Agent (headless crash dump watcher/uploader)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/opt/dumptriage/agent/DumpTriageAgent
+Restart=on-failure
+RestartSec=10
+# Logs and the queue live under these; systemd creates them.
+StateDirectory=dumptriage
+LogsDirectory=dumptriage
+ConfigurationDirectory=dumptriage
+# The agent only reads dumps and writes its own state.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/etc/dumptriage
+# If CentralCopy is enabled, also allow its destination via a drop-in, e.g.
+#   systemctl edit dumptriage-agent  ->  [Service]\nReadWritePaths=/srv/dumps
+
+[Install]
+WantedBy=multi-user.target

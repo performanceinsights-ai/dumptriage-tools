@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>DumpTriageTray</RootNamespace>
+    <!-- TODO: add tray.ico and uncomment once branding assets exist. -->
+    <!-- <ApplicationIcon>tray.ico</ApplicationIcon> -->
+    <ApplicationVisualStyles>true</ApplicationVisualStyles>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DumpTriage.Common\DumpTriage.Common.csproj" />
+  </ItemGroup>
+
+</Project>
