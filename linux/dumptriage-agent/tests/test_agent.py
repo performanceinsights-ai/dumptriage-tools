@@ -1,6 +1,7 @@
 import json
 import lzma
 import os
+import shutil
 import struct
 import sys
 import tempfile
@@ -73,9 +74,10 @@ class PolicyTests(unittest.TestCase):
 
     def test_batching(self):
         b = {"mode": "ScheduledTimeOfDay", "scheduledTimesLocal": ["02:00"]}
-        self.assertFalse(da.should_submit_now(b, datetime(2026, 10, 7, 1, 0), None))
-        self.assertTrue(da.should_submit_now(b, datetime(2026, 10, 7, 3, 0), None))
+        self.assertFalse(da.should_submit_now(b, datetime(2026, 10, 7, 1, 0), datetime(2026, 10, 6, 3, 0)))
+        self.assertTrue(da.should_submit_now(b, datetime(2026, 10, 7, 3, 0), datetime(2026, 10, 6, 3, 0)))
         self.assertFalse(da.should_submit_now(b, datetime(2026, 10, 7, 3, 0), datetime(2026, 10, 7, 2, 30)))
+        self.assertFalse(da.should_submit_now(b, datetime(2026, 10, 7, 3, 0), None))  # no flush yet: wait for a slot
         self.assertTrue(da.should_submit_now({"mode": "Immediate"}, self.NOW, None))
 
 
@@ -83,12 +85,12 @@ class FakeUploader:
     def __init__(self, *outcomes):
         self.outcomes, self.calls = list(outcomes), []
 
-    def __call__(self, url, key, path, hostname):
-        self.calls.append((url, key, os.path.basename(path), hostname, Path(path).read_bytes()))
+    def __call__(self, url, key, path, hostname, name):
+        self.calls.append((url, key, name, hostname, Path(path).read_bytes()))
         return self.outcomes.pop(0) if self.outcomes else (da.SUCCESS, 201, None)
 
 
-class AgentTests(unittest.TestCase):
+class AgentTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.watch = self.tmp / "dumps"
@@ -110,6 +112,9 @@ class AgentTests(unittest.TestCase):
 
     def rows(self, agent):
         return {Path(r["file_path"]).name: r["state"] for r in agent.queue.db.execute("SELECT * FROM dumps")}
+
+
+class AgentTests(AgentTestBase):
 
     def test_detects_and_uploads_core_ignores_other_files(self):
         (self.watch / "core.a.1.2").write_bytes(USER_CORE)
@@ -287,3 +292,108 @@ class UploadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewFixTests(AgentTestBase):
+    """Fixes from the 2026-10-14 agent review (dumptriage-tools #4, #9, #10, #11)."""
+
+    def test_symlinks_and_hard_links_are_never_read(self):  # #4
+        secret = self.tmp / "secret-core"
+        secret.write_bytes(USER_CORE)
+        (self.watch / "core.link").symlink_to(secret)
+        os.link(secret, self.watch / "core.hard")
+        a = self.agent()
+        self.settle(a)
+        self.assertEqual(self.rows(a), {})
+        self.assertEqual(self.uploader.calls, [])
+
+    def test_directory_swapped_for_symlink_after_scan_is_refused(self):  # #4
+        sub = self.watch / "d"
+        sub.mkdir()
+        (sub / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent(policy={"mode": "AskFirst"})
+        self.settle(a)
+        self.assertEqual(self.rows(a), {"core.a.1.2": da.PENDING})
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "core.a.1.2").write_bytes(USER_CORE + b"not this one")
+        sub.rename(self.tmp / "d-moved")
+        sub.symlink_to(elsewhere)
+        with self.assertRaises(OSError):
+            da.open_dump(str(sub / "core.a.1.2"), a.roots())
+        a.queue.update(a.queue.in_state(da.PENDING)[0]["id"], state=da.QUEUED)
+        a.submit_due()
+        self.assertEqual(self.uploader.calls, [])
+        self.assertEqual(self.rows(a), {"core.a.1.2": da.QUEUED})  # transient: retried, never read through the link
+
+    def test_uploads_under_the_original_name_from_the_opened_file(self):  # #4
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent()
+        self.settle(a)
+        self.assertEqual(self.uploader.calls[0][2], "core.a.1.2")
+        self.assertEqual(self.uploader.calls[0][4], USER_CORE)
+
+    def test_central_copies_with_the_same_name_do_not_overwrite(self):  # #10
+        dest = self.tmp / "archive"
+        for n, body in ((1, USER_CORE), (2, USER_CORE + b"second")):
+            d = self.watch / f"127.0.0.1-2026-10-0{n}"
+            d.mkdir()
+            (d / "vmcore").write_bytes(body)
+        a = self.agent(centralCopy={"enabled": True, "destinationPath": str(dest), "organizeByHostname": False})
+        self.settle(a)
+        copies = sorted(p.read_bytes() for p in dest.iterdir())
+        self.assertEqual(copies, sorted([USER_CORE, USER_CORE + b"second"]))
+
+    def test_auth_failure_uses_no_retry_and_pauses_uploads(self):  # #11
+        for n in (1, 2):
+            (self.watch / f"core.a.{n}").write_bytes(USER_CORE + bytes([n]))
+        a = self.agent(FakeUploader((da.AUTH, 401, "revoked")), maxRetries=1)
+        self.settle(a)
+        self.assertEqual(len(self.uploader.calls), 1)  # the second dump isn't tried with a refused key
+        self.assertEqual(set(self.rows(a).values()), {da.QUEUED})
+        self.assertEqual({r["retry_count"] for r in a.queue.in_state(da.QUEUED)}, {0})
+        self.now += timedelta(minutes=5)
+        a.tick()
+        self.assertEqual(len(self.uploader.calls), 1)  # still paused
+        self.now += timedelta(minutes=6)
+        a.tick()
+        self.assertEqual(set(self.rows(a).values()), {da.SUBMITTED})
+
+    def test_upload_dump_maps_401_and_403_to_auth(self):  # #11
+        for status in (401, 403):
+            srv = HTTPServer(("127.0.0.1", 0), type("H", (BaseHTTPRequestHandler,), {
+                "do_POST": lambda self, s=status: (self.rfile.read(int(self.headers["Content-Length"])), self.send_response(s), self.end_headers()),
+                "log_message": lambda *a: None}))
+            t = threading.Thread(target=srv.handle_request, daemon=True)
+            t.start()
+            p = self.tmp / "f"
+            p.write_bytes(b"x")
+            self.assertEqual(da.upload_dump(f"http://127.0.0.1:{srv.server_port}", "k", str(p), None)[0], da.AUTH)
+            t.join()
+            srv.server_close()
+
+    @unittest.skipUnless(shutil.which("zstd"), "zstd not installed")
+    def test_zst_core_is_decompressed_from_the_opened_file(self):  # #4: the decompressor reads stdin, not a path
+        import subprocess
+        subprocess.run(["zstd", "-q", "-o", str(self.watch / "core.z.1.2.zst")], input=USER_CORE, check=True)
+        a = self.agent()
+        self.settle(a)
+        self.assertEqual(self.uploader.calls[0][2:5:2], ("core.z.1.2", USER_CORE))
+
+    def test_scheduled_slot_with_nothing_queued_is_still_used(self):  # #9
+        batching = {"mode": "ScheduledTimeOfDay", "scheduledTimesLocal": ["02:00"]}
+        local = lambda h: datetime(2026, 10, 7, h, 0).astimezone().astimezone(timezone.utc)
+        self.now = local(1)
+        a = self.agent(policy={"mode": "AlwaysSubmit", "batching": batching})
+        a.tick()  # first run: records now, waits for the next slot
+        self.now = local(3)
+        a.tick()  # 02:00 slot passes with nothing queued
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        self.now = local(9)
+        self.settle(a)
+        self.assertEqual(self.uploader.calls, [])  # waits for tomorrow's 02:00
+        self.assertEqual(self.rows(a), {"core.a.1.2": da.QUEUED})
+        self.now = local(9) + timedelta(hours=18)  # 03:00 the next day
+        a.tick()
+        self.assertEqual(self.rows(a), {"core.a.1.2": da.SUBMITTED})
+

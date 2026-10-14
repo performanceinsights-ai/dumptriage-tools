@@ -85,7 +85,17 @@ dumptriage-agent status               # counts per state
 `AskFirst` and rule-`Ask` dumps wait `askTimeoutSeconds`, then take `askTimeoutDefaultAction` (Skip by
 default). `NotifyOnly` dumps wait for `approve` with no timeout. Each pending dump is logged to the journal
 (`journalctl -u dumptriage-agent`) with the exact command. Transient failures retry with exponential
-backoff (30 s doubling, capped at 1 h) up to `maxRetries`; a 400, 413 or 429 is final (`Failed`).
+backoff (30 s doubling, capped at 1 h) up to `maxRetries`; a 400, 413 or 429 is final (`Failed`). A 401 or 403 means the key
+is wrong or revoked: no attempt is used up, and uploads pause for 10 minutes (store a new key with
+`set-api-key`). With `ScheduledTimeOfDay`, uploads happen only once a scheduled time has passed since the
+last flush, and a slot with nothing queued still counts, so a dump queued after it waits for the next one.
+
+A central copy never overwrites another dump's copy: if the name is taken (kdump calls every dump
+`vmcore`), the copy is named `<name>.<first 8 characters of the dump id>`.
+
+Capture folders like `/var/crash/dumptriage` are world-writable, so the agent never follows a symlink
+below a watched path and only reads regular files with a single link. A symlink planted there (to
+`/proc/kcore`, or to another user's core) is ignored rather than uploaded.
 
 ## Differences from the Windows agent
 

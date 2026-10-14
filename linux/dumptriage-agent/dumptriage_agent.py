@@ -12,6 +12,7 @@ Run it as a daemon (`run`, what the systemd unit does), or as a bounded pass
 the local queue: status, list, approve, skip, retry, set-api-key.
 """
 import argparse
+import errno
 import fnmatch
 import hashlib
 import http.client
@@ -23,6 +24,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -92,6 +94,7 @@ def detect_dump_type(header):
 
 # --- compressed cores (systemd-coredump writes .zst / .xz / .lz4) ------------
 
+# Both read the compressed stream from stdin, so they only ever see the file the agent opened.
 _DECOMPRESSORS = {".zst": ["zstd", "-dc"], ".lz4": ["lz4", "-dc"]}
 
 
@@ -100,28 +103,57 @@ def compression_of(path):
     return ext if ext in (".zst", ".lz4", ".xz") else None
 
 
-def read_header(path, compression=None, n=HEADER_BYTES):
+def read_header(f, compression=None, n=HEADER_BYTES):
+    """The first n (decompressed) bytes of the open file f."""
     if compression == ".xz":
-        with lzma.open(path, "rb") as f:
-            return f.read(n)
+        with lzma.open(f, "rb") as x:
+            return x.read(n)
     if compression:
-        proc = subprocess.Popen(_DECOMPRESSORS[compression] + [str(path)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(_DECOMPRESSORS[compression], stdin=f, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
             return proc.stdout.read(n)
         finally:
             proc.kill()
             proc.wait()
-    with open(path, "rb") as f:
-        return f.read(n)
+    return f.read(n)
 
 
-def decompress_to(path, compression, dest):
+def decompress_to(f, compression, dest):
     if compression == ".xz":
-        with lzma.open(path, "rb") as src, open(dest, "wb") as out:
+        with lzma.open(f, "rb") as src, open(dest, "wb") as out:
             shutil.copyfileobj(src, out, 1 << 20)
         return
     with open(dest, "wb") as out:
-        subprocess.run(_DECOMPRESSORS[compression] + [str(path)], stdout=out, check=True)
+        subprocess.run(_DECOMPRESSORS[compression], stdin=f, stdout=out, check=True)
+
+
+def open_dump(path, roots):
+    """Open a dump for reading without following any symlink below its watched root (#4).
+
+    Capture folders such as /var/crash/dumptriage are world-writable, and the system agent runs as
+    root: a symlink planted there (to /proc/kcore, or another user's core) must not be read, uploaded
+    or copied. Every component below the root is opened with O_NOFOLLOW, relative to its parent, so a
+    directory swapped for a symlink after the scan is refused too, and the file must be a regular file
+    with a single link. The root itself is the admin's configuration and may be a symlink."""
+    path = os.path.abspath(path)
+    root = max((r for r in roots if path.startswith(r.rstrip("/") + "/")), key=len, default=None)
+    if root is None:
+        raise OSError(errno.EPERM, "not under a watched path", path)
+    parts = os.path.relpath(path, root).split(os.sep)
+    dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = next_fd
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        os.close(fd)
+        raise OSError(errno.EPERM, "not a regular file with a single link", path)
+    return os.fdopen(fd, "rb")
 
 
 # --- config ------------------------------------------------------------------
@@ -207,13 +239,20 @@ def evaluate_policy(dump, policy, now):
 
 
 def should_submit_now(batching, now, last_flush):
-    """Timing only: whether an already-approved dump may be uploaded now."""
+    """Timing only: whether an already-approved dump may be uploaded now.
+
+    ScheduledTimeOfDay: only when a scheduled time has passed since the last flush.
+    The caller records every flush, also one with nothing to send, so a dump queued
+    after an empty slot waits for the next one (#9); with no flush recorded yet it
+    waits for the first slot rather than uploading at once."""
     mode = batching["mode"]
     if mode == "ScheduledTimeOfDay":
+        if last_flush is None:
+            return False
         for t in batching["scheduledTimesLocal"]:
             hh, mm = (int(x) for x in t.split(":")[:2])
             at = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-            if now >= at and (last_flush is None or last_flush < at):
+            if now >= at and last_flush < at:
                 return True
         return False
     if mode == "Idle":
@@ -288,18 +327,20 @@ class Queue:
 
 # --- upload ------------------------------------------------------------------
 
-SUCCESS, REJECTED, QUOTA, TRANSIENT = "success", "rejected", "quota", "transient"
+SUCCESS, REJECTED, QUOTA, AUTH, TRANSIENT = "success", "rejected", "quota", "auth", "transient"
+AUTH_BACKOFF_SECONDS = 600
 
 
-def upload_dump(base_url, api_key, path, hostname, timeout=1800):
+def upload_dump(base_url, api_key, path, hostname, name=None, timeout=1800):
     """Stream one file to POST /api/v1/dumps as multipart/form-data (same request
-    as the web uploader and the Windows agent). Returns (outcome, status, message)."""
+    as the web uploader and the Windows agent), named `name` (default: the path's
+    basename). Returns (outcome, status, message)."""
     u = urllib.parse.urlsplit(base_url)
     boundary = uuid.uuid4().hex
     pre = b""
     if hostname:
         pre += (f'--{boundary}\r\nContent-Disposition: form-data; name="hostname"\r\n\r\n{hostname}\r\n').encode()
-    name = os.path.basename(path).replace('"', "")
+    name = (name or os.path.basename(path)).replace('"', "")
     pre += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
             "Content-Type: application/octet-stream\r\n\r\n").encode()
     post = f"\r\n--{boundary}--\r\n".encode()
@@ -329,6 +370,8 @@ def upload_dump(base_url, api_key, path, hostname, timeout=1800):
         return REJECTED, 400, body
     if resp.status in (413, 429):
         return QUOTA, resp.status, body
+    if resp.status in (401, 403):
+        return AUTH, resp.status, body
     return TRANSIENT, resp.status, body
 
 
@@ -389,10 +432,11 @@ class Agent:
         settling, live = False, set()
         for path in self.candidates():
             try:
-                st = os.stat(path)
+                st = os.lstat(path)
             except OSError:
                 continue
-            if not os.path.isfile(path) or st.st_size == 0:
+            # Not a symlink, not a hard link: see open_dump (#4).
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size == 0:
                 continue
             ident = (path, st.st_size, st.st_mtime_ns)
             dump_id = hashlib.sha256(f"{path}|{st.st_ino}|{st.st_mtime_ns}".encode()).hexdigest()[:32]
@@ -417,7 +461,8 @@ class Agent:
     def accept(self, path, st, dump_id, ident):
         comp = compression_of(path)
         try:
-            dump_type = detect_dump_type(read_header(path, comp))
+            with open_dump(path, self.roots()) as f:
+                dump_type = detect_dump_type(read_header(f, comp))
         except (OSError, subprocess.SubprocessError, lzma.LZMAError) as e:
             log.debug("cannot read %s: %s", path, e)
             self.ignored.add(ident)
@@ -456,37 +501,48 @@ class Agent:
     # upload
     def submit_due(self):
         now = self.clock()
+        batching = self.cfg["policy"]["batching"]
         last = self.queue.meta("last_flush_utc")
-        last = datetime.fromisoformat(last) if last else None
-        if not should_submit_now(self.cfg["policy"]["batching"], now.astimezone(), last.astimezone() if last else None):
+        if batching["mode"] == "ScheduledTimeOfDay" and last is None:
+            self.queue.set_meta("last_flush_utc", iso(now))  # first run: wait for the next slot
             return
+        last = datetime.fromisoformat(last) if last else None
+        if not should_submit_now(batching, now.astimezone(), last.astimezone() if last else None):
+            return
+        if batching["mode"] == "ScheduledTimeOfDay":
+            self.queue.set_meta("last_flush_utc", iso(now))  # this slot is used, even if nothing is due
+        backoff = self.queue.meta("auth_backoff_until_utc")
+        if backoff and datetime.fromisoformat(backoff) > now:
+            return  # the key was just refused; don't hammer the server (#11)
         key = self.api_key()
         due = [r for r in self.queue.in_state(QUEUED) if not r["next_attempt_utc"] or datetime.fromisoformat(r["next_attempt_utc"]) <= now]
         if due and not key:
             log.error("no API key at %s; run `dumptriage-agent set-api-key`", self.config_dir / "api-key")
             return
         for r in due:
-            self.submit_one(r, key)
-        if due and self.cfg["policy"]["batching"]["mode"] == "ScheduledTimeOfDay":
-            self.queue.set_meta("last_flush_utc", iso(self.clock()))
+            if self.submit_one(r, key) == AUTH:
+                break  # the rest would be refused too
+
+    def roots(self):
+        return [os.path.abspath(os.path.expanduser(r)) for r in self.cfg["watchedPaths"]]
 
     def submit_one(self, r, key):
         self.queue.update(r["id"], state=SUBMITTING)
         spool = None
         try:
-            path = r["file_path"]
-            if not os.path.exists(path):
-                raise FileNotFoundError(path)
-            self.central_copy(r)
-            if r["compression"]:
-                spool = self.state_dir / "spool" / (r["id"] + ".core")
-                spool.parent.mkdir(parents=True, exist_ok=True)
-                decompress_to(path, r["compression"], spool)
-                # Upload under the original name minus the compression suffix.
-                named = spool.with_name(Path(path).stem)
-                os.replace(spool, named)
-                spool, path = named, str(named)
-            outcome, status, msg = self.uploader(self.cfg["apiBaseUrl"], key, path, self.hostname)
+            with open_dump(r["file_path"], self.roots()) as f:
+                self.central_copy(r, f)
+                f.seek(0)
+                if r["compression"]:
+                    spool = self.state_dir / "spool" / (r["id"] + ".core")
+                    spool.parent.mkdir(parents=True, exist_ok=True)
+                    decompress_to(f, r["compression"], spool)
+                    path, name = str(spool), Path(r["file_path"]).stem  # the original name minus the suffix
+                else:
+                    # The uploader opens this again: /proc/self/fd/N is the file already opened
+                    # (safely), whatever the path points at by now.
+                    path, name = f"/proc/self/fd/{f.fileno()}", os.path.basename(r["file_path"])
+                outcome, status, msg = self.uploader(self.cfg["apiBaseUrl"], key, path, self.hostname, name)
         except (OSError, subprocess.SubprocessError, lzma.LZMAError) as e:
             outcome, status, msg = TRANSIENT, None, str(e)
         finally:
@@ -498,6 +554,13 @@ class Agent:
         elif outcome in (REJECTED, QUOTA):
             log.warning("dump %s rejected (%s): %s", r["file_path"], status, msg)
             self.queue.update(r["id"], state=FAILED, last_error=f"{status}: {msg}")
+        elif outcome == AUTH:
+            # Not the dump's fault and no attempt used: the key is wrong, revoked or rotated.
+            log.error("upload of %s refused (%s): the API key is invalid or revoked; store a new one with "
+                      "`dumptriage-agent set-api-key`; uploads paused for %d minutes",
+                      r["file_path"], status, AUTH_BACKOFF_SECONDS // 60)
+            self.queue.update(r["id"], state=QUEUED, last_error=f"{status}: authentication failed")
+            self.queue.set_meta("auth_backoff_until_utc", iso(self.clock() + timedelta(seconds=AUTH_BACKOFF_SECONDS)))
         else:
             n = r["retry_count"] + 1
             if n >= self.cfg["maxRetries"]:
@@ -508,8 +571,9 @@ class Agent:
                 log.warning("upload of %s failed (%s: %s); retry in %ds", r["file_path"], status, msg, delay)
                 self.queue.update(r["id"], state=QUEUED, retry_count=n, last_error=msg,
                                   next_attempt_utc=iso(self.clock() + timedelta(seconds=delay)))
+        return outcome
 
-    def central_copy(self, r):
+    def central_copy(self, r, f):
         cc = self.cfg["centralCopy"]
         if not cc["enabled"] or r["central_copied_at_utc"] or not cc["destinationPath"]:
             return
@@ -518,7 +582,18 @@ class Agent:
             if cc["organizeByHostname"]:
                 dest /= socket.gethostname()
             dest.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(r["file_path"], dest / Path(r["file_path"]).name)
+            # Never over another dump's copy (kdump names every dump "vmcore", #10): the plain
+            # name if it is free, else name.<id8>, which only this dump uses (as on Windows).
+            name = Path(r["file_path"]).name
+            try:
+                out = open(dest / name, "xb")
+            except FileExistsError:
+                stem, ext = os.path.splitext(name)
+                out = open(dest / f"{stem}.{r['id'][:8]}{ext}", "wb")
+            with out:
+                shutil.copyfileobj(f, out, 1 << 20)
+            st = os.fstat(f.fileno())
+            os.utime(out.name, ns=(st.st_atime_ns, st.st_mtime_ns))
             self.queue.update(r["id"], central_copied_at_utc=iso(self.clock()), central_copy_error=None)
         except OSError as e:  # best effort: submission still proceeds
             log.warning("central copy of %s failed: %s", r["file_path"], e)
