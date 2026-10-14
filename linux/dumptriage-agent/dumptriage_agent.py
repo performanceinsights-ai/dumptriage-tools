@@ -351,6 +351,7 @@ def iso(dt):
 class Queue:
     def __init__(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.created = not Path(path).exists()  # a first run, not an upgrade (#17)
         self.db = sqlite3.connect(path, timeout=30)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
@@ -487,14 +488,19 @@ class Agent:
         self.hostname = socket.gethostname() if config["sendHostname"] else None
         self.queue.recover()
         # Files older than the agent's first run are left alone (#17): a fresh install mustn't upload
-        # every old core already lying around. An existing queue has been watching since its oldest
-        # record; files written while the agent was stopped still count.
+        # every old core already lying around. A queue that already existed (an upgrade) has seen
+        # everything in its folders, so it filters nothing; files written while the agent was stopped
+        # always count. Never later than now, in case the clock was ahead when it was recorded.
+        now = self.clock()
         since = self.queue.meta("watching_since_utc")
         if since is None:
-            oldest = self.queue.db.execute("SELECT MIN(detected_at_utc) FROM dumps").fetchone()[0]
-            since = oldest or iso(self.clock())
+            since = iso(now) if self.queue.created else iso(datetime(1970, 1, 1, tzinfo=timezone.utc))
+            self.queue.set_meta("watching_since_utc", since)
+        elif datetime.fromisoformat(since) > now:
+            since = iso(now)
             self.queue.set_meta("watching_since_utc", since)
         self.watching_since_ns = int(datetime.fromisoformat(since).timestamp()) * 1_000_000_000
+        self.logged_old = set()  # paths skipped as older than watching_since, logged once
 
     def api_key(self):
         key_file = self.config_dir / "api-key"
@@ -544,8 +550,13 @@ class Agent:
             # Not a symlink, not a hard link: see open_dump (#4).
             if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size == 0:
                 continue
-            if st.st_mtime_ns < self.watching_since_ns:
-                continue  # older than the agent's first run (#17)
+            # Older than the agent's first run (#17). ctime too: a core moved or copied in on purpose
+            # keeps its old mtime (mv, cp -p, rsync -t) but gets a new ctime.
+            if max(st.st_mtime_ns, st.st_ctime_ns) < self.watching_since_ns:
+                if path not in self.logged_old:
+                    log.info("ignoring %s: older than this agent's first run", path)
+                    self.logged_old.add(path)
+                continue
             ident = (path, st.st_size, st.st_mtime_ns)
             dump_id = hashlib.sha256(f"{path}|{st.st_ino}|{st.st_mtime_ns}".encode()).hexdigest()[:32]
             if ident in self.ignored or self.queue.known(dump_id):

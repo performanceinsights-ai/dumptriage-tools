@@ -48,8 +48,11 @@ are sniffed through the decompressor and uploaded decompressed (the backend need
 file in the state directory that is removed afterwards; `zstd` / `lz4` must be installed for those two.
 
 
-Files older than the agent's first run are left alone, so a fresh install doesn't upload every old core
-already in the watched folders; a core written while the agent was stopped is still picked up.
+Files older than the agent's first run are left alone (logged once each), so a fresh install doesn't
+upload every old core already in the watched folders. "Older" goes by the later of a file's mtime and
+ctime, so a core moved or copied in on purpose (which keeps its mtime) still counts, and so does a core
+written while the agent was stopped. An upgrade from a version without this filters nothing, since that
+agent has already seen everything in its folders.
 ## Configuration
 
 `/etc/dumptriage/config.json` (system) or `~/.config/dumptriage/config.json` (user), same model as Windows.
