@@ -588,5 +588,20 @@ class ReviewFixTests(AgentTestBase):
         self.assertNotIn("symlink", logs.output[0])
 
 
+    def test_root_that_can_be_entered_but_not_read_is_skipped_not_fatal(self):  # review of #14
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        locked.chmod(0o111)
+        try:
+            a = self.agent(watchedPaths=[str(locked), str(self.watch)])
+            with self.assertLogs("dumptriage", "ERROR") as logs:
+                self.settle(a)
+            self.assertIn("Permission denied", logs.output[0])
+            self.assertEqual(self.rows(a), {"core.a.1.2": da.SUBMITTED})  # the next root is still scanned
+        finally:
+            locked.chmod(0o755)
+
+
 if __name__ == "__main__":
     unittest.main()

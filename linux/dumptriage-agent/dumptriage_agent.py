@@ -497,11 +497,18 @@ class Agent:
         from the descriptor open_dir_safely returns and never follows a symlink, so what is listed
         is what that check accepted (#4)."""
         for root in self.roots():
+            root_fd = None
             try:
                 root_fd = open_dir_safely(root)
+                # Read access to the root itself, checked here so fwalk can't raise mid-scan.
+                os.close(os.open(".", os.O_RDONLY | os.O_DIRECTORY, dir_fd=root_fd))
             except FileNotFoundError:
+                if root_fd is not None:
+                    os.close(root_fd)
                 continue  # e.g. /var/crash before the first crash
             except OSError as e:
+                if root_fd is not None:
+                    os.close(root_fd)
                 problem = (f"its path goes through a symlink another user could have planted ({e.filename})"
                            if isinstance(e, NotWatched) else str(e))
                 if (root, problem) not in self.untrusted:
@@ -509,7 +516,7 @@ class Agent:
                     self.untrusted.add((root, problem))
                 continue
             try:
-                for dirpath, dirs, files, dir_fd in os.fwalk(".", dir_fd=root_fd):
+                for dirpath, dirs, files, dir_fd in os.fwalk(".", dir_fd=root_fd, onerror=lambda e: None):
                     if dirpath.count("/") >= 2:
                         dirs[:] = []
                     for name in files:
