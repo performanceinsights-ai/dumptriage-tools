@@ -29,3 +29,19 @@ jobs:
         with:
           dotnet-version: "8.0.x"
       - run: dotnet test windows/dumptriage-agent/tests/DumpTriage.Common.Tests
+
+  powershell-parse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every .ps1 parses
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($f in Get-ChildItem -Recurse -Filter *.ps1) {
+            $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errors)
+            if ($errors) { $failed = $true; Write-Host "$($f.FullName)"; $errors | ForEach-Object { Write-Host "  $_" } }
+          }
+          if ($failed) { exit 1 }

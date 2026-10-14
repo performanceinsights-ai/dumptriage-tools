@@ -23,20 +23,21 @@ IApiKeyProtector CreateApiKeyProtector() => OperatingSystem.IsWindows()
     ? new DpapiApiKeyProtector()
     : new FileApiKeyProtector(paths.ApiKeyPath);
 
-// Bootstrap mode: `DumpTriageAgent.exe --set-api-key <key>` (or --set-api-key-stdin) protects the key
-// with machine-scope DPAPI and writes it into config.json, then exits. This
-// lets install.ps1 provision the key without reimplementing DPAPI in
-// PowerShell — it just shells out to the already-published exe once.
-// `--set-api-key-stdin` reads the key from standard input instead, so it never
-// appears in the process command line (visible to other users and logs).
-string? plaintextApiKey = args switch
+// Bootstrap mode: `DumpTriageAgent.exe --set-api-key-stdin` reads the key from
+// standard input, protects it with machine-scope DPAPI and writes it into
+// config.json, then exits. This lets install.ps1 provision the key without
+// reimplementing DPAPI in PowerShell — it just shells out to the
+// already-published exe once. There is deliberately no form that takes the key
+// as an argument: the process command line is visible to other users and is
+// recorded by process-creation audit logs.
+if (args is ["--set-api-key", ..])
 {
-    ["--set-api-key", var key] => key,
-    ["--set-api-key-stdin"] => (await Console.In.ReadLineAsync())?.Trim(),
-    _ => null,
-};
-if (args is ["--set-api-key", _] or ["--set-api-key-stdin"])
+    Console.Error.WriteLine("--set-api-key <key> is not supported: pipe the key in with --set-api-key-stdin.");
+    return 2;
+}
+if (args is ["--set-api-key-stdin"])
 {
+    var plaintextApiKey = (await Console.In.ReadLineAsync())?.Trim();
     if (string.IsNullOrEmpty(plaintextApiKey))
     {
         Console.Error.WriteLine("No API key provided.");

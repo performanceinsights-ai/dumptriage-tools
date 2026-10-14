@@ -8,14 +8,22 @@
     Expects both projects already published (see README.md - `dotnet publish
     -c Release -r win-x64 --self-contained` for each). Copies the published
     output into place, provisions the API key via the service exe's
-    bootstrap mode (`--set-api-key`, which encrypts it with machine-scope
+    bootstrap mode (`--set-api-key-stdin`, which encrypts it with machine-scope
     DPAPI rather than writing it to config.json in plaintext), registers the
     Windows Service, and installs a logon-trigger scheduled task so the tray
     app starts for whichever user is signed in.
 
-.PARAMETER ApiKey
-    The customer's DumpTriage API key (starts with dts_). Required on first
-    install; omit on a reinstall to leave the existing key untouched.
+.PARAMETER ApiKeyFile
+    A file holding the DumpTriage API key (starts with dts_). The file is
+    deleted once the key is stored. Use this for unattended installs.
+
+.PARAMETER PromptForApiKey
+    Ask for the API key at a masked prompt. This is also what happens on a
+    first install in an interactive session when no -ApiKeyFile is given.
+    On a reinstall without either option the existing key is left untouched.
+
+    The key is never taken as a plain command-line argument: that would land
+    in PowerShell history, process-creation audit logs and transcripts.
 
 .PARAMETER AgentPublishDir
     Path to the published DumpTriageAgent output (contains DumpTriageAgent.exe).
@@ -27,13 +35,26 @@
     Where to copy both apps on this machine. Defaults to Program Files.
 #>
 param(
-    [string]$ApiKey,
+    [string]$ApiKeyFile,
+    [switch]$PromptForApiKey,
+    # Removed: kept only to fail with a clear message instead of "parameter not found".
+    [Parameter(DontShow = $true)][string]$ApiKey,
     [Parameter(Mandatory = $true)][string]$AgentPublishDir,
     [Parameter(Mandatory = $true)][string]$TrayPublishDir,
     [string]$InstallDir = "$env:ProgramFiles\DumpTriage"
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($ApiKey) {
+    throw "-ApiKey is no longer accepted: a key on the command line is saved in PowerShell history and process audit logs. Revoke that key in the portal, then use -ApiKeyFile <path> or -PromptForApiKey. Clear it from history with: Remove-Item (Get-PSReadLineOption).HistorySavePath"
+}
+if ($ApiKeyFile -and $PromptForApiKey) {
+    throw "Use either -ApiKeyFile or -PromptForApiKey, not both."
+}
+if ($ApiKeyFile -and -not (Test-Path -LiteralPath $ApiKeyFile -PathType Leaf)) {
+    throw "API key file not found: $ApiKeyFile"
+}
 
 $ServiceName = "DumpTriageAgent"
 $AgentInstallDir = Join-Path $InstallDir "Agent"
@@ -55,17 +76,35 @@ if ($existingService) {
 Copy-Item -Path (Join-Path $AgentPublishDir "*") -Destination $AgentInstallDir -Recurse -Force
 Copy-Item -Path (Join-Path $TrayPublishDir "*") -Destination $TrayInstallDir -Recurse -Force
 
-if ($ApiKey) {
+# A first install prompts unless the session can't answer (-NonInteractive, or no console).
+$canPrompt = [Environment]::UserInteractive -and
+    -not ([Environment]::GetCommandLineArgs() | Where-Object { $_ -like '-NonI*' })
+$plaintextKey = $null
+if ($ApiKeyFile) {
+    $plaintextKey = (Get-Content -LiteralPath $ApiKeyFile -Raw).Trim()
+}
+elseif ($PromptForApiKey -or (-not $existingService -and $canPrompt)) {
+    $secure = Read-Host -Prompt "DumpTriage API key (dts_...)" -AsSecureString
+    $plaintextKey = [System.Net.NetworkCredential]::new("", $secure).Password.Trim()
+}
+
+if ($plaintextKey) {
     Write-Host "Provisioning API key..."
     # Via stdin, not argv: a command-line argument is visible to every user
     # on the machine (process listing) and can end up in audit logs.
-    $ApiKey | & $AgentExe --set-api-key-stdin
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to provision API key (exit code $LASTEXITCODE)"
+    $plaintextKey | & $AgentExe --set-api-key-stdin
+    $exit = $LASTEXITCODE
+    $plaintextKey = $null
+    if ($exit -ne 0) {
+        throw "Failed to provision API key (exit code $exit)"
+    }
+    if ($ApiKeyFile) {
+        Remove-Item -LiteralPath $ApiKeyFile -Force
+        Write-Host "Removed $ApiKeyFile now that the key is stored."
     }
 }
 elseif (-not $existingService) {
-    Write-Warning "No -ApiKey supplied on first install. Run '<key> | $AgentExe --set-api-key-stdin' before starting the service, or the agent will fail to submit dumps."
+    Write-Warning "No API key provided on first install. Re-run with -PromptForApiKey or -ApiKeyFile <path> before the agent can submit dumps."
 }
 
 if ($existingService) {
