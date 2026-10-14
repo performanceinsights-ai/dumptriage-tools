@@ -603,5 +603,34 @@ class ReviewFixTests(AgentTestBase):
             locked.chmod(0o755)
 
 
+    def test_cores_older_than_the_first_run_are_left_alone(self):  # #17
+        (self.watch / "core.old.1.2").write_bytes(USER_CORE)
+        self.now = datetime.now(timezone.utc) + timedelta(hours=1)  # first run after the core was written
+        a = self.agent()
+        with self.assertLogs("dumptriage", "INFO") as logs:
+            self.settle(a)
+        self.assertEqual(self.rows(a), {})
+        self.assertEqual(sum("older than this agent's first run" in line for line in logs.output), 1)  # once
+
+    def test_a_core_copied_in_with_its_old_mtime_still_counts(self):  # #17: ctime, not just mtime
+        self.now = datetime.now(timezone.utc) - timedelta(hours=1)  # the agent first ran an hour ago
+        a = self.agent()
+        core = self.watch / "core.copied.1.2"
+        core.write_bytes(USER_CORE)
+        os.utime(core, (0, 0))  # cp -p / rsync -t keep a 1970 mtime; the ctime is now
+        self.settle(a)
+        self.assertEqual(self.rows(a), {"core.copied.1.2": da.SUBMITTED})
+
+    def test_an_upgraded_queue_filters_nothing_and_a_future_start_is_capped(self):  # #17
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent()
+        a.queue.db.execute("DELETE FROM meta WHERE k = 'watching_since_utc'")  # as before this version
+        a.queue.db.commit()
+        b = self.agent()  # the queue file exists: an upgrade
+        self.assertTrue(b.queue.meta("watching_since_utc").startswith("1970-01-01"))
+        b.queue.set_meta("watching_since_utc", da.iso(self.now + timedelta(days=365)))  # clock was ahead
+        c = self.agent()
+        self.assertEqual(c.queue.meta("watching_since_utc"), da.iso(self.now))
+
 if __name__ == "__main__":
     unittest.main()
