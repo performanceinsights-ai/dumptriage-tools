@@ -19,6 +19,29 @@ var configPath = paths.ConfigPath;
 var dbPath = paths.DbPath;
 var logDir = paths.LogDir;
 
+// Before anything reads or writes the data folder, in every mode (service and --set-api-key-stdin):
+// it must be ours and readable by SYSTEM and Administrators only (#3).
+if (OperatingSystem.IsWindows())
+{
+    try
+    {
+        DataDirectoryGuard.Secure(Path.GetDirectoryName(configPath)!);
+    }
+    catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or System.Security.SecurityException)
+    {
+        Console.Error.WriteLine($"Refusing to start: {ex.Message}");
+        try
+        {
+            System.Diagnostics.EventLog.WriteEntry("DumpTriageAgent", $"Refusing to start: {ex.Message}", System.Diagnostics.EventLogEntryType.Error);
+        }
+        catch (Exception)
+        {
+            // No event source yet (first run) or no right to create one: stderr is all we have.
+        }
+        return 3;
+    }
+}
+
 IApiKeyProtector CreateApiKeyProtector() => OperatingSystem.IsWindows()
     ? new DpapiApiKeyProtector()
     : new FileApiKeyProtector(paths.ApiKeyPath);

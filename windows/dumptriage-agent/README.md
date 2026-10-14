@@ -89,6 +89,12 @@ deletes the local queue/config/logs).
 `%ProgramData%\DumpTriage\config.json`, created with defaults on first run.
 Restart the service to pick up changes.
 
+`%ProgramData%\DumpTriage` (config with the DPAPI-protected key, queue, logs)
+is readable by SYSTEM and Administrators only: the service sets a protected
+ACL on it at every start. It refuses to start if that folder is a junction or
+is owned by any other account, since another user could have created it
+first; delete it and reinstall.
+
 ```jsonc
 {
   "apiBaseUrl": "https://api.performanceinsights.ai",

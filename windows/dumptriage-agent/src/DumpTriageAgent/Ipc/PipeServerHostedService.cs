@@ -58,6 +58,13 @@ public sealed class PipeServerHostedService : BackgroundService, ITrayChannel
             {
                 break;
             }
+            catch (UnauthorizedAccessException ex)
+            {
+                // FirstPipeInstance: the name already exists, so some other process created it (#8).
+                // Trays refuse a server outside session 0, so it gets no prompts or answers from them.
+                _logger.LogCritical(ex, "Another process holds the pipe {PipeName}; trays can't reach the service until it exits. Retrying", IpcPipe.PipeName);
+                await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Pipe server loop faulted; retrying");
@@ -108,12 +115,13 @@ public sealed class PipeServerHostedService : BackgroundService, ITrayChannel
                 IpcPipe.PipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
         }
 
+        // FirstPipeInstance: fail rather than join a pipe some other process created first (#8).
         return NamedPipeServerStreamAcl.Create(
             IpcPipe.PipeName,
             PipeDirection.InOut,
             maxNumberOfServerInstances: 1,
             PipeTransmissionMode.Byte,
-            PipeOptions.Asynchronous,
+            PipeOptions.Asynchronous | PipeOptions.FirstPipeInstance,
             inBufferSize: 0,
             outBufferSize: 0,
             CreatePipeSecurity());

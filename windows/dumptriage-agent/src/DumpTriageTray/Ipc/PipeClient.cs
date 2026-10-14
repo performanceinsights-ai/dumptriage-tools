@@ -39,6 +39,12 @@ public sealed class PipeClient : IDisposable
                 await using var pipe = new NamedPipeClientStream(
                     ".", IpcPipe.PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
                 await pipe.ConnectAsync(5000, cancellationToken);
+                if (!ServerIsAService(pipe))
+                {
+                    // A process in a user session created the pipe first (#8): don't show its
+                    // prompts or send it answers. The service logs that its pipe name is taken.
+                    throw new IOException("The pipe's server is not the DumpTriage service.");
+                }
 
                 using var reader = new StreamReader(pipe);
                 var writer = new StreamWriter(pipe) { AutoFlush = true };
@@ -81,6 +87,24 @@ public sealed class PipeClient : IDisposable
             }
         }
     }
+
+    /// <summary>
+    /// Whether the pipe's server runs in session 0, where only services run. The agent service does;
+    /// a process started by a signed-in user, which could squat the pipe name while the service
+    /// restarts, does not.
+    /// </summary>
+    private static bool ServerIsAService(NamedPipeClientStream pipe)
+    {
+        return GetNamedPipeServerProcessId(pipe.SafePipeHandle, out var pid)
+            && ProcessIdToSessionId(pid, out var session)
+            && session == 0;
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetNamedPipeServerProcessId(Microsoft.Win32.SafeHandles.SafePipeHandle pipe, out uint serverProcessId);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool ProcessIdToSessionId(uint processId, out uint sessionId);
 
     public async Task SendAsync(IpcMessage message)
     {

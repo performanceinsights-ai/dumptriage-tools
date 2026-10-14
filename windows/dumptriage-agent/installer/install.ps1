@@ -71,6 +71,27 @@ $TaskName = "DumpTriageTray"
 
 $existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 
+# The data folder holds the DPAPI-protected key, so it must be one only SYSTEM or Administrators
+# could have created (#3); the agent itself refuses to start otherwise and locks its ACL down.
+# Checked before anything on the machine changes. One this elevated session created (an admin
+# pre-writing config.json) is handed to Administrators.
+$DataDir = Join-Path $env:ProgramData 'DumpTriage'
+if (Test-Path -LiteralPath $DataDir) {
+    if ((Get-Item -LiteralPath $DataDir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "$DataDir is a junction or symlink. Delete it and run the installer again."
+    }
+    $acl = Get-Acl -LiteralPath $DataDir
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier])
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    if ($owner -eq $me) {
+        $acl.SetOwner([Security.Principal.SecurityIdentifier]'S-1-5-32-544')
+        Set-Acl -LiteralPath $DataDir -AclObject $acl
+    }
+    elseif ($owner.Value -notin 'S-1-5-18', 'S-1-5-32-544') {
+        throw "$DataDir is owned by $($owner.Value), not SYSTEM or Administrators, so another account could have created it or changed its contents. Delete it and run the installer again."
+    }
+}
+
 # Read the key before touching the installed service, so a bad key file or an
 # abandoned prompt leaves the current install running as it was.
 # A first install prompts unless the session can't answer (-NonInteractive, or no console).
