@@ -446,18 +446,23 @@ class ReviewFixTests(AgentTestBase):
         a.tick()  # the 02:00 slot was not used up by the refused attempt
         self.assertEqual(self.rows(a), {"core.a.1.2": da.SUBMITTED})
 
-    def test_untrusted_watched_root_is_not_read(self):  # review of #14
+    def test_watched_root_through_a_planted_symlink_is_not_read(self):  # review of #14
+        shared = self.tmp / "shared"
+        shared.mkdir()
+        shared.chmod(0o1777)
+        (shared / "dumptriage").symlink_to(self.watch)  # as if another user planted it
         (self.watch / "core.a.1.2").write_bytes(USER_CORE)
-        a = self.agent()
         orig = os.geteuid
-        os.geteuid = lambda: orig() + 12345  # as if the folder belonged to another user
+        os.geteuid = lambda: orig() + 12345  # the link (and the rest) now belongs to "someone else"
         try:
+            a = self.agent(watchedPaths=[str(shared / "dumptriage")])
             self.settle(a)
             with self.assertRaises(da.NotWatched):
-                da.open_dump(str(self.watch / "core.a.1.2"), a.roots())
+                da.open_dump(str(shared / "dumptriage" / "core.a.1.2"), a.roots())
         finally:
             os.geteuid = orig
         self.assertEqual(self.rows(a), {})
+        self.assertEqual(self.uploader.calls, [])
 
     def test_dump_no_longer_under_a_watched_path_fails_with_a_reason(self):  # review of #14
         (self.watch / "core.a.1.2").write_bytes(USER_CORE)
@@ -485,26 +490,32 @@ class ReviewFixTests(AgentTestBase):
             a.central_copy(a.queue.get(r["id"]), f)
         self.assertEqual(sorted(p.name for p in dest.iterdir()), ["core.a.1.2"])
 
-    def test_root_owned_by_a_service_user_is_trusted_in_a_safe_parent(self):  # review of #14
-        safe = self.tmp / "safe"
-        safe.mkdir(mode=0o755)
-        (safe / "dumps").mkdir()
+    def test_trusted_root_rules(self):  # review of #14
         orig = os.geteuid
-        os.geteuid = lambda: orig() + 12345  # the agent is someone else; the folders aren't its own
-        try:
-            self.assertFalse(da.trusted_root(str(safe / "dumps")))  # parent owned by "another" user
-        finally:
-            os.geteuid = orig
-        self.assertTrue(da.trusted_root(str(safe / "dumps")))
-        shared = self.tmp / "shared"
-        shared.mkdir()
-        shared.chmod(0o1777)
-        (shared / "dumps").mkdir()
-        os.geteuid = lambda: orig() + 12345
-        try:
-            self.assertFalse(da.trusted_root(str(shared / "dumps")))  # world-writable parent, not ours
-        finally:
-            os.geteuid = orig
+        def as_other(fn):
+            os.geteuid = lambda: orig() + 12345
+            try:
+                return fn()
+            finally:
+                os.geteuid = orig
+        safe = self.tmp / "safe"
+        (safe / "app" / "dumps").mkdir(parents=True)
+        safe.chmod(0o755)  # whatever the umask: only we can write here
+        # Real folders owned by someone else (an app's service user) are fine.
+        self.assertTrue(as_other(lambda: da.trusted_root(str(safe / "app" / "dumps"))))
+        # A symlink only its trusted owner can replace is fine; one owned by someone else is not.
+        (safe / "link").symlink_to(safe / "app")
+        self.assertTrue(da.trusted_root(str(safe / "link" / "dumps")))
+        self.assertFalse(as_other(lambda: da.trusted_root(str(safe / "link" / "dumps"))))
+        # Our own symlink in a group/other-writable, non-sticky folder could be replaced: refused.
+        loose = self.tmp / "loose"
+        loose.mkdir()
+        loose.chmod(0o777)
+        (loose / "link").symlink_to(safe / "app")
+        self.assertFalse(da.trusted_root(str(loose / "link" / "dumps")))
+        # ... but in a sticky one only we can replace it.
+        loose.chmod(0o1777)
+        self.assertTrue(da.trusted_root(str(loose / "link" / "dumps")))
 
 
 if __name__ == "__main__":

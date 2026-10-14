@@ -132,22 +132,36 @@ class NotWatched(OSError):
 
 
 def trusted_root(root):
-    """Whether a watched root can be trusted not to have been planted by another user. /var/crash is
-    world-writable, so another user could create /var/crash/dumptriage (or a symlink by that name)
-    before configure-dumps.sh does. Trusted: it (and the symlink naming it) belongs to root or to the
-    agent's user, or it sits in a folder only root or the agent's user can write to, such as an app's
-    own dump folder owned by its service user under /var/lib."""
+    """Whether a watched root's path can be trusted not to lead somewhere another user chose.
+
+    /var/crash is world-writable, so another user could create /var/crash/dumptriage before
+    configure-dumps.sh does. As a real folder that only holds files that user could write anyway,
+    and open_dump reads nothing through a symlink or hard link below it. As a symlink it could
+    point anywhere, so a symlink anywhere on the path is trusted only if it belongs to root or the
+    agent's user and sits in a folder no one else can replace it in: one only they can write to, or
+    a sticky one (like /tmp). An app's own dump folder owned by its service user is fine."""
+    path = os.path.abspath(root)
     try:
-        link, target = os.lstat(root), os.stat(root)
-        parent = os.stat(os.path.dirname(os.path.abspath(root)))
+        if not stat.S_ISDIR(os.stat(path).st_mode):
+            return False
     except OSError:
         return False
-    if not stat.S_ISDIR(target.st_mode):
-        return False
     ok = (0, os.geteuid())
-    if link.st_uid in ok and target.st_uid in ok:
-        return True
-    return parent.st_uid in ok and not parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    cur = "/"
+    for part in path.strip("/").split("/"):
+        nxt = os.path.join(cur, part)
+        try:
+            link, parent = os.lstat(nxt), os.stat(cur)
+        except OSError:
+            return False
+        if stat.S_ISLNK(link.st_mode):
+            others_can_write = parent.st_uid not in ok or parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            if link.st_uid not in ok or (others_can_write and not parent.st_mode & stat.S_ISVTX):
+                return False
+            cur = os.path.realpath(nxt)
+        else:
+            cur = nxt
+    return True
 
 
 def open_dump(path, roots):
@@ -163,8 +177,7 @@ def open_dump(path, roots):
     if root is None:
         raise NotWatched(errno.EPERM, "no longer under a watched path; add its folder back to watchedPaths and run `retry`", path)
     if not trusted_root(root):
-        raise NotWatched(errno.EPERM, f"its watched path {root} is not trusted: it must belong to root or this agent's user, "
-                                      "or sit in a folder only they can write to", path)
+        raise NotWatched(errno.EPERM, f"its watched path {root} goes through a symlink another user could have planted", path)
     parts = os.path.relpath(path, root).split(os.sep)
     dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -447,7 +460,7 @@ class Agent:
             root = os.path.expanduser(root)
             if os.path.exists(root) and not trusted_root(root):
                 if root not in self.untrusted:
-                    log.error("not watching %s: it must belong to root or to this agent's user", root)
+                    log.error("not watching %s: its path goes through a symlink another user could have planted", root)
                     self.untrusted.add(root)
                 continue
             base_depth = root.rstrip("/").count("/")
@@ -541,7 +554,8 @@ class Agent:
             return
         if self.auth_paused(now):
             return  # the key was refused; don't send dumps to be refused again (#11)
-        key, self.used_key_stamp = self.api_key(), self.key_stamp()
+        self.used_key_stamp = self.key_stamp()  # before reading the key, so a key stored in between isn't blamed
+        key = self.api_key()
         due = [r for r in self.queue.in_state(QUEUED) if not r["next_attempt_utc"] or datetime.fromisoformat(r["next_attempt_utc"]) <= now]
         if due and not key:
             log.error("no API key at %s; run `dumptriage-agent set-api-key`", self.config_dir / "api-key")
@@ -650,7 +664,8 @@ class Agent:
                     d = done.stat()
                 except OSError:
                     continue
-                if (d.st_size, d.st_mtime_ns) == (st.st_size, st.st_mtime_ns):
+                # Within 2 s: SMB and some NFS servers keep coarser timestamps than the local disk.
+                if d.st_size == st.st_size and abs(d.st_mtime_ns - st.st_mtime_ns) < 2_000_000_000:
                     break  # copied by an attempt that died before recording it
             else:
                 # Written under a temporary name, created 0600 and given the dump's own mode (as copy2
