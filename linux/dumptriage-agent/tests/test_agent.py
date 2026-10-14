@@ -501,6 +501,7 @@ class ReviewFixTests(AgentTestBase):
         safe = self.tmp / "safe"
         (safe / "app" / "dumps").mkdir(parents=True)
         safe.chmod(0o755)  # whatever the umask: only we can write here
+        (safe / "app").chmod(0o755)
         # Real folders owned by someone else (an app's service user) are fine.
         self.assertTrue(as_other(lambda: da.trusted_root(str(safe / "app" / "dumps"))))
         # A symlink only its trusted owner can replace is fine; one owned by someone else is not.
@@ -516,6 +517,31 @@ class ReviewFixTests(AgentTestBase):
         # ... but in a sticky one only we can replace it.
         loose.chmod(0o1777)
         self.assertTrue(da.trusted_root(str(loose / "link" / "dumps")))
+        # A link inside the target is checked too: here one "someone else" owns, so it is refused.
+        (safe / "app" / "inner").symlink_to(safe / "app" / "dumps")
+        (safe / "outer").symlink_to(safe / "app" / "inner")
+        self.assertTrue(da.trusted_root(str(safe / "outer")))
+        self.assertFalse(as_other(lambda: da.trusted_root(str(safe / "outer"))))
+        # A relative link and .. resolve like the kernel does.
+        (safe / "rel").symlink_to("app/../app/dumps")
+        self.assertTrue(da.trusted_root(str(safe / "rel")))
+
+    def test_open_dump_walks_the_root_without_following_a_swap(self):  # review of #14
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        with da.open_dump(str(self.watch / "core.a.1.2"), [str(self.watch)]) as f:
+            self.assertEqual(f.read(), USER_CORE)
+        moved = self.tmp / "dumps-moved"
+        self.watch.rename(moved)
+        self.watch.symlink_to(moved)  # our own link in our own 0700 temp folder: allowed
+        with da.open_dump(str(self.watch / "core.a.1.2"), [str(self.watch)]) as f:
+            self.assertEqual(f.read(), USER_CORE)
+        orig = os.geteuid
+        os.geteuid = lambda: orig() + 12345  # now the link is "someone else's": refused at open
+        try:
+            with self.assertRaises(da.NotWatched):
+                da.open_dump(str(self.watch / "core.a.1.2"), [str(self.watch)])
+        finally:
+            os.geteuid = orig
 
 
 if __name__ == "__main__":

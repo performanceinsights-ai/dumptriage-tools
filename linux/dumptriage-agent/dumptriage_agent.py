@@ -131,37 +131,60 @@ class NotWatched(OSError):
     """The path is not under a watched path the agent trusts (any more)."""
 
 
-def trusted_root(root):
-    """Whether a watched root's path can be trusted not to lead somewhere another user chose.
+def open_dir_safely(path, _depth=0):
+    """A file descriptor for the directory `path`, walked from / one component at a time.
 
     /var/crash is world-writable, so another user could create /var/crash/dumptriage before
-    configure-dumps.sh does. As a real folder that only holds files that user could write anyway,
-    and open_dump reads nothing through a symlink or hard link below it. As a symlink it could
-    point anywhere, so a symlink anywhere on the path is trusted only if it belongs to root or the
-    agent's user and sits in a folder no one else can replace it in: one only they can write to, or
-    a sticky one (like /tmp). An app's own dump folder owned by its service user is fine."""
-    path = os.path.abspath(root)
+    configure-dumps.sh does. As a real folder that is harmless: it only holds files that user could
+    write anyway, and open_dump reads nothing through a symlink or hard link below it. A symlink
+    could point anywhere, so one is followed only if it belongs to root or the agent's user and sits
+    in a folder that also does and that no one else can replace it in (only they can write to it,
+    or it is sticky); the walk then restarts at its target, which is checked the same way. Every
+    real folder is opened with O_NOFOLLOW relative to the previous one, so nothing can be swapped
+    for a symlink between a check and its use. Raises NotWatched for a refused symlink."""
+    if _depth > 40:
+        raise OSError(errno.ELOOP, "too many symlinks", path)
+    ok = (0, os.geteuid())
+    parts = [p for p in path.split("/") if p not in ("", ".")]
+    fd, cur = os.open("/", os.O_RDONLY | os.O_DIRECTORY), "/"
     try:
-        if not stat.S_ISDIR(os.stat(path).st_mode):
-            return False
+        for i, part in enumerate(parts):
+            if part == "..":
+                cur = os.path.dirname(cur)
+                next_fd = open_dir_safely(cur, _depth + 1)
+            else:
+                st = os.stat(part, dir_fd=fd, follow_symlinks=False)
+                if stat.S_ISLNK(st.st_mode):
+                    parent = os.fstat(fd)
+                    others_can_write = parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    if (st.st_uid not in ok or parent.st_uid not in ok
+                            or (others_can_write and not parent.st_mode & stat.S_ISVTX)):
+                        raise NotWatched(errno.EPERM, "goes through a symlink another user could have planted",
+                                         os.path.join(cur, part))
+                    target = os.readlink(part, dir_fd=fd)
+                    rest = "/".join(parts[i + 1:])
+                    target = target if target.startswith("/") else os.path.join(cur, target)
+                    os.close(fd)
+                    fd = None
+                    return open_dir_safely(os.path.join(target, rest) if rest else target, _depth + 1)
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                cur = os.path.join(cur, part)
+            os.close(fd)
+            fd = next_fd
+        result, fd = fd, None
+        return result
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def trusted_root(root):
+    """Whether a watched root can be opened by open_dir_safely (see there)."""
+    try:
+        os.close(open_dir_safely(os.path.abspath(root)))
+        return True
     except OSError:
         return False
-    ok = (0, os.geteuid())
-    cur = "/"
-    for part in path.strip("/").split("/"):
-        nxt = os.path.join(cur, part)
-        try:
-            link, parent = os.lstat(nxt), os.stat(cur)
-        except OSError:
-            return False
-        if stat.S_ISLNK(link.st_mode):
-            others_can_write = parent.st_uid not in ok or parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-            if link.st_uid not in ok or (others_can_write and not parent.st_mode & stat.S_ISVTX):
-                return False
-            cur = os.path.realpath(nxt)
-        else:
-            cur = nxt
-    return True
 
 
 def open_dump(path, roots):
@@ -171,15 +194,13 @@ def open_dump(path, roots):
     root: a symlink planted there (to /proc/kcore, or another user's core) must not be read, uploaded
     or copied. Every component below the root is opened with O_NOFOLLOW, relative to its parent, so a
     directory swapped for a symlink after the scan is refused too, and the file must be a regular file
-    with a single link. The root itself is the admin's configuration and may be a symlink."""
+    with a single link. The root itself is opened by open_dir_safely."""
     path = os.path.abspath(path)
     root = max((r for r in roots if path.startswith(r.rstrip("/") + "/")), key=len, default=None)
     if root is None:
         raise NotWatched(errno.EPERM, "no longer under a watched path; add its folder back to watchedPaths and run `retry`", path)
-    if not trusted_root(root):
-        raise NotWatched(errno.EPERM, f"its watched path {root} goes through a symlink another user could have planted", path)
     parts = os.path.relpath(path, root).split(os.sep)
-    dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    dir_fd = open_dir_safely(root)
     try:
         for part in parts[:-1]:
             next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
