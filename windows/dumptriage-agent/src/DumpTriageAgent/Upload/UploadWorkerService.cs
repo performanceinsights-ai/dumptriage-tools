@@ -1,5 +1,6 @@
 using DumpTriage.Common.CentralCopy;
 using DumpTriage.Common.Config;
+using DumpTriage.Common.Detection;
 using DumpTriage.Common.Idle;
 using DumpTriage.Common.Ipc;
 using DumpTriage.Common.Models;
@@ -179,8 +180,20 @@ public sealed class UploadWorkerService : BackgroundService
         // The file must still be the dump this record describes: one overwritten in place after
         // detection (a reused dump name, while an approval was pending) must not go up under this id.
         // The watcher sees the change and records the new dump itself.
-        var info = new FileInfo(record.FilePath);
-        if (info.Exists && (info.Length != record.SizeBytes || info.LastWriteTimeUtc > record.DetectedAtUtc.UtcDateTime))
+        bool changed;
+        try
+        {
+            var info = new FileInfo(record.FilePath);
+            changed = info.Exists && (info.Length != record.SizeBytes
+                // A newer write time alone may be a touch (a backup or scan tool): the hash decides.
+                || (info.LastWriteTimeUtc > record.DetectedAtUtc.UtcDateTime
+                    && (record.Sha256 is null || await DumpHasher.ComputeSha256Async(record.FilePath, stoppingToken) != record.Sha256)));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            changed = true; // locked for writing: a new dump is being written over it
+        }
+        if (changed)
         {
             record.State = DumpQueueState.Skipped;
             record.LastError = "Dump file changed after it was detected; the new dump is handled separately";

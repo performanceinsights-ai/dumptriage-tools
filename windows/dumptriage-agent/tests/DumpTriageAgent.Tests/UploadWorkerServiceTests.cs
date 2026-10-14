@@ -117,6 +117,18 @@ public sealed class UploadWorkerServiceTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task A_dump_only_touched_after_detection_is_still_uploaded()
+    {
+        var worker = await Worker();
+        var a = await Queued("a.dmp");
+        a.Sha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData("MDMP"u8.ToArray())).ToLowerInvariant();
+        await _queue!.UpsertAsync(a);
+        File.SetLastWriteTimeUtc(a.FilePath, _time.GetUtcNow().UtcDateTime.AddMinutes(1)); // same content, newer time
+        await worker.TickAsync(default);
+        Assert.Equal(DumpQueueState.Submitted, (await Get("a.dmp")).State);
+    }
+
+    [Fact]
     public async Task Fails_only_after_the_last_attempt()
     {
         var worker = await Worker();

@@ -291,7 +291,7 @@ public sealed class DumpWatcherService : BackgroundService
                     continue;
                 }
 
-                if (await ChangedSinceDetectedAsync(record, stoppingToken))
+                if (await ChangedSinceDetectedOrUnknownAsync(record, stoppingToken) is not false)
                 {
                     // Path reused (e.g. MEMORY.DMP rewritten by a new crash)
                     // while we were down: this record no longer describes the
@@ -324,7 +324,7 @@ public sealed class DumpWatcherService : BackgroundService
             // the old record: retire them and look at the file afresh.
             foreach (var record in await _queueStore.GetByStateAsync(DumpQueueState.Queued, stoppingToken))
             {
-                if (File.Exists(record.FilePath) && await ChangedSinceDetectedAsync(record, stoppingToken))
+                if (File.Exists(record.FilePath) && await ChangedSinceDetectedOrUnknownAsync(record, stoppingToken) is true)
                 {
                     await RetireAsync(record, "Overwritten by a newer dump at the same path before it was uploaded", stoppingToken);
                     _candidatePaths.Writer.TryWrite(record.FilePath);
@@ -342,12 +342,22 @@ public sealed class DumpWatcherService : BackgroundService
     /// new crash, possibly to the same size. A changed size or write time is only a hint; the content
     /// hash decides, so a file that was merely touched keeps its record.
     /// </summary>
-    private static async Task<bool> ChangedSinceDetectedAsync(DumpRecord record, CancellationToken stoppingToken)
+    private async Task<bool?> ChangedSinceDetectedOrUnknownAsync(DumpRecord record, CancellationToken stoppingToken)
     {
-        var info = new FileInfo(record.FilePath);
-        if (info.Length == record.SizeBytes && info.LastWriteTimeUtc <= record.DetectedAtUtc.UtcDateTime) return false;
-        if (info.Length != record.SizeBytes || record.Sha256 is null) return true;
-        return await DumpHasher.ComputeSha256Async(record.FilePath, stoppingToken) != record.Sha256;
+        try
+        {
+            var info = new FileInfo(record.FilePath);
+            if (info.Length == record.SizeBytes && info.LastWriteTimeUtc <= record.DetectedAtUtc.UtcDateTime) return false;
+            if (info.Length != record.SizeBytes || record.Sha256 is null) return true;
+            return await DumpHasher.ComputeSha256Async(record.FilePath, stoppingToken) != record.Sha256;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Being written right now (a new dump at this path): unknown. Callers leave the record
+            // alone or retire it, but one unreadable file never stops the recovery of the rest.
+            _logger.LogWarning(ex, "Could not check whether {Path} changed", record.FilePath);
+            return null;
+        }
     }
 
     private async Task ResumeAsync(DumpRecord record, ApprovalOutcome outcome, CancellationToken stoppingToken)
