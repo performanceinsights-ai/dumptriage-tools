@@ -29,6 +29,7 @@ jobs:
         with:
           dotnet-version: "8.0.x"
       - run: dotnet test windows/dumptriage-agent/tests/DumpTriage.Common.Tests
+      - run: dotnet test windows/dumptriage-agent/tests/DumpTriageAgent.Tests
 
   windows-agent-on-windows:
     # The Windows-only parts (ACLs on the data folder) need a real Windows host.

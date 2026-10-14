@@ -38,6 +38,17 @@ public sealed class DumpWatcherService : BackgroundService
     private readonly List<string> _missingPaths = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> _inFlight = new();
 
+    // Files older than the agent's first start are not picked up by a folder scan (#5): a fresh
+    // install mustn't upload years of old minidumps. Set from the queue in ExecuteAsync.
+    private DateTimeOffset _watchingSinceUtc = DateTimeOffset.MaxValue;
+
+    // (path, size, mtime) whose content is already tracked under another path: not rehashed again.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(string, long, DateTime), bool> _knownDuplicates = new();
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> _loggedOld = new();
+    private CancellationToken _stoppingToken;
+    private int _retryLoopRunning;
+
     public DumpWatcherService(
         AgentConfig config,
         DumpQueueStore queueStore,
@@ -82,9 +93,10 @@ public sealed class DumpWatcherService : BackgroundService
                     DumpSizeBytes = record.SizeBytes,
                     DumpType = record.DumpType,
                     // Only set for a dump still mid-timeout in ApprovalCoordinator
-                    // (the AskFirst path) — a ManualOnly one never registered
+                    // (the AskFirst path), and to the time that wait has left, not
+                    // the full timeout (#12) — a ManualOnly one never registered
                     // there and has no timeout to report.
-                    AskTimeoutSeconds = activeAskIds.Contains(record.Id) ? _config.Policy.AskTimeoutSeconds : null,
+                    AskTimeoutSeconds = activeAskIds.Contains(record.Id) ? _approvalCoordinator.SecondsLeft(record.Id) : null,
                 }, CancellationToken.None);
             }
         }
@@ -102,7 +114,7 @@ public sealed class DumpWatcherService : BackgroundService
             if (!TryAttachWatcher(expanded))
             {
                 _logger.LogWarning("Watched path {Path} does not exist yet, will retry", expanded);
-                _missingPaths.Add(expanded);
+                lock (_missingPaths) { _missingPaths.Add(expanded); }
             }
         }
 
@@ -127,54 +139,139 @@ public sealed class DumpWatcherService : BackgroundService
         }
         watcher.Created += (_, e) => { _logger.LogDebug("FileSystemWatcher Created event for {Path}", e.FullPath); _candidatePaths.Writer.TryWrite(e.FullPath); };
         watcher.Renamed += (_, e) => { _logger.LogDebug("FileSystemWatcher Renamed event for {Path}", e.FullPath); _candidatePaths.Writer.TryWrite(e.FullPath); };
-        watcher.Error += (_, e) => _logger.LogError(e.GetException(), "FileSystemWatcher error for {Path}", expanded);
+        // MEMORY.DMP is overwritten in place by the next bugcheck: that is a Changed, not a Created (#5).
+        // IsAlreadyRecordedAsync makes the many Changed events of one write cheap (size + mtime, no rehash).
+        watcher.Changed += (_, e) => _candidatePaths.Writer.TryWrite(e.FullPath);
+        watcher.Error += (_, e) =>
+        {
+            if (!Directory.Exists(expanded))
+            {
+                // The folder was deleted (a cleanup tool on %WINDIR%\Minidump): this watcher is dead.
+                // Wait for the folder to come back, as for one missing at start.
+                _logger.LogWarning("Watched path {Path} was removed; will watch it again once it exists", expanded);
+                lock (_watchers) { _watchers.Remove(watcher); }
+                watcher.Dispose();
+                lock (_missingPaths) { if (!_missingPaths.Contains(expanded)) _missingPaths.Add(expanded); }
+                StartRetryLoop();
+                return;
+            }
+
+            // Usually a buffer overflow: events were lost, so look at everything again.
+            _logger.LogError(e.GetException(), "FileSystemWatcher error for {Path}; rescanning it", expanded);
+            EnqueueExisting(expanded);
+        };
         watcher.EnableRaisingEvents = true;
 
         lock (_watchers) { _watchers.Add(watcher); }
         _logger.LogInformation("Watching {Path} for dump files (filters: {Filters}, raising: {Raising})", expanded, string.Join(",", watcher.Filters), watcher.EnableRaisingEvents);
+
         return true;
     }
 
     /// <summary>
-    /// A directory like /var/crash may not exist until the first crash. Keep
-    /// retrying, and on attach pick up files that landed before the watcher
-    /// did (ProcessCandidateAsync dedups).
+    /// Queues the dumps already in a folder: a dump written while the service wasn't running
+    /// (MEMORY.DMP during boot, a crash during an upgrade) raises no event (#5). Only files written
+    /// since the agent first started: a fresh install leaves older dumps alone. Known files are
+    /// skipped cheaply (size + mtime).
     /// </summary>
-    private async Task RetryMissingPathsAsync(CancellationToken stoppingToken)
+    private void EnqueueExisting(string path)
     {
-        while (_missingPaths.Count > 0 && !stoppingToken.IsCancellationRequested)
+        try
         {
-            await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
-
-            foreach (var path in _missingPaths.ToList())
+            foreach (var filter in _config.WatchedFilters)
             {
-                if (!TryAttachWatcher(path)) continue;
-
-                _missingPaths.Remove(path);
-                try
+                foreach (var file in Directory.EnumerateFiles(path, filter))
                 {
-                    foreach (var filter in _config.WatchedFilters)
+                    // The later of write and creation time: a dump copied in on purpose keeps its old
+                    // write time but gets a new creation time.
+                    var latest = File.GetLastWriteTimeUtc(file) > File.GetCreationTimeUtc(file)
+                        ? File.GetLastWriteTimeUtc(file) : File.GetCreationTimeUtc(file);
+                    if (latest >= _watchingSinceUtc.UtcDateTime)
                     {
-                        foreach (var file in Directory.EnumerateFiles(path, filter))
-                        {
-                            _candidatePaths.Writer.TryWrite(file);
-                        }
+                        _candidatePaths.Writer.TryWrite(file);
+                    }
+                    else if (_loggedOld.TryAdd(file, true))
+                    {
+                        _logger.LogInformation("Ignoring {Path}: older than this agent's first start", file);
                     }
                 }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "Could not scan {Path} for existing dumps", path);
+        }
+    }
+
+    /// <summary>
+    /// A directory like /var/crash may not exist until the first crash. Keep
+    /// retrying; attaching picks up files that landed before the watcher did
+    /// (ProcessCandidateAsync dedups).
+    /// </summary>
+    private void StartRetryLoop()
+    {
+        if (Interlocked.Exchange(ref _retryLoopRunning, 1) == 1) return;
+        _ = RetryMissingPathsAsync(_stoppingToken).ContinueWith(
+            t => _logger.LogError(t.Exception, "Watch-path retry loop failed"),
+            TaskContinuationOptions.OnlyOnFaulted);
+    }
+
+    private async Task RetryMissingPathsAsync(CancellationToken stoppingToken)
+    {
+        try
+        {
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                List<string> missing;
+                lock (_missingPaths) { missing = _missingPaths.ToList(); }
+                if (missing.Count == 0) return;
+
+                await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+                foreach (var path in missing)
                 {
-                    _logger.LogWarning(ex, "Could not scan {Path} for pre-existing dumps", path);
+                    if (!TryAttachWatcher(path)) continue;
+                    lock (_missingPaths) { _missingPaths.Remove(path); }
+                    EnqueueExisting(path);
                 }
             }
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _retryLoopRunning, 0);
+            // A path removed while the loop was finishing: start again rather than lose it.
+            bool more;
+            lock (_missingPaths) { more = _missingPaths.Count > 0; }
+            if (more && !stoppingToken.IsCancellationRequested) StartRetryLoop();
         }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        _stoppingToken = stoppingToken;
+        var now = DateTimeOffset.UtcNow;
+        if (await _queueStore.GetMetaAsync(DumpQueueStore.WatchingSinceKey, stoppingToken) is { } since)
+        {
+            _watchingSinceUtc = DateTimeOffset.Parse(since, null, System.Globalization.DateTimeStyles.RoundtripKind);
+            if (_watchingSinceUtc > now)
+            {
+                _watchingSinceUtc = now; // the clock was ahead when it was recorded
+                await _queueStore.SetMetaAsync(DumpQueueStore.WatchingSinceKey, now.ToString("O"), stoppingToken);
+            }
+        }
+        else
+        {
+            // A queue from before this setting (a new one gets it when the file is created): an
+            // upgrade from a version that has already seen everything in its folders, so filter
+            // nothing, and dumps written while the service was down for the upgrade still count.
+            _watchingSinceUtc = DateTimeOffset.UnixEpoch;
+            await _queueStore.SetMetaAsync(DumpQueueStore.WatchingSinceKey, _watchingSinceUtc.ToString("O"), stoppingToken);
+        }
+
         await RecoverUnfinishedAsync(stoppingToken);
-        _ = RetryMissingPathsAsync(stoppingToken).ContinueWith(
-            t => _logger.LogError(t.Exception, "Watch-path retry loop failed"),
-            TaskContinuationOptions.OnlyOnFaulted);
+        List<string> attached;
+        lock (_watchers) { attached = _watchers.Select(w => w.Path).ToList(); }
+        foreach (var path in attached) EnqueueExisting(path);
+        StartRetryLoop();
 
         await foreach (var path in _candidatePaths.Reader.ReadAllAsync(stoppingToken))
         {
@@ -209,7 +306,7 @@ public sealed class DumpWatcherService : BackgroundService
                     continue;
                 }
 
-                if (new FileInfo(record.FilePath).Length != record.SizeBytes)
+                if (await ChangedSinceDetectedOrUnknownAsync(record, stoppingToken) is not false)
                 {
                     // Path reused (e.g. MEMORY.DMP rewritten by a new crash)
                     // while we were down: this record no longer describes the
@@ -234,6 +331,47 @@ public sealed class DumpWatcherService : BackgroundService
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogError(ex, "Failed to recover unfinished dumps at startup");
+        }
+
+        try
+        {
+            // Queued dumps overwritten while the service was stopped would upload the new file under
+            // the old record: retire them and look at the file afresh.
+            foreach (var record in await _queueStore.GetByStateAsync(DumpQueueState.Queued, stoppingToken))
+            {
+                if (File.Exists(record.FilePath) && await ChangedSinceDetectedOrUnknownAsync(record, stoppingToken) is true)
+                {
+                    await RetireAsync(record, "Overwritten by a newer dump at the same path before it was uploaded", stoppingToken);
+                    _candidatePaths.Writer.TryWrite(record.FilePath);
+                }
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Failed to check queued dumps at startup");
+        }
+    }
+
+    /// <summary>
+    /// The file at the record's path is no longer the dump it describes: MEMORY.DMP rewritten by a
+    /// new crash, possibly to the same size. A changed size or write time is only a hint; the content
+    /// hash decides, so a file that was merely touched keeps its record.
+    /// </summary>
+    private async Task<bool?> ChangedSinceDetectedOrUnknownAsync(DumpRecord record, CancellationToken stoppingToken)
+    {
+        try
+        {
+            var info = new FileInfo(record.FilePath);
+            if (info.Length == record.SizeBytes && info.LastWriteTimeUtc <= record.DetectedAtUtc.UtcDateTime) return false;
+            if (info.Length != record.SizeBytes || record.Sha256 is null) return true;
+            return await DumpHasher.ComputeSha256Async(record.FilePath, stoppingToken) != record.Sha256;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Being written right now (a new dump at this path): unknown. Callers leave the record
+            // alone or retire it, but one unreadable file never stops the recovery of the rest.
+            _logger.LogWarning(ex, "Could not check whether {Path} changed", record.FilePath);
+            return null;
         }
     }
 
@@ -269,6 +407,18 @@ public sealed class DumpWatcherService : BackgroundService
             {
                 return;
             }
+            try
+            {
+                var info = new FileInfo(path);
+                if (_knownDuplicates.ContainsKey((path, info.Length, info.LastWriteTimeUtc)))
+                {
+                    return; // a copy of a tracked dump, already hashed once
+                }
+            }
+            catch (IOException)
+            {
+                // Vanished or locked: the checks below report it.
+            }
 
             var stable = await StabilityChecker.WaitUntilStableAsync(
                 path, StabilityPollInterval, StabilityQuietPeriod, StabilityTimeout, stoppingToken);
@@ -287,6 +437,12 @@ public sealed class DumpWatcherService : BackgroundService
             {
                 return; // same content re-touched; nothing new to submit
             }
+            if (existing is { State: DumpQueueState.Detected or DumpQueueState.PendingApproval or DumpQueueState.Queued })
+            {
+                // Overwritten in place (MEMORY.DMP) before the old dump was uploaded: that one is gone,
+                // and its record must not upload the new file under its id.
+                await RetireAsync(existing, "Overwritten by a newer dump at the same path before it was uploaded", stoppingToken);
+            }
 
             // Id is the content hash, so a path that goes A -> B -> A lands on
             // an existing record. Upserting would reset its state (e.g.
@@ -297,6 +453,8 @@ public sealed class DumpWatcherService : BackgroundService
             if (byId is not null && byId.State is not (DumpQueueState.Failed or DumpQueueState.Skipped))
             {
                 _logger.LogDebug("Dump {Path} matches already-tracked record {Id}; skipping", path, sha256);
+                var seen = new FileInfo(path);
+                _knownDuplicates[(path, seen.Length, seen.LastWriteTimeUtc)] = true;
                 return;
             }
 
@@ -348,6 +506,15 @@ public sealed class DumpWatcherService : BackgroundService
         {
             return false;
         }
+    }
+
+    private async Task RetireAsync(DumpRecord record, string reason, CancellationToken stoppingToken)
+    {
+        _approvalCoordinator.Resolve(record.Id, approved: false); // an approval wait for it ends here
+        record.State = DumpQueueState.Skipped;
+        record.LastError = reason;
+        await _queueStore.UpsertAsync(record, stoppingToken);
+        _logger.LogWarning("Dump {Path} ({Id}) retired: {Reason}", record.FilePath, record.Id, reason);
     }
 
     private async Task ApplyOutcomeAsync(DumpRecord record, ApprovalOutcome outcome, CancellationToken stoppingToken)

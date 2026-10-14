@@ -11,6 +11,7 @@ namespace DumpTriageAgent.Runtime;
 public sealed class ApprovalCoordinator
 {
     private readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> _pending = new();
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _deadlines = new();
 
     public async Task<bool?> WaitForApprovalAsync(string dumpId, TimeSpan timeout, CancellationToken cancellationToken)
     {
@@ -22,6 +23,7 @@ public sealed class ApprovalCoordinator
             return null;
         }
 
+        _deadlines[dumpId] = DateTimeOffset.UtcNow + timeout;
         try
         {
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -39,6 +41,7 @@ public sealed class ApprovalCoordinator
         finally
         {
             _pending.TryRemove(dumpId, out _);
+            _deadlines.TryRemove(dumpId, out _);
         }
     }
 
@@ -56,4 +59,10 @@ public sealed class ApprovalCoordinator
     /// user never having seen it.
     /// </summary>
     public ICollection<string> GetPendingDumpIds() => _pending.Keys;
+
+    /// <summary>Whole seconds this dump's approval wait has left, or null if none is running.</summary>
+    public int? SecondsLeft(string dumpId) =>
+        _deadlines.TryGetValue(dumpId, out var deadline)
+            ? Math.Max(1, (int)Math.Ceiling((deadline - DateTimeOffset.UtcNow).TotalSeconds))
+            : null;
 }

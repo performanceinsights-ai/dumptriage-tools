@@ -24,6 +24,12 @@ public static class BatchScheduler
         };
     }
 
+    /// <summary>
+    /// ScheduledTimeOfDay: only when a scheduled time has passed since the last flush. The caller
+    /// records every flush, also one with nothing to send, so a dump queued after an empty slot waits
+    /// for the next one (#9), and records a first run as a flush (null means "never ran"), so it waits
+    /// for the first slot rather than uploading at once.
+    /// </summary>
     private static bool IsAtOrPastAnyScheduledTimeSinceLastFlush(
         BatchingConfig config, DateTimeOffset nowLocal, DateTimeOffset? lastScheduledFlushUtc)
     {
@@ -35,7 +41,7 @@ public static class BatchScheduler
             if (nowTime < scheduled) continue;
 
             var scheduledInstant = new DateTimeOffset(today.ToDateTime(scheduled), nowLocal.Offset);
-            if (lastScheduledFlushUtc is null || lastScheduledFlushUtc < scheduledInstant)
+            if (lastScheduledFlushUtc is not null && lastScheduledFlushUtc < scheduledInstant)
             {
                 return true;
             }

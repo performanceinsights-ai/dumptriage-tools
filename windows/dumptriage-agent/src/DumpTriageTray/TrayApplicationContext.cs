@@ -14,13 +14,27 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly PipeClient _pipeClient = new();
     private readonly SynchronizationContext _uiContext;
     private readonly ToolStripMenuItem _pauseResumeItem;
+    private readonly ToolStripMenuItem _submitMenu;
     private bool _paused;
+
+    // One approval popup at a time (#12): the rest wait here, each dump once. A re-sent ask (after a
+    // service restart) replaces the waiting one, since it carries the service's new deadline.
+    private readonly Queue<string> _askOrder = new();
+    private readonly Dictionary<string, (IpcMessage Message, DateTime ReceivedUtc)> _waitingAsks = new();
+    private string? _askShowingId;
+
+    // NotifyOnly dumps already announced with a balloon in this session: re-sent on every reconnect,
+    // but only new ones are announced (#7).
+    private readonly HashSet<string> _announcedManual = new();
 
     public TrayApplicationContext()
     {
         _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
 
         var menu = new ContextMenuStrip();
+        // NotifyOnly dumps wait here until the user submits them (#7).
+        _submitMenu = new ToolStripMenuItem("Submit dump") { Visible = false };
+        menu.Items.Add(_submitMenu);
         _pauseResumeItem = new ToolStripMenuItem("Pause", null, OnPauseResumeClicked);
         menu.Items.Add(_pauseResumeItem);
         menu.Items.Add(new ToolStripSeparator());
@@ -44,6 +58,14 @@ public sealed class TrayApplicationContext : ApplicationContext
         _uiContext.Post(_ =>
         {
             _notifyIcon.Text = connected ? "DumpTriage Agent — connected" : "DumpTriage Agent — service unavailable";
+            if (connected)
+            {
+                // The service re-sends everything still pending on every connect; start the list afresh.
+                var old = _submitMenu.DropDownItems.Cast<ToolStripItem>().ToList();
+                _submitMenu.DropDownItems.Clear();
+                old.ForEach(item => item.Dispose());
+                _submitMenu.Visible = false;
+            }
         }, null);
     }
 
@@ -64,32 +86,92 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         if (message.DumpId is null) return;
 
-        // ManualOnly mode (no AskTimeoutSeconds set): passive notification,
-        // submission happens later from the queue view, not from this popup.
+        // ManualOnly mode (no AskTimeoutSeconds set): passive notification, and
+        // the dump is listed under "Submit dump" in the tray menu.
         if (message.AskTimeoutSeconds is null)
         {
-            _notifyIcon.ShowBalloonTip(
-                10_000,
-                "DumpTriage",
-                $"New dump detected: {message.DumpFileName}. Right-click the tray icon to submit it.",
-                ToolTipIcon.Info);
+            if (AddManualSubmitItem(message) && _announcedManual.Add(message.DumpId))
+            {
+                _notifyIcon.ShowBalloonTip(
+                    10_000,
+                    "DumpTriage",
+                    $"New dump detected: {message.DumpFileName}. Right-click the tray icon and choose Submit dump to send it.",
+                    ToolTipIcon.Info);
+            }
             return;
         }
 
-        using var popup = new ApprovalPopupForm(
-            message.DumpFileName ?? "dump file",
-            message.DumpSizeBytes ?? 0,
-            message.DumpType?.ToString() ?? "unknown",
-            message.AskTimeoutSeconds.Value);
+        if (message.DumpId == _askShowingId) return; // its popup is open; its answer goes out when it closes
+        if (!_waitingAsks.ContainsKey(message.DumpId)) _askOrder.Enqueue(message.DumpId);
+        _waitingAsks[message.DumpId] = (message, DateTime.UtcNow);
+        ShowNextAsk();
+    }
 
-        popup.ShowDialog();
-
-        _ = _pipeClient.SendAsync(new IpcMessage
+    /// <summary>
+    /// Shows queued approval popups one after another. Each answer is sent the moment its popup
+    /// closes, instead of a nested modal holding it back until the ones above it close (#12).
+    /// </summary>
+    private void ShowNextAsk()
+    {
+        if (_askShowingId is not null) return;
+        try
         {
-            Type = IpcMessageType.ApprovalResponse,
-            DumpId = message.DumpId,
-            Approved = popup.Result ?? false,
-        });
+            while (_askOrder.TryDequeue(out var id))
+            {
+                if (!_waitingAsks.Remove(id, out var next)) continue;
+                var message = next.Message;
+                // The service's wait ran on while this one waited its turn: show only what is left.
+                var remaining = (message.AskTimeoutSeconds ?? 0) - (int)(DateTime.UtcNow - next.ReceivedUtc).TotalSeconds;
+                if (remaining <= 0)
+                {
+                    continue; // the service has already applied its timeout action
+                }
+
+                _askShowingId = id;
+
+                using (var popup = new ApprovalPopupForm(
+                    message.DumpFileName ?? "dump file",
+                    message.DumpSizeBytes ?? 0,
+                    message.DumpType?.ToString() ?? "unknown",
+                    remaining))
+                {
+                    popup.ShowDialog();
+                    _ = _pipeClient.SendAsync(new IpcMessage
+                    {
+                        Type = IpcMessageType.ApprovalResponse,
+                        DumpId = message.DumpId,
+                        Approved = popup.Result ?? false,
+                    });
+                }
+                _askShowingId = null;
+            }
+        }
+        finally
+        {
+            _askShowingId = null;
+        }
+    }
+
+    private bool AddManualSubmitItem(IpcMessage message)
+    {
+        foreach (ToolStripItem existing in _submitMenu.DropDownItems)
+        {
+            if (Equals(existing.Tag, message.DumpId)) return false; // already listed (re-sent on reconnect)
+        }
+
+        var item = new ToolStripMenuItem($"{message.DumpFileName} ({(message.DumpSizeBytes ?? 0) / (1024 * 1024)} MB)")
+        {
+            Tag = message.DumpId,
+        };
+        item.Click += (_, _) =>
+        {
+            _ = _pipeClient.SendAsync(new IpcMessage { Type = IpcMessageType.ManualSubmit, DumpId = message.DumpId });
+            _submitMenu.DropDownItems.Remove(item);
+            _submitMenu.Visible = _submitMenu.DropDownItems.Count > 0;
+        };
+        _submitMenu.DropDownItems.Add(item);
+        _submitMenu.Visible = true;
+        return true;
     }
 
     private void HandleStatusUpdate(IpcMessage message)

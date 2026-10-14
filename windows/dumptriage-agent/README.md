@@ -124,7 +124,25 @@ first; delete it and reinstall.
 all; **timing mode** (`policy.batching`) decides *when* an already-approved
 dump actually gets POSTed. They're independent — e.g. `AskFirst` +
 `ScheduledTimeOfDay` prompts immediately on detection but doesn't upload the
-approved bytes until the nightly window.
+approved bytes until the nightly window. A scheduled time counts as used even when nothing was
+queued then, so a dump approved after it waits for the next one, and a fresh
+install or restart waits for the next scheduled time rather than uploading at
+once.
+
+`NotifyOnly` dumps are listed under **Submit dump** in the tray icon's menu;
+choosing one uploads it. Approval popups (`AskFirst`) are shown one at a time,
+each with the time the service has left to wait for it.
+
+Existing dumps are picked up when the service starts (a `MEMORY.DMP` written
+during boot, or a crash while the service was stopped), and a dump overwritten
+in place is seen as new. Known files are recognised by size and time, so this
+doesn't rehash them.
+
+A transient upload failure is retried with backoff (30 s doubling, capped at
+1 h) up to 10 times before the dump is marked `Failed`; a 400, 413 or 429 is
+final. A 401 or 403 (wrong or revoked key) uses up no attempt and pauses all
+uploads for 10 minutes, doubling with each refusal in a row up to 6 hours;
+restarting the service after `--set-api-key-stdin` ends the pause.
 
 `RuleBased` mode evaluates `policy.rules` in order, first match wins:
 
