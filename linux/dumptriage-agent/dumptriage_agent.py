@@ -349,7 +349,7 @@ def iso(dt):
 
 
 class Queue:
-    def __init__(self, path):
+    def __init__(self, path, clock=None):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.created = not Path(path).exists()  # a first run, not an upgrade (#17)
         self.db = sqlite3.connect(path, timeout=30)
@@ -364,6 +364,10 @@ class Queue:
             CREATE INDEX IF NOT EXISTS idx_dumps_state ON dumps(state);
             CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
         """)
+        if self.created:
+            # Recorded with the file itself, so a first run that dies before the agent starts
+            # watching isn't later mistaken for an upgrade (which filters nothing, #17).
+            self.set_meta("watching_since_utc", iso((clock or utcnow)()))
 
     def add(self, **row):
         cols = ", ".join(row)
@@ -480,7 +484,7 @@ def open_by_other_process(path):
 class Agent:
     def __init__(self, config, config_dir, state_dir, queue=None, uploader=upload_dump, clock=utcnow):
         self.cfg, self.config_dir, self.state_dir = config, Path(config_dir), Path(state_dir)
-        self.queue = queue or Queue(self.state_dir / "queue.db")
+        self.queue = queue or Queue(self.state_dir / "queue.db", clock)
         self.uploader, self.clock = uploader, clock
         self.stable = {}  # path -> (size, mtime_ns, first_seen_unchanged_monotonic)
         self.ignored = set()  # (path, size, mtime_ns) already sniffed as not-a-dump
@@ -493,8 +497,8 @@ class Agent:
         # always count. Never later than now, in case the clock was ahead when it was recorded.
         now = self.clock()
         since = self.queue.meta("watching_since_utc")
-        if since is None:
-            since = iso(now) if self.queue.created else iso(datetime(1970, 1, 1, tzinfo=timezone.utc))
+        if since is None:  # a queue from before this setting (a new one gets it on creation): an upgrade
+            since = iso(datetime(1970, 1, 1, tzinfo=timezone.utc))
             self.queue.set_meta("watching_since_utc", since)
         elif datetime.fromisoformat(since) > now:
             since = iso(now)
