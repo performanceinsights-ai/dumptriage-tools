@@ -66,10 +66,17 @@ public sealed class DataDirectoryGuardTests : IDisposable
         var elsewhere = Path.Combine(_root, "elsewhere");
         Directory.CreateDirectory(dir);
         Directory.CreateDirectory(elsewhere);
-        Junction(Path.Combine(dir, "logs"), elsewhere);
-
-        var ex = Assert.Throws<UnauthorizedAccessException>(() => DataDirectoryGuard.Secure(dir));
-        Assert.Contains("junction", ex.Message);
+        var link = Path.Combine(dir, "logs");
+        Junction(link, elsewhere);
+        try
+        {
+            var ex = Assert.Throws<UnauthorizedAccessException>(() => DataDirectoryGuard.Secure(dir));
+            Assert.Contains("junction", ex.Message);
+        }
+        finally
+        {
+            Directory.Delete(link); // the link only; a recursive delete in Dispose can't remove junctions
+        }
     }
 
     [Fact]
