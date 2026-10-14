@@ -69,8 +69,14 @@ fine on Linux/macOS too, which is how this was developed/tested.)
 ## Installing
 
 ```powershell
-.\installer\install.ps1 -ApiKey dts_xxx -AgentPublishDir .\publish\agent -TrayPublishDir .\publish\tray
+.\installer\install.ps1 -AgentPublishDir .\publish\agent -TrayPublishDir .\publish\tray
 ```
+
+On a first install the script asks for the API key at a masked prompt. For an
+unattended install, put the key in a file and pass `-ApiKeyFile key.txt`; the
+file is deleted once the key is stored. The key is never accepted as a
+command-line argument, because that would leave it in PowerShell history and
+in process-creation audit logs.
 
 Registers the `DumpTriageAgent` Windows Service (auto-start), provisions the
 API key (encrypted at rest with machine-scope DPAPI — never written to disk
