@@ -47,6 +47,9 @@ for `stableSeconds` and no other process holds it open. systemd-coredump's `.zst
 are sniffed through the decompressor and uploaded decompressed (the backend needs the raw ELF) via a spool
 file in the state directory that is removed afterwards; `zstd` / `lz4` must be installed for those two.
 
+
+Files older than the agent's first run are left alone, so a fresh install doesn't upload every old core
+already in the watched folders; a core written while the agent was stopped is still picked up.
 ## Configuration
 
 `/etc/dumptriage/config.json` (system) or `~/.config/dumptriage/config.json` (user), same model as Windows.

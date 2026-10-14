@@ -603,5 +603,26 @@ class ReviewFixTests(AgentTestBase):
             locked.chmod(0o755)
 
 
+    def test_cores_older_than_the_first_run_are_left_alone(self):  # #17
+        old, new = self.watch / "core.old.1.2", self.watch / "core.new.1.2"
+        old.write_bytes(USER_CORE)
+        new.write_bytes(USER_CORE + b"new")
+        then = self.now.timestamp() - 86400
+        os.utime(old, (then, then))
+        a = self.agent()
+        self.settle(a)
+        self.assertEqual(self.rows(a), {"core.new.1.2": da.SUBMITTED})
+
+    def test_an_existing_queue_watches_since_its_oldest_record(self):  # #17
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent()
+        self.settle(a)
+        a.queue.db.execute("DELETE FROM meta WHERE k = 'watching_since_utc'")
+        a.queue.db.commit()
+        self.now += timedelta(days=3)  # upgraded later: the meta value is new, the queue is not
+        b = self.agent()
+        self.assertEqual(b.queue.meta("watching_since_utc"), a.queue.get(a.queue.in_state(da.SUBMITTED)[0]["id"])["detected_at_utc"])
+
+
 if __name__ == "__main__":
     unittest.main()

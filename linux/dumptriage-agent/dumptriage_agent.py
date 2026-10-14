@@ -486,6 +486,15 @@ class Agent:
         self.untrusted = set()  # (watched root, problem) already logged by candidates
         self.hostname = socket.gethostname() if config["sendHostname"] else None
         self.queue.recover()
+        # Files older than the agent's first run are left alone (#17): a fresh install mustn't upload
+        # every old core already lying around. An existing queue has been watching since its oldest
+        # record; files written while the agent was stopped still count.
+        since = self.queue.meta("watching_since_utc")
+        if since is None:
+            oldest = self.queue.db.execute("SELECT MIN(detected_at_utc) FROM dumps").fetchone()[0]
+            since = oldest or iso(self.clock())
+            self.queue.set_meta("watching_since_utc", since)
+        self.watching_since_ns = int(datetime.fromisoformat(since).timestamp()) * 1_000_000_000
 
     def api_key(self):
         key_file = self.config_dir / "api-key"
@@ -535,6 +544,8 @@ class Agent:
             # Not a symlink, not a hard link: see open_dump (#4).
             if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size == 0:
                 continue
+            if st.st_mtime_ns < self.watching_since_ns:
+                continue  # older than the agent's first run (#17)
             ident = (path, st.st_size, st.st_mtime_ns)
             dump_id = hashlib.sha256(f"{path}|{st.st_ino}|{st.st_mtime_ns}".encode()).hexdigest()[:32]
             if ident in self.ignored or self.queue.known(dump_id):
