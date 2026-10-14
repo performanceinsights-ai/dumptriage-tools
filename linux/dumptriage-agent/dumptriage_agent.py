@@ -132,15 +132,22 @@ class NotWatched(OSError):
 
 
 def trusted_root(root):
-    """A watched root is trusted only if it, and the symlink naming it if it is one, belong to root or
-    to the agent's own user: /var/crash is world-writable, so another user could otherwise create
-    /var/crash/dumptriage (or a symlink by that name) before configure-dumps.sh does."""
+    """Whether a watched root can be trusted not to have been planted by another user. /var/crash is
+    world-writable, so another user could create /var/crash/dumptriage (or a symlink by that name)
+    before configure-dumps.sh does. Trusted: it (and the symlink naming it) belongs to root or to the
+    agent's user, or it sits in a folder only root or the agent's user can write to, such as an app's
+    own dump folder owned by its service user under /var/lib."""
     try:
         link, target = os.lstat(root), os.stat(root)
+        parent = os.stat(os.path.dirname(os.path.abspath(root)))
     except OSError:
         return False
+    if not stat.S_ISDIR(target.st_mode):
+        return False
     ok = (0, os.geteuid())
-    return stat.S_ISDIR(target.st_mode) and target.st_uid in ok and link.st_uid in ok
+    if link.st_uid in ok and target.st_uid in ok:
+        return True
+    return parent.st_uid in ok and not parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
 
 
 def open_dump(path, roots):
@@ -153,8 +160,11 @@ def open_dump(path, roots):
     with a single link. The root itself is the admin's configuration and may be a symlink."""
     path = os.path.abspath(path)
     root = max((r for r in roots if path.startswith(r.rstrip("/") + "/")), key=len, default=None)
-    if root is None or not trusted_root(root):
-        raise NotWatched(errno.EPERM, "not under a trusted watched path", path)
+    if root is None:
+        raise NotWatched(errno.EPERM, "no longer under a watched path; add its folder back to watchedPaths and run `retry`", path)
+    if not trusted_root(root):
+        raise NotWatched(errno.EPERM, f"its watched path {root} is not trusted: it must belong to root or this agent's user, "
+                                      "or sit in a folder only they can write to", path)
     parts = os.path.relpath(path, root).split(os.sep)
     dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -531,7 +541,7 @@ class Agent:
             return
         if self.auth_paused(now):
             return  # the key was refused; don't send dumps to be refused again (#11)
-        key = self.api_key()
+        key, self.used_key_stamp = self.api_key(), self.key_stamp()
         due = [r for r in self.queue.in_state(QUEUED) if not r["next_attempt_utc"] or datetime.fromisoformat(r["next_attempt_utc"]) <= now]
         if due and not key:
             log.error("no API key at %s; run `dumptriage-agent set-api-key`", self.config_dir / "api-key")
@@ -583,7 +593,7 @@ class Agent:
                     path, name = f"/proc/self/fd/{f.fileno()}", os.path.basename(r["file_path"])
                 outcome, status, msg = self.uploader(self.cfg["apiBaseUrl"], key, path, self.hostname, name)
         except NotWatched as e:
-            outcome, status, msg = REJECTED, None, f"{e}; add its folder back to watchedPaths and run `retry`"
+            outcome, status, msg = REJECTED, None, str(e)
         except (OSError, subprocess.SubprocessError, lzma.LZMAError) as e:
             outcome, status, msg = TRANSIENT, None, str(e)
         finally:
@@ -598,7 +608,7 @@ class Agent:
             self.queue.update(r["id"], state=FAILED, last_error=f"{status}: {msg}")
         elif outcome == AUTH:
             # Not the dump's fault and no attempt used: the key is wrong, revoked or rotated.
-            stamp = self.key_stamp()
+            stamp = self.used_key_stamp  # the key this upload used, not one stored meanwhile
             streak = int(self.queue.meta("auth_refusals") or 0) + 1 if self.queue.meta("auth_refused_key_stamp") == stamp else 1
             pause = min(AUTH_BACKOFF_SECONDS * 2 ** (streak - 1), 6 * 3600)
             log.error("upload of %s refused (%s): the API key is invalid or revoked; store a new one with "
@@ -633,21 +643,34 @@ class Agent:
             # name if it is free, else name.<id8>, which only this dump uses (as on Windows).
             name = Path(r["file_path"]).name
             stem, ext = os.path.splitext(name)
-            ours = dest / f"{stem}.{r['id'][:8]}{ext}"
+            plain, ours = dest / name, dest / f"{stem}.{r['id'][:8]}{ext}"
             st = os.fstat(f.fileno())
-            # Created 0600 and then given the dump's own mode (as copy2 did): a core is someone's memory.
-            try:
-                target, fd = dest / name, os.open(dest / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            except FileExistsError:
-                target, fd = ours, os.open(ours, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            try:
-                with os.fdopen(fd, "wb") as out:
-                    os.fchmod(out.fileno(), stat.S_IMODE(st.st_mode))
-                    shutil.copyfileobj(f, out, 1 << 20)
-                os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns))
-            except BaseException:
-                target.unlink(missing_ok=True)  # never leave a partial copy behind (as on Windows)
-                raise
+            for done in (plain, ours):
+                try:
+                    d = done.stat()
+                except OSError:
+                    continue
+                if (d.st_size, d.st_mtime_ns) == (st.st_size, st.st_mtime_ns):
+                    break  # copied by an attempt that died before recording it
+            else:
+                # Written under a temporary name, created 0600 and given the dump's own mode (as copy2
+                # did: a core is someone's memory), then linked in without replacing anything, so a
+                # failed or killed copy never leaves a partial file under a real name.
+                tmp = dest / f".{stem}.{r['id'][:8]}{ext}.partial"
+                try:
+                    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    with os.fdopen(fd, "wb") as out:
+                        os.fchmod(out.fileno(), stat.S_IMODE(st.st_mode))
+                        shutil.copyfileobj(f, out, 1 << 20)
+                    os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+                    try:
+                        os.link(tmp, plain)
+                    except FileExistsError:
+                        os.replace(tmp, ours)
+                    except OSError:  # no hard links on this filesystem (an SMB share): check, then move
+                        os.replace(tmp, ours if plain.exists() else plain)
+                finally:
+                    tmp.unlink(missing_ok=True)
             self.queue.update(r["id"], central_copied_at_utc=iso(self.clock()), central_copy_error=None)
         except OSError as e:  # best effort: submission still proceeds
             log.warning("central copy of %s failed: %s", r["file_path"], e)

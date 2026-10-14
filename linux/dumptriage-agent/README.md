@@ -98,7 +98,10 @@ A central copy never overwrites another dump's copy: if the name is taken (kdump
 Capture folders like `/var/crash/dumptriage` are world-writable, so the agent never follows a symlink
 below a watched path and only reads regular files with a single link. A symlink planted there (to
 `/proc/kcore`, or to another user's core) is ignored rather than uploaded. A watched path itself must belong to root or to the agent's user, or
-it is not watched (another user could otherwise create `/var/crash/dumptriage` first).
+sit in a folder only they can write to (an app's own dump folder under `/var/lib` is fine); otherwise it
+is not watched, since another user could create `/var/crash/dumptriage` before `configure-dumps.sh` does.
+Central copies are written under a temporary name and moved into place, so a failed copy leaves nothing
+behind.
 
 ## Differences from the Windows agent
 

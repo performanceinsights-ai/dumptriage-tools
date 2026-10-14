@@ -471,5 +471,41 @@ class ReviewFixTests(AgentTestBase):
         self.assertIn("watchedPaths", row["last_error"])
 
 
+    def test_central_copy_is_not_repeated_after_a_crash_before_it_was_recorded(self):  # review of #14
+        dest = self.tmp / "archive"
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent(policy={"mode": "AskFirst"},
+                       centralCopy={"enabled": True, "destinationPath": str(dest), "organizeByHostname": False})
+        self.settle(a)
+        r = a.queue.in_state(da.PENDING)[0]
+        with da.open_dump(r["file_path"], a.roots()) as f:
+            a.central_copy(r, f)
+        a.queue.update(r["id"], central_copied_at_utc=None)  # as if killed before the queue recorded it
+        with da.open_dump(r["file_path"], a.roots()) as f:
+            a.central_copy(a.queue.get(r["id"]), f)
+        self.assertEqual(sorted(p.name for p in dest.iterdir()), ["core.a.1.2"])
+
+    def test_root_owned_by_a_service_user_is_trusted_in_a_safe_parent(self):  # review of #14
+        safe = self.tmp / "safe"
+        safe.mkdir(mode=0o755)
+        (safe / "dumps").mkdir()
+        orig = os.geteuid
+        os.geteuid = lambda: orig() + 12345  # the agent is someone else; the folders aren't its own
+        try:
+            self.assertFalse(da.trusted_root(str(safe / "dumps")))  # parent owned by "another" user
+        finally:
+            os.geteuid = orig
+        self.assertTrue(da.trusted_root(str(safe / "dumps")))
+        shared = self.tmp / "shared"
+        shared.mkdir()
+        shared.chmod(0o1777)
+        (shared / "dumps").mkdir()
+        os.geteuid = lambda: orig() + 12345
+        try:
+            self.assertFalse(da.trusted_root(str(shared / "dumps")))  # world-writable parent, not ours
+        finally:
+            os.geteuid = orig
+
+
 if __name__ == "__main__":
     unittest.main()
