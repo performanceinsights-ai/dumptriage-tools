@@ -26,6 +26,12 @@ public sealed class DumpQueueStore : IAsyncDisposable
     /// <summary>True when this open created the queue file: a first run, not an upgrade.</summary>
     public bool CreatedNew { get; }
 
+    /// <summary>
+    /// Meta key: the folder scans take only files written since then. Set when the queue file is
+    /// created; a queue without it predates the setting (an upgrade).
+    /// </summary>
+    public const string WatchingSinceKey = "watching_since_utc";
+
     public static async Task<DumpQueueStore> OpenAsync(string dbPath, CancellationToken cancellationToken = default)
     {
         var directory = Path.GetDirectoryName(dbPath);
@@ -50,6 +56,12 @@ public sealed class DumpQueueStore : IAsyncDisposable
 
         var store = new DumpQueueStore(connection, createdNew);
         await store.EnsureSchemaAsync(cancellationToken);
+        if (createdNew)
+        {
+            // Recorded with the file itself, so a first start that dies before the watcher runs
+            // isn't later mistaken for an upgrade (which would filter nothing).
+            await store.SetMetaAsync(WatchingSinceKey, DateTimeOffset.UtcNow.ToString("O"), cancellationToken);
+        }
         return store;
     }
 

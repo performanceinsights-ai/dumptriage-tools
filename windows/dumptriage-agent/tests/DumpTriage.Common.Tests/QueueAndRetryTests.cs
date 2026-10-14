@@ -58,6 +58,7 @@ public sealed class QueueAndRetryTests : IDisposable
         await using (var first = await DumpQueueStore.OpenAsync(_db))
         {
             Assert.True(first.CreatedNew);
+            Assert.NotNull(await first.GetMetaAsync(DumpQueueStore.WatchingSinceKey)); // recorded with the file
         }
         await using var again = await DumpQueueStore.OpenAsync(_db);
         Assert.False(again.CreatedNew);

@@ -41,7 +41,6 @@ public sealed class DumpWatcherService : BackgroundService
     // Files older than the agent's first start are not picked up by a folder scan (#5): a fresh
     // install mustn't upload years of old minidumps. Set from the queue in ExecuteAsync.
     private DateTimeOffset _watchingSinceUtc = DateTimeOffset.MaxValue;
-    private const string WatchingSinceKey = "watching_since_utc";
 
     // (path, size, mtime) whose content is already tracked under another path: not rehashed again.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(string, long, DateTime), bool> _knownDuplicates = new();
@@ -250,22 +249,22 @@ public sealed class DumpWatcherService : BackgroundService
     {
         _stoppingToken = stoppingToken;
         var now = DateTimeOffset.UtcNow;
-        if (await _queueStore.GetMetaAsync(WatchingSinceKey, stoppingToken) is { } since)
+        if (await _queueStore.GetMetaAsync(DumpQueueStore.WatchingSinceKey, stoppingToken) is { } since)
         {
             _watchingSinceUtc = DateTimeOffset.Parse(since, null, System.Globalization.DateTimeStyles.RoundtripKind);
             if (_watchingSinceUtc > now)
             {
                 _watchingSinceUtc = now; // the clock was ahead when it was recorded
-                await _queueStore.SetMetaAsync(WatchingSinceKey, now.ToString("O"), stoppingToken);
+                await _queueStore.SetMetaAsync(DumpQueueStore.WatchingSinceKey, now.ToString("O"), stoppingToken);
             }
         }
         else
         {
-            // A new queue is a fresh install: start now. An existing one is an upgrade from a version
-            // that has already seen everything in its folders, so it filters nothing, and dumps written
-            // while the service was down for the upgrade still count.
-            _watchingSinceUtc = _queueStore.CreatedNew ? now : DateTimeOffset.UnixEpoch;
-            await _queueStore.SetMetaAsync(WatchingSinceKey, _watchingSinceUtc.ToString("O"), stoppingToken);
+            // A queue from before this setting (a new one gets it when the file is created): an
+            // upgrade from a version that has already seen everything in its folders, so filter
+            // nothing, and dumps written while the service was down for the upgrade still count.
+            _watchingSinceUtc = DateTimeOffset.UnixEpoch;
+            await _queueStore.SetMetaAsync(DumpQueueStore.WatchingSinceKey, _watchingSinceUtc.ToString("O"), stoppingToken);
         }
 
         await RecoverUnfinishedAsync(stoppingToken);
