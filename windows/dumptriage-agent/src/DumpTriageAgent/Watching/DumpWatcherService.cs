@@ -46,6 +46,7 @@ public sealed class DumpWatcherService : BackgroundService
     // (path, size, mtime) whose content is already tracked under another path: not rehashed again.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(string, long, DateTime), bool> _knownDuplicates = new();
 
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> _loggedOld = new();
     private CancellationToken _stoppingToken;
     private int _retryLoopRunning;
 
@@ -182,9 +183,17 @@ public sealed class DumpWatcherService : BackgroundService
             {
                 foreach (var file in Directory.EnumerateFiles(path, filter))
                 {
-                    if (File.GetLastWriteTimeUtc(file) >= _watchingSinceUtc.UtcDateTime)
+                    // The later of write and creation time: a dump copied in on purpose keeps its old
+                    // write time but gets a new creation time.
+                    var latest = File.GetLastWriteTimeUtc(file) > File.GetCreationTimeUtc(file)
+                        ? File.GetLastWriteTimeUtc(file) : File.GetCreationTimeUtc(file);
+                    if (latest >= _watchingSinceUtc.UtcDateTime)
                     {
                         _candidatePaths.Writer.TryWrite(file);
+                    }
+                    else if (_loggedOld.TryAdd(file, true))
+                    {
+                        _logger.LogInformation("Ignoring {Path}: older than this agent's first start", file);
                     }
                 }
             }
@@ -240,15 +249,22 @@ public sealed class DumpWatcherService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _stoppingToken = stoppingToken;
+        var now = DateTimeOffset.UtcNow;
         if (await _queueStore.GetMetaAsync(WatchingSinceKey, stoppingToken) is { } since)
         {
             _watchingSinceUtc = DateTimeOffset.Parse(since, null, System.Globalization.DateTimeStyles.RoundtripKind);
+            if (_watchingSinceUtc > now)
+            {
+                _watchingSinceUtc = now; // the clock was ahead when it was recorded
+                await _queueStore.SetMetaAsync(WatchingSinceKey, now.ToString("O"), stoppingToken);
+            }
         }
         else
         {
-            // First start of this version. An existing install has been watching since its first
-            // record, so dumps written while it was down for this upgrade still count.
-            _watchingSinceUtc = await _queueStore.GetEarliestDetectedAsync(stoppingToken) ?? DateTimeOffset.UtcNow;
+            // A new queue is a fresh install: start now. An existing one is an upgrade from a version
+            // that has already seen everything in its folders, so it filters nothing, and dumps written
+            // while the service was down for the upgrade still count.
+            _watchingSinceUtc = _queueStore.CreatedNew ? now : DateTimeOffset.UnixEpoch;
             await _queueStore.SetMetaAsync(WatchingSinceKey, _watchingSinceUtc.ToString("O"), stoppingToken);
         }
 

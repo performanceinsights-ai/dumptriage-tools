@@ -17,10 +17,14 @@ public sealed class DumpQueueStore : IAsyncDisposable
     // handlers and status broadcaster all share this one instance.
     private readonly SemaphoreSlim _gate = new(1, 1);
 
-    private DumpQueueStore(SqliteConnection connection)
+    private DumpQueueStore(SqliteConnection connection, bool createdNew)
     {
         _connection = connection;
+        CreatedNew = createdNew;
     }
+
+    /// <summary>True when this open created the queue file: a first run, not an upgrade.</summary>
+    public bool CreatedNew { get; }
 
     public static async Task<DumpQueueStore> OpenAsync(string dbPath, CancellationToken cancellationToken = default)
     {
@@ -40,10 +44,11 @@ public sealed class DumpQueueStore : IAsyncDisposable
         // one connection to this exact file for the service's lifetime, so
         // pooling has no benefit here — disabling it makes Dispose actually
         // release the handle deterministically.
+        var createdNew = !File.Exists(dbPath);
         var connection = new SqliteConnection($"Data Source={dbPath};Pooling=False");
         await connection.OpenAsync(cancellationToken);
 
-        var store = new DumpQueueStore(connection);
+        var store = new DumpQueueStore(connection, createdNew);
         await store.EnsureSchemaAsync(cancellationToken);
         return store;
     }
@@ -82,19 +87,6 @@ public sealed class DumpQueueStore : IAsyncDisposable
             alter.CommandText = "ALTER TABLE dumps ADD COLUMN next_attempt_utc TEXT NULL;";
             await alter.ExecuteNonQueryAsync(cancellationToken);
         }
-    }
-
-    /// <summary>When the oldest record in the queue was detected, or null for an empty queue.</summary>
-    public async Task<DateTimeOffset?> GetEarliestDetectedAsync(CancellationToken cancellationToken = default)
-    {
-        await _gate.WaitAsync(cancellationToken);
-        try
-        {
-            using var command = _connection.CreateCommand();
-            command.CommandText = "SELECT detected_at_utc FROM dumps ORDER BY detected_at_utc ASC LIMIT 1;";
-            return await command.ExecuteScalarAsync(cancellationToken) is string value ? DateTimeOffset.Parse(value) : null;
-        }
-        finally { _gate.Release(); }
     }
 
     /// <summary>A small persistent value, such as when the last scheduled flush ran.</summary>

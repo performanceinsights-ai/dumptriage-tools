@@ -53,6 +53,17 @@ public sealed class QueueAndRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task CreatedNew_tells_a_first_run_from_an_upgrade()
+    {
+        await using (var first = await DumpQueueStore.OpenAsync(_db))
+        {
+            Assert.True(first.CreatedNew);
+        }
+        await using var again = await DumpQueueStore.OpenAsync(_db);
+        Assert.False(again.CreatedNew);
+    }
+
+    [Fact]
     public async Task Meta_values_persist()
     {
         await using (var queue = await DumpQueueStore.OpenAsync(_db))
