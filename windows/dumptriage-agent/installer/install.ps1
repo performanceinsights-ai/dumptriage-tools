@@ -34,26 +34,32 @@
 .PARAMETER InstallDir
     Where to copy both apps on this machine. Defaults to Program Files.
 #>
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$ApiKeyFile,
     [switch]$PromptForApiKey,
-    # Removed: kept only to fail with a clear message instead of "parameter not found".
+    # Removed: kept only so an old call fails with a clear message.
     [Parameter(DontShow = $true)][string]$ApiKey,
-    [Parameter(Mandatory = $true)][string]$AgentPublishDir,
-    [Parameter(Mandatory = $true)][string]$TrayPublishDir,
-    [string]$InstallDir = "$env:ProgramFiles\DumpTriage"
+    [Parameter(Position = 0, Mandatory = $true)][string]$AgentPublishDir,
+    [Parameter(Position = 1, Mandatory = $true)][string]$TrayPublishDir,
+    [Parameter(Position = 2)][string]$InstallDir = "$env:ProgramFiles\DumpTriage"
 )
 
 $ErrorActionPreference = "Stop"
 
-if ($ApiKey) {
+# An old positional call (`install.ps1 dts_xxx <agent> <tray>`) binds the key to
+# a path parameter; catch it here so no later error message echoes it.
+$keyInPath = @($AgentPublishDir, $TrayPublishDir, $InstallDir) | Where-Object { $_ -like 'dts_*' }
+if ($ApiKey -or $keyInPath) {
     throw "-ApiKey is no longer accepted: a key on the command line is saved in PowerShell history and process audit logs. Revoke that key in the portal, then use -ApiKeyFile <path> or -PromptForApiKey. Clear it from history with: Remove-Item (Get-PSReadLineOption).HistorySavePath"
 }
 if ($ApiKeyFile -and $PromptForApiKey) {
     throw "Use either -ApiKeyFile or -PromptForApiKey, not both."
 }
-if ($ApiKeyFile -and -not (Test-Path -LiteralPath $ApiKeyFile -PathType Leaf)) {
-    throw "API key file not found: $ApiKeyFile"
+foreach ($dir in @($AgentPublishDir, $TrayPublishDir)) {
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+        throw "Publish directory not found: $dir"
+    }
 }
 
 $ServiceName = "DumpTriageAgent"
@@ -63,11 +69,35 @@ $AgentExe = Join-Path $AgentInstallDir "DumpTriageAgent.exe"
 $TrayExe = Join-Path $TrayInstallDir "DumpTriageTray.exe"
 $TaskName = "DumpTriageTray"
 
+$existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+
+# Read the key before touching the installed service, so a bad key file or an
+# abandoned prompt leaves the current install running as it was.
+# A first install prompts unless the session can't answer (-NonInteractive, or no console).
+$canPrompt = [Environment]::UserInteractive -and
+    -not ([Environment]::GetCommandLineArgs() | Where-Object { $_ -like '-NonI*' })
+$plaintextKey = $null
+if ($ApiKeyFile) {
+    if (-not (Test-Path -LiteralPath $ApiKeyFile -PathType Leaf)) {
+        throw "API key file not found: $ApiKeyFile"
+    }
+    $plaintextKey = "$(Get-Content -LiteralPath $ApiKeyFile -Raw)".Trim()
+    if (-not $plaintextKey) {
+        throw "API key file is empty: $ApiKeyFile"
+    }
+}
+elseif ($PromptForApiKey -or (-not $existingService -and $canPrompt)) {
+    $secure = Read-Host -Prompt "DumpTriage API key (dts_...)" -AsSecureString
+    $plaintextKey = [System.Net.NetworkCredential]::new("", $secure).Password.Trim()
+    if (-not $plaintextKey -and $PromptForApiKey) {
+        throw "No API key entered."
+    }
+}
+
 Write-Host "Installing DumpTriage agent into $InstallDir"
 New-Item -ItemType Directory -Force -Path $AgentInstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path $TrayInstallDir | Out-Null
 
-$existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($existingService) {
     Write-Host "Stopping existing service for upgrade..."
     Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
@@ -75,18 +105,6 @@ if ($existingService) {
 
 Copy-Item -Path (Join-Path $AgentPublishDir "*") -Destination $AgentInstallDir -Recurse -Force
 Copy-Item -Path (Join-Path $TrayPublishDir "*") -Destination $TrayInstallDir -Recurse -Force
-
-# A first install prompts unless the session can't answer (-NonInteractive, or no console).
-$canPrompt = [Environment]::UserInteractive -and
-    -not ([Environment]::GetCommandLineArgs() | Where-Object { $_ -like '-NonI*' })
-$plaintextKey = $null
-if ($ApiKeyFile) {
-    $plaintextKey = (Get-Content -LiteralPath $ApiKeyFile -Raw).Trim()
-}
-elseif ($PromptForApiKey -or (-not $existingService -and $canPrompt)) {
-    $secure = Read-Host -Prompt "DumpTriage API key (dts_...)" -AsSecureString
-    $plaintextKey = [System.Net.NetworkCredential]::new("", $secure).Password.Trim()
-}
 
 if ($plaintextKey) {
     Write-Host "Provisioning API key..."
