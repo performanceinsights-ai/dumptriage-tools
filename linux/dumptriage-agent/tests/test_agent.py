@@ -77,7 +77,6 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(da.should_submit_now(b, datetime(2026, 10, 7, 1, 0), datetime(2026, 10, 6, 3, 0)))
         self.assertTrue(da.should_submit_now(b, datetime(2026, 10, 7, 3, 0), datetime(2026, 10, 6, 3, 0)))
         self.assertFalse(da.should_submit_now(b, datetime(2026, 10, 7, 3, 0), datetime(2026, 10, 7, 2, 30)))
-        self.assertFalse(da.should_submit_now(b, datetime(2026, 10, 7, 3, 0), None))  # no flush yet: wait for a slot
         self.assertTrue(da.should_submit_now({"mode": "Immediate"}, self.NOW, None))
 
 
@@ -290,8 +289,6 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(da.upload_dump("http://127.0.0.1:1", "k", str(p), None)[0], da.TRANSIENT)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ReviewFixTests(AgentTestBase):
@@ -397,3 +394,82 @@ class ReviewFixTests(AgentTestBase):
         a.tick()
         self.assertEqual(self.rows(a), {"core.a.1.2": da.SUBMITTED})
 
+    def test_central_copy_keeps_the_dump_mode_and_leaves_no_partial_file(self):  # review of #14
+        dest = self.tmp / "archive"
+        core = self.watch / "core.a.1.2"
+        core.write_bytes(USER_CORE)
+        core.chmod(0o600)
+        a = self.agent(centralCopy={"enabled": True, "destinationPath": str(dest), "organizeByHostname": False})
+        self.settle(a)
+        self.assertEqual((dest / "core.a.1.2").stat().st_mode & 0o777, 0o600)
+
+        def broken(src, dst, length=0):
+            dst.write(b"partial")
+            raise OSError("disk full")
+        (self.watch / "core.b.1.2").write_bytes(USER_CORE + b"b")
+        orig, da.shutil.copyfileobj = da.shutil.copyfileobj, broken
+        try:
+            self.settle(a)
+        finally:
+            da.shutil.copyfileobj = orig
+        self.assertFalse((dest / "core.b.1.2").exists())
+
+    def test_auth_pause_doubles_and_a_new_key_ends_it(self):  # review of #14
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent(FakeUploader(*[(da.AUTH, 401, "revoked")] * 2))
+        self.settle(a)  # refusal 1: 10 min
+        self.now += timedelta(minutes=11)
+        a.tick()  # refusal 2: 20 min
+        self.assertEqual(len(self.uploader.calls), 2)
+        self.now += timedelta(minutes=15)
+        a.tick()
+        self.assertEqual(len(self.uploader.calls), 2)  # still paused (20 min)
+        key = self.cfgdir / "api-key"
+        key.write_text("dts_new\n")
+        os.utime(key, ns=(1, 2))  # a different mtime, whatever the clock resolution
+        a.tick()
+        self.assertEqual(self.rows(a), {"core.a.1.2": da.SUBMITTED})
+
+    def test_scheduled_slot_during_an_auth_pause_is_taken_after_it(self):  # review of #14
+        batching = {"mode": "ScheduledTimeOfDay", "scheduledTimesLocal": ["02:00"]}
+        local = lambda h, m=0: datetime(2026, 10, 7, h, m).astimezone().astimezone(timezone.utc)
+        self.now = local(1)
+        a = self.agent(FakeUploader((da.AUTH, 401, "revoked")), policy={"mode": "AlwaysSubmit", "batching": batching})
+        a.tick()
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        self.settle(a)  # queued, waiting for 02:00
+        self.now = local(2, 1)
+        a.tick()  # refused: paused until 02:11
+        self.now = local(2, 5)
+        a.tick()
+        self.now = local(2, 12)
+        a.tick()  # the 02:00 slot was not used up by the refused attempt
+        self.assertEqual(self.rows(a), {"core.a.1.2": da.SUBMITTED})
+
+    def test_untrusted_watched_root_is_not_read(self):  # review of #14
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent()
+        orig = os.geteuid
+        os.geteuid = lambda: orig() + 12345  # as if the folder belonged to another user
+        try:
+            self.settle(a)
+            with self.assertRaises(da.NotWatched):
+                da.open_dump(str(self.watch / "core.a.1.2"), a.roots())
+        finally:
+            os.geteuid = orig
+        self.assertEqual(self.rows(a), {})
+
+    def test_dump_no_longer_under_a_watched_path_fails_with_a_reason(self):  # review of #14
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent(policy={"mode": "AskFirst"})
+        self.settle(a)
+        a.queue.update(a.queue.in_state(da.PENDING)[0]["id"], state=da.QUEUED)
+        a.cfg = da.merge(a.cfg, {"watchedPaths": [str(self.tmp / "other")]})
+        a.submit_due()
+        row = a.queue.db.execute("SELECT state, last_error FROM dumps").fetchone()
+        self.assertEqual(row["state"], da.FAILED)
+        self.assertIn("watchedPaths", row["last_error"])
+
+
+if __name__ == "__main__":
+    unittest.main()

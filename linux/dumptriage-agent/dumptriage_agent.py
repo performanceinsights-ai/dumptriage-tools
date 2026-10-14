@@ -127,6 +127,22 @@ def decompress_to(f, compression, dest):
         subprocess.run(_DECOMPRESSORS[compression], stdin=f, stdout=out, check=True)
 
 
+class NotWatched(OSError):
+    """The path is not under a watched path the agent trusts (any more)."""
+
+
+def trusted_root(root):
+    """A watched root is trusted only if it, and the symlink naming it if it is one, belong to root or
+    to the agent's own user: /var/crash is world-writable, so another user could otherwise create
+    /var/crash/dumptriage (or a symlink by that name) before configure-dumps.sh does."""
+    try:
+        link, target = os.lstat(root), os.stat(root)
+    except OSError:
+        return False
+    ok = (0, os.geteuid())
+    return stat.S_ISDIR(target.st_mode) and target.st_uid in ok and link.st_uid in ok
+
+
 def open_dump(path, roots):
     """Open a dump for reading without following any symlink below its watched root (#4).
 
@@ -137,8 +153,8 @@ def open_dump(path, roots):
     with a single link. The root itself is the admin's configuration and may be a symlink."""
     path = os.path.abspath(path)
     root = max((r for r in roots if path.startswith(r.rstrip("/") + "/")), key=len, default=None)
-    if root is None:
-        raise OSError(errno.EPERM, "not under a watched path", path)
+    if root is None or not trusted_root(root):
+        raise NotWatched(errno.EPERM, "not under a trusted watched path", path)
     parts = os.path.relpath(path, root).split(os.sep)
     dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -243,12 +259,10 @@ def should_submit_now(batching, now, last_flush):
 
     ScheduledTimeOfDay: only when a scheduled time has passed since the last flush.
     The caller records every flush, also one with nothing to send, so a dump queued
-    after an empty slot waits for the next one (#9); with no flush recorded yet it
-    waits for the first slot rather than uploading at once."""
+    after an empty slot waits for the next one (#9), and records a first run as a
+    flush, so it waits for the first slot rather than uploading at once."""
     mode = batching["mode"]
     if mode == "ScheduledTimeOfDay":
-        if last_flush is None:
-            return False
         for t in batching["scheduledTimesLocal"]:
             hh, mm = (int(x) for x in t.split(":")[:2])
             at = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
@@ -409,6 +423,7 @@ class Agent:
         self.uploader, self.clock = uploader, clock
         self.stable = {}  # path -> (size, mtime_ns, first_seen_unchanged_monotonic)
         self.ignored = set()  # (path, size, mtime_ns) already sniffed as not-a-dump
+        self.untrusted = set()  # watched roots refused by trusted_root, logged once
         self.hostname = socket.gethostname() if config["sendHostname"] else None
         self.queue.recover()
 
@@ -420,6 +435,11 @@ class Agent:
     def candidates(self):
         for root in self.cfg["watchedPaths"]:
             root = os.path.expanduser(root)
+            if os.path.exists(root) and not trusted_root(root):
+                if root not in self.untrusted:
+                    log.error("not watching %s: it must belong to root or to this agent's user", root)
+                    self.untrusted.add(root)
+                continue
             base_depth = root.rstrip("/").count("/")
             for dirpath, dirs, files in os.walk(root, onerror=lambda e: None):
                 if dirpath.count("/") - base_depth >= 2:
@@ -509,19 +529,38 @@ class Agent:
         last = datetime.fromisoformat(last) if last else None
         if not should_submit_now(batching, now.astimezone(), last.astimezone() if last else None):
             return
-        if batching["mode"] == "ScheduledTimeOfDay":
-            self.queue.set_meta("last_flush_utc", iso(now))  # this slot is used, even if nothing is due
-        backoff = self.queue.meta("auth_backoff_until_utc")
-        if backoff and datetime.fromisoformat(backoff) > now:
-            return  # the key was just refused; don't hammer the server (#11)
+        if self.auth_paused(now):
+            return  # the key was refused; don't send dumps to be refused again (#11)
         key = self.api_key()
         due = [r for r in self.queue.in_state(QUEUED) if not r["next_attempt_utc"] or datetime.fromisoformat(r["next_attempt_utc"]) <= now]
         if due and not key:
             log.error("no API key at %s; run `dumptriage-agent set-api-key`", self.config_dir / "api-key")
             return
+        refused = False
         for r in due:
             if self.submit_one(r, key) == AUTH:
+                refused = True
                 break  # the rest would be refused too
+        if batching["mode"] == "ScheduledTimeOfDay" and not refused:
+            # The slot is used, even if nothing was due. Not when the key was refused, or (returns
+            # above) during an auth pause or without a key: then it is taken once that clears.
+            self.queue.set_meta("last_flush_utc", iso(now))
+
+    def key_stamp(self):
+        try:
+            return str((self.config_dir / "api-key").stat().st_mtime_ns)
+        except OSError:
+            return ""
+
+    def auth_paused(self, now):
+        """After a 401/403, uploads wait AUTH_BACKOFF_SECONDS, doubling with each refusal in a row up to
+        6 h, since every attempt sends the whole dump. A new key (the file changed) ends the pause."""
+        until = self.queue.meta("auth_backoff_until_utc")
+        if not until or datetime.fromisoformat(until) <= now:
+            return False
+        if self.queue.meta("auth_refused_key_stamp") != self.key_stamp():
+            return False
+        return True
 
     def roots(self):
         return [os.path.abspath(os.path.expanduser(r)) for r in self.cfg["watchedPaths"]]
@@ -543,6 +582,8 @@ class Agent:
                     # (safely), whatever the path points at by now.
                     path, name = f"/proc/self/fd/{f.fileno()}", os.path.basename(r["file_path"])
                 outcome, status, msg = self.uploader(self.cfg["apiBaseUrl"], key, path, self.hostname, name)
+        except NotWatched as e:
+            outcome, status, msg = REJECTED, None, f"{e}; add its folder back to watchedPaths and run `retry`"
         except (OSError, subprocess.SubprocessError, lzma.LZMAError) as e:
             outcome, status, msg = TRANSIENT, None, str(e)
         finally:
@@ -550,17 +591,23 @@ class Agent:
                 spool.unlink(missing_ok=True)
         if outcome == SUCCESS:
             log.info("submitted %s", r["file_path"])
+            self.queue.set_meta("auth_refusals", "0")
             self.queue.update(r["id"], state=SUBMITTED, submitted_at_utc=iso(self.clock()), last_error=None)
         elif outcome in (REJECTED, QUOTA):
             log.warning("dump %s rejected (%s): %s", r["file_path"], status, msg)
             self.queue.update(r["id"], state=FAILED, last_error=f"{status}: {msg}")
         elif outcome == AUTH:
             # Not the dump's fault and no attempt used: the key is wrong, revoked or rotated.
+            stamp = self.key_stamp()
+            streak = int(self.queue.meta("auth_refusals") or 0) + 1 if self.queue.meta("auth_refused_key_stamp") == stamp else 1
+            pause = min(AUTH_BACKOFF_SECONDS * 2 ** (streak - 1), 6 * 3600)
             log.error("upload of %s refused (%s): the API key is invalid or revoked; store a new one with "
-                      "`dumptriage-agent set-api-key`; uploads paused for %d minutes",
-                      r["file_path"], status, AUTH_BACKOFF_SECONDS // 60)
+                      "`dumptriage-agent set-api-key`; uploads paused for %d minutes or until then",
+                      r["file_path"], status, pause // 60)
             self.queue.update(r["id"], state=QUEUED, last_error=f"{status}: authentication failed")
-            self.queue.set_meta("auth_backoff_until_utc", iso(self.clock() + timedelta(seconds=AUTH_BACKOFF_SECONDS)))
+            self.queue.set_meta("auth_refusals", str(streak))
+            self.queue.set_meta("auth_refused_key_stamp", stamp)
+            self.queue.set_meta("auth_backoff_until_utc", iso(self.clock() + timedelta(seconds=pause)))
         else:
             n = r["retry_count"] + 1
             if n >= self.cfg["maxRetries"]:
@@ -585,15 +632,22 @@ class Agent:
             # Never over another dump's copy (kdump names every dump "vmcore", #10): the plain
             # name if it is free, else name.<id8>, which only this dump uses (as on Windows).
             name = Path(r["file_path"]).name
-            try:
-                out = open(dest / name, "xb")
-            except FileExistsError:
-                stem, ext = os.path.splitext(name)
-                out = open(dest / f"{stem}.{r['id'][:8]}{ext}", "wb")
-            with out:
-                shutil.copyfileobj(f, out, 1 << 20)
+            stem, ext = os.path.splitext(name)
+            ours = dest / f"{stem}.{r['id'][:8]}{ext}"
             st = os.fstat(f.fileno())
-            os.utime(out.name, ns=(st.st_atime_ns, st.st_mtime_ns))
+            # Created 0600 and then given the dump's own mode (as copy2 did): a core is someone's memory.
+            try:
+                target, fd = dest / name, os.open(dest / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                target, fd = ours, os.open(ours, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as out:
+                    os.fchmod(out.fileno(), stat.S_IMODE(st.st_mode))
+                    shutil.copyfileobj(f, out, 1 << 20)
+                os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns))
+            except BaseException:
+                target.unlink(missing_ok=True)  # never leave a partial copy behind (as on Windows)
+                raise
             self.queue.update(r["id"], central_copied_at_utc=iso(self.clock()), central_copy_error=None)
         except OSError as e:  # best effort: submission still proceeds
             log.warning("central copy of %s failed: %s", r["file_path"], e)

@@ -86,16 +86,19 @@ dumptriage-agent status               # counts per state
 default). `NotifyOnly` dumps wait for `approve` with no timeout. Each pending dump is logged to the journal
 (`journalctl -u dumptriage-agent`) with the exact command. Transient failures retry with exponential
 backoff (30 s doubling, capped at 1 h) up to `maxRetries`; a 400, 413 or 429 is final (`Failed`). A 401 or 403 means the key
-is wrong or revoked: no attempt is used up, and uploads pause for 10 minutes (store a new key with
-`set-api-key`). With `ScheduledTimeOfDay`, uploads happen only once a scheduled time has passed since the
+is wrong or revoked: no attempt is used up, and uploads pause for 10 minutes, doubling with each refusal in
+a row up to 6 hours (every attempt sends the whole dump). Storing a new key with `set-api-key` ends the
+pause. With `ScheduledTimeOfDay`, uploads happen only once a scheduled time has passed since the
 last flush, and a slot with nothing queued still counts, so a dump queued after it waits for the next one.
 
 A central copy never overwrites another dump's copy: if the name is taken (kdump calls every dump
-`vmcore`), the copy is named `<name>.<first 8 characters of the dump id>`.
+`vmcore`), the copy gets the first 8 characters of the dump id before its extension (`vmcore.1a2b3c4d`,
+`core.app.1.2.1a2b3c4d.zst`). Copies keep the dump's file mode, so a 0600 core stays 0600.
 
 Capture folders like `/var/crash/dumptriage` are world-writable, so the agent never follows a symlink
 below a watched path and only reads regular files with a single link. A symlink planted there (to
-`/proc/kcore`, or to another user's core) is ignored rather than uploaded.
+`/proc/kcore`, or to another user's core) is ignored rather than uploaded. A watched path itself must belong to root or to the agent's user, or
+it is not watched (another user could otherwise create `/var/crash/dumptriage` first).
 
 ## Differences from the Windows agent
 
