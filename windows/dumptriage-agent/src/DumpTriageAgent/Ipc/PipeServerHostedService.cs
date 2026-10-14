@@ -58,11 +58,19 @@ public sealed class PipeServerHostedService : BackgroundService, ITrayChannel
             {
                 break;
             }
-            catch (UnauthorizedAccessException ex)
+            catch (PipeNameTakenException ex)
             {
-                // FirstPipeInstance: the name already exists, so some other process created it (#8).
-                // Trays refuse a server outside session 0, so it gets no prompts or answers from them.
-                _logger.LogCritical(ex, "Another process holds the pipe {PipeName}; trays can't reach the service until it exits. Retrying", IpcPipe.PipeName);
+                // FirstPipeInstance: the name still exists. Right after a restart that is usually the
+                // tray's handle on the old instance, gone within seconds; for longer, another process
+                // holds it (#8). Trays only talk to the service's own process, so it gets nothing from
+                // them. Logged once a minute at most, so it can't flood the event log.
+                _pipeTakenSince ??= DateTimeOffset.UtcNow;
+                var takenFor = DateTimeOffset.UtcNow - _pipeTakenSince.Value;
+                if (takenFor > TimeSpan.FromSeconds(30) && DateTimeOffset.UtcNow - _pipeTakenLoggedAt > TimeSpan.FromMinutes(1))
+                {
+                    _pipeTakenLoggedAt = DateTimeOffset.UtcNow;
+                    _logger.LogCritical(ex.InnerException, "Another process has held the pipe {PipeName} for {Seconds:0} s; trays can't reach the service until it exits", IpcPipe.PipeName, takenFor.TotalSeconds);
+                }
                 await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
             }
             catch (Exception ex)
@@ -73,9 +81,24 @@ public sealed class PipeServerHostedService : BackgroundService, ITrayChannel
         }
     }
 
+    private DateTimeOffset? _pipeTakenSince;
+    private DateTimeOffset _pipeTakenLoggedAt = DateTimeOffset.MinValue;
+
+    private sealed class PipeNameTakenException(Exception inner) : Exception("pipe name taken", inner);
+
     private async Task AcceptAndServeOneClientAsync(CancellationToken stoppingToken)
     {
-        await using var pipeServer = CreateServerStream();
+        NamedPipeServerStream created;
+        try
+        {
+            created = CreateServerStream();
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            throw new PipeNameTakenException(ex);
+        }
+        _pipeTakenSince = null;
+        await using var pipeServer = created;
 
         _logger.LogInformation("Waiting for tray connection on pipe {PipeName}", IpcPipe.PipeName);
         await pipeServer.WaitForConnectionAsync(stoppingToken);

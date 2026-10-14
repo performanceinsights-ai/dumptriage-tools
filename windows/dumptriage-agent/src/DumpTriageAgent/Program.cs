@@ -27,7 +27,7 @@ if (OperatingSystem.IsWindows())
     {
         DataDirectoryGuard.Secure(Path.GetDirectoryName(configPath)!);
     }
-    catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or System.Security.SecurityException)
+    catch (Exception ex)
     {
         Console.Error.WriteLine($"Refusing to start: {ex.Message}");
         try

@@ -36,13 +36,15 @@ public sealed class PipeClient : IDisposable
         {
             try
             {
+                // Identification only: whatever serves this pipe can't act as the signed-in user (#8).
                 await using var pipe = new NamedPipeClientStream(
-                    ".", IpcPipe.PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+                    ".", IpcPipe.PipeName, PipeDirection.InOut, PipeOptions.Asynchronous,
+                    System.Security.Principal.TokenImpersonationLevel.Identification);
                 await pipe.ConnectAsync(5000, cancellationToken);
-                if (!ServerIsAService(pipe))
+                if (!ServerIsTheService(pipe))
                 {
-                    // A process in a user session created the pipe first (#8): don't show its
-                    // prompts or send it answers. The service logs that its pipe name is taken.
+                    // Some other process created the pipe first (#8): don't show its prompts or send
+                    // it answers. The service logs that its pipe name is taken.
                     throw new IOException("The pipe's server is not the DumpTriage service.");
                 }
 
@@ -89,22 +91,58 @@ public sealed class PipeClient : IDisposable
     }
 
     /// <summary>
-    /// Whether the pipe's server runs in session 0, where only services run. The agent service does;
-    /// a process started by a signed-in user, which could squat the pipe name while the service
-    /// restarts, does not.
+    /// Whether the pipe's server is the DumpTriageAgent service's own process, as the Service Control
+    /// Manager reports it. A process that squats the pipe name while the service restarts is not,
+    /// even one in session 0 (an SSH logon, a scheduled task).
     /// </summary>
-    private static bool ServerIsAService(NamedPipeClientStream pipe)
+    private static bool ServerIsTheService(NamedPipeClientStream pipe)
     {
-        return GetNamedPipeServerProcessId(pipe.SafePipeHandle, out var pid)
-            && ProcessIdToSessionId(pid, out var session)
-            && session == 0;
+        return GetNamedPipeServerProcessId(pipe.SafePipeHandle, out var serverPid)
+            && ServiceProcessId("DumpTriageAgent") is { } servicePid
+            && servicePid != 0
+            && servicePid == serverPid;
+    }
+
+    private static uint? ServiceProcessId(string serviceName)
+    {
+        const uint ScManagerConnect = 0x0001, ServiceQueryStatus = 0x0004, ScStatusProcessInfo = 0;
+        var manager = OpenSCManager(null, null, ScManagerConnect);
+        if (manager == IntPtr.Zero) return null;
+        try
+        {
+            var service = OpenService(manager, serviceName, ServiceQueryStatus);
+            if (service == IntPtr.Zero) return null;
+            try
+            {
+                var buffer = new byte[36]; // SERVICE_STATUS_PROCESS
+                if (!QueryServiceStatusEx(service, ScStatusProcessInfo, buffer, buffer.Length, out _)) return null;
+                return BitConverter.ToUInt32(buffer, 28); // dwProcessId
+            }
+            finally
+            {
+                CloseServiceHandle(service);
+            }
+        }
+        finally
+        {
+            CloseServiceHandle(manager);
+        }
     }
 
     [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetNamedPipeServerProcessId(Microsoft.Win32.SafeHandles.SafePipeHandle pipe, out uint serverProcessId);
 
-    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool ProcessIdToSessionId(uint processId, out uint sessionId);
+    [System.Runtime.InteropServices.DllImport("advapi32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr OpenSCManager(string? machineName, string? databaseName, uint desiredAccess);
+
+    [System.Runtime.InteropServices.DllImport("advapi32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr OpenService(IntPtr scManager, string serviceName, uint desiredAccess);
+
+    [System.Runtime.InteropServices.DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool QueryServiceStatusEx(IntPtr service, uint infoLevel, byte[] buffer, int bufferSize, out int bytesNeeded);
+
+    [System.Runtime.InteropServices.DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool CloseServiceHandle(IntPtr handle);
 
     public async Task SendAsync(IpcMessage message)
     {
