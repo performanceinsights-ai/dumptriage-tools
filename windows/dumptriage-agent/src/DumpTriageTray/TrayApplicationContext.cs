@@ -17,10 +17,15 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly ToolStripMenuItem _submitMenu;
     private bool _paused;
 
-    // One approval popup at a time (#12): the rest wait here, each dump once.
-    private readonly Queue<(IpcMessage Message, DateTime ReceivedUtc)> _pendingAsks = new();
-    private readonly HashSet<string> _askIds = new();
-    private bool _askShowing;
+    // One approval popup at a time (#12): the rest wait here, each dump once. A re-sent ask (after a
+    // service restart) replaces the waiting one, since it carries the service's new deadline.
+    private readonly Queue<string> _askOrder = new();
+    private readonly Dictionary<string, (IpcMessage Message, DateTime ReceivedUtc)> _waitingAsks = new();
+    private string? _askShowingId;
+
+    // NotifyOnly dumps already announced with a balloon in this session: re-sent on every reconnect,
+    // but only new ones are announced (#7).
+    private readonly HashSet<string> _announcedManual = new();
 
     public TrayApplicationContext()
     {
@@ -56,7 +61,9 @@ public sealed class TrayApplicationContext : ApplicationContext
             if (connected)
             {
                 // The service re-sends everything still pending on every connect; start the list afresh.
+                var old = _submitMenu.DropDownItems.Cast<ToolStripItem>().ToList();
                 _submitMenu.DropDownItems.Clear();
+                old.ForEach(item => item.Dispose());
                 _submitMenu.Visible = false;
             }
         }, null);
@@ -83,7 +90,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         // the dump is listed under "Submit dump" in the tray menu.
         if (message.AskTimeoutSeconds is null)
         {
-            if (AddManualSubmitItem(message))
+            if (AddManualSubmitItem(message) && _announcedManual.Add(message.DumpId))
             {
                 _notifyIcon.ShowBalloonTip(
                     10_000,
@@ -94,8 +101,9 @@ public sealed class TrayApplicationContext : ApplicationContext
             return;
         }
 
-        if (!_askIds.Add(message.DumpId)) return; // already waiting or showing (re-sent on reconnect)
-        _pendingAsks.Enqueue((message, DateTime.UtcNow));
+        if (message.DumpId == _askShowingId) return; // its popup is open; its answer goes out when it closes
+        if (!_waitingAsks.ContainsKey(message.DumpId)) _askOrder.Enqueue(message.DumpId);
+        _waitingAsks[message.DumpId] = (message, DateTime.UtcNow);
         ShowNextAsk();
     }
 
@@ -105,20 +113,21 @@ public sealed class TrayApplicationContext : ApplicationContext
     /// </summary>
     private void ShowNextAsk()
     {
-        if (_askShowing) return;
-        _askShowing = true;
+        if (_askShowingId is not null) return;
         try
         {
-            while (_pendingAsks.TryDequeue(out var next))
+            while (_askOrder.TryDequeue(out var id))
             {
+                if (!_waitingAsks.Remove(id, out var next)) continue;
                 var message = next.Message;
-                // The service's timeout ran while this one waited its turn: show only what is left.
+                // The service's wait ran on while this one waited its turn: show only what is left.
                 var remaining = (message.AskTimeoutSeconds ?? 0) - (int)(DateTime.UtcNow - next.ReceivedUtc).TotalSeconds;
                 if (remaining <= 0)
                 {
-                    _askIds.Remove(message.DumpId!);
                     continue; // the service has already applied its timeout action
                 }
+
+                _askShowingId = id;
 
                 using (var popup = new ApprovalPopupForm(
                     message.DumpFileName ?? "dump file",
@@ -134,12 +143,12 @@ public sealed class TrayApplicationContext : ApplicationContext
                         Approved = popup.Result ?? false,
                     });
                 }
-                _askIds.Remove(message.DumpId!);
+                _askShowingId = null;
             }
         }
         finally
         {
-            _askShowing = false;
+            _askShowingId = null;
         }
     }
 

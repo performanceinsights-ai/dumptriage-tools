@@ -62,7 +62,7 @@ public sealed class UploadWorkerServiceTests : IAsyncDisposable
         };
         var client = new DumpTriageApiClient(new HttpClient(new Handler(this)) { BaseAddress = new Uri("http://test") });
         return new UploadWorkerService(config, _queue, client, new NotIdle(), new PlainKey(), new AgentRuntimeState(),
-            NullLogger<UploadWorkerService>.Instance, _time);
+            NullLogger<UploadWorkerService>.Instance, time: _time);
     }
 
     private async Task<DumpRecord> Queued(string name)
@@ -158,6 +158,23 @@ public sealed class UploadWorkerServiceTests : IAsyncDisposable
 
         _time.Advance(TimeSpan.FromHours(23));
         await worker.TickAsync(default);
+        Assert.Equal(DumpQueueState.Submitted, (await Get("a.dmp")).State);
+    }
+
+    [Fact]
+    public async Task A_transient_failure_in_a_scheduled_slot_is_retried_on_its_backoff_not_the_next_slot()
+    {
+        var local = _time.GetUtcNow().ToLocalTime();
+        var slot = TimeOnly.FromDateTime(local.AddHours(1).DateTime);
+        var worker = await Worker(new BatchingConfig { Mode = BatchMode.ScheduledTimeOfDay, ScheduledTimesLocal = { slot } });
+        await worker.TickAsync(default); // first run
+        await Queued("a.dmp");
+        _responses.Enqueue(HttpStatusCode.ServiceUnavailable);
+        _time.Advance(TimeSpan.FromHours(1));
+        await worker.TickAsync(default); // the slot: 503
+        Assert.Equal(1, _requests);
+        _time.Advance(TimeSpan.FromSeconds(61));
+        await worker.TickAsync(default); // retried within minutes, not tomorrow
         Assert.Equal(DumpQueueState.Submitted, (await Get("a.dmp")).State);
     }
 }

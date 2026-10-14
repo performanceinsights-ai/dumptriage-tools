@@ -1,6 +1,7 @@
 using DumpTriage.Common.CentralCopy;
 using DumpTriage.Common.Config;
 using DumpTriage.Common.Idle;
+using DumpTriage.Common.Ipc;
 using DumpTriage.Common.Models;
 using DumpTriage.Common.Policy;
 using DumpTriage.Common.Queue;
@@ -33,6 +34,7 @@ public sealed class UploadWorkerService : BackgroundService
     private readonly AgentRuntimeState _runtimeState;
     private readonly ILogger<UploadWorkerService> _logger;
     private readonly TimeProvider _time;
+    private readonly ITrayChannel _tray;
 
     // In memory: a new key needs a service restart (the config is read at start), which clears it.
     private DateTimeOffset _authBackoffUntilUtc = DateTimeOffset.MinValue;
@@ -46,9 +48,11 @@ public sealed class UploadWorkerService : BackgroundService
         IApiKeyProtector apiKeyProtector,
         AgentRuntimeState runtimeState,
         ILogger<UploadWorkerService> logger,
+        ITrayChannel? tray = null,
         TimeProvider? time = null)
     {
         _time = time ?? TimeProvider.System;
+        _tray = tray ?? new NullTrayChannel();
         _config = config;
         _queueStore = queueStore;
         _apiClient = apiClient;
@@ -96,12 +100,15 @@ public sealed class UploadWorkerService : BackgroundService
         var idle = _idleTimeProvider.GetIdleDuration();
         var shouldFlush = BatchScheduler.ShouldSubmitNow(batching, now.ToLocalTime(), idle, lastFlush);
         _logger.LogDebug("Upload tick, shouldFlush={ShouldFlush}, batchMode={Mode}", shouldFlush, batching.Mode);
-        if (!shouldFlush) return;
         if (now < _authBackoffUntilUtc) return; // the key was refused; don't send dumps to be refused again
 
+        // A dump whose upload already started in a slot and failed transiently is retried on its own
+        // backoff, not held for the next slot (a day away for a nightly one).
         var due = (await _queueStore.GetByStateAsync(DumpQueueState.Queued, stoppingToken))
+            .Where(r => shouldFlush || r.RetryCount > 0)
             .Where(r => r.NextAttemptUtc is null || r.NextAttemptUtc <= now)
             .ToList();
+        if (!shouldFlush && due.Count == 0) return;
         _logger.LogDebug("Queued dumps due for upload: {Count}", due.Count);
         var refused = false;
         foreach (var record in due)
@@ -116,7 +123,7 @@ public sealed class UploadWorkerService : BackgroundService
 
         // The slot is used, even if nothing was due; not when the key was refused (or, above, during
         // a pause), so it is taken once that clears.
-        if (batching.Mode == BatchMode.ScheduledTimeOfDay && !refused)
+        if (batching.Mode == BatchMode.ScheduledTimeOfDay && shouldFlush && !refused)
         {
             await _queueStore.SetMetaAsync(LastFlushKey, now.ToString("O"), stoppingToken);
         }
@@ -139,11 +146,30 @@ public sealed class UploadWorkerService : BackgroundService
             _logger.LogWarning("Manual submit of {DumpId} skipped: uploads are paused after an authentication failure", dumpId);
             record.LastError = "Submit skipped: uploads are paused after an authentication failure; try again later.";
             await _queueStore.UpsertAsync(record, stoppingToken);
+            await ListAgainInTrayAsync(record, stoppingToken);
             return;
         }
 
         await SubmitAsync(record, stoppingToken, DumpQueueState.PendingApproval);
+        if (record.State == DumpQueueState.PendingApproval)
+        {
+            await ListAgainInTrayAsync(record, stoppingToken);
+        }
     }
+
+    /// <summary>
+    /// The tray drops a NotifyOnly dump from its "Submit dump" menu when it is clicked; one that
+    /// wasn't sent after all (paused, or a transient failure) goes back on the list (#7).
+    /// </summary>
+    private Task ListAgainInTrayAsync(DumpRecord record, CancellationToken stoppingToken) =>
+        _tray.SendAsync(new IpcMessage
+        {
+            Type = IpcMessageType.AskApproval,
+            DumpId = record.Id,
+            DumpFileName = Path.GetFileName(record.FilePath),
+            DumpSizeBytes = record.SizeBytes,
+            DumpType = record.DumpType,
+        }, stoppingToken);
 
     private async Task SubmitAsync(
         DumpRecord record,
