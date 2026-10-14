@@ -66,18 +66,57 @@ public sealed class DumpQueueStore : IAsyncDisposable
                 central_copy_error TEXT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_dumps_state ON dumps(state);
+            CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
             """;
 
         using var command = _connection.CreateCommand();
         command.CommandText = sql;
         await command.ExecuteNonQueryAsync(cancellationToken);
+
+        // Added after the first release (#6): queues created before it get the column here.
+        using var columns = _connection.CreateCommand();
+        columns.CommandText = "SELECT 1 FROM pragma_table_info('dumps') WHERE name = 'next_attempt_utc';";
+        if (await columns.ExecuteScalarAsync(cancellationToken) is null)
+        {
+            using var alter = _connection.CreateCommand();
+            alter.CommandText = "ALTER TABLE dumps ADD COLUMN next_attempt_utc TEXT NULL;";
+            await alter.ExecuteNonQueryAsync(cancellationToken);
+        }
+    }
+
+    /// <summary>A small persistent value, such as when the last scheduled flush ran.</summary>
+    public async Task<string?> GetMetaAsync(string key, CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = "SELECT v FROM meta WHERE k = $k;";
+            command.Parameters.AddWithValue("$k", key);
+            return await command.ExecuteScalarAsync(cancellationToken) as string;
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetMetaAsync(string key, string value, CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = "INSERT INTO meta (k, v) VALUES ($k, $v) ON CONFLICT(k) DO UPDATE SET v = excluded.v;";
+            command.Parameters.AddWithValue("$k", key);
+            command.Parameters.AddWithValue("$v", value);
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+        finally { _gate.Release(); }
     }
 
     public async Task UpsertAsync(DumpRecord record, CancellationToken cancellationToken = default)
     {
         const string sql = """
-            INSERT INTO dumps (id, file_path, size_bytes, sha256, dump_type, state, detected_at_utc, submitted_at_utc, retry_count, last_error, central_copied_at_utc, central_copy_error)
-            VALUES ($id, $filePath, $sizeBytes, $sha256, $dumpType, $state, $detectedAtUtc, $submittedAtUtc, $retryCount, $lastError, $centralCopiedAtUtc, $centralCopyError)
+            INSERT INTO dumps (id, file_path, size_bytes, sha256, dump_type, state, detected_at_utc, submitted_at_utc, retry_count, last_error, central_copied_at_utc, central_copy_error, next_attempt_utc)
+            VALUES ($id, $filePath, $sizeBytes, $sha256, $dumpType, $state, $detectedAtUtc, $submittedAtUtc, $retryCount, $lastError, $centralCopiedAtUtc, $centralCopyError, $nextAttemptUtc)
             ON CONFLICT(id) DO UPDATE SET
                 file_path = excluded.file_path,
                 size_bytes = excluded.size_bytes,
@@ -88,7 +127,8 @@ public sealed class DumpQueueStore : IAsyncDisposable
                 retry_count = excluded.retry_count,
                 last_error = excluded.last_error,
                 central_copied_at_utc = excluded.central_copied_at_utc,
-                central_copy_error = excluded.central_copy_error;
+                central_copy_error = excluded.central_copy_error,
+                next_attempt_utc = excluded.next_attempt_utc;
             """;
 
         await _gate.WaitAsync(cancellationToken);
@@ -108,6 +148,7 @@ public sealed class DumpQueueStore : IAsyncDisposable
         command.Parameters.AddWithValue("$lastError", (object?)record.LastError ?? DBNull.Value);
         command.Parameters.AddWithValue("$centralCopiedAtUtc", (object?)record.CentralCopiedAtUtc?.ToString("O") ?? DBNull.Value);
         command.Parameters.AddWithValue("$centralCopyError", (object?)record.CentralCopyError ?? DBNull.Value);
+        command.Parameters.AddWithValue("$nextAttemptUtc", (object?)record.NextAttemptUtc?.ToString("O") ?? DBNull.Value);
         await command.ExecuteNonQueryAsync(cancellationToken);
         }
         finally { _gate.Release(); }
@@ -205,6 +246,9 @@ public sealed class DumpQueueStore : IAsyncDisposable
                 ? null
                 : DateTimeOffset.Parse(reader.GetString(reader.GetOrdinal("central_copied_at_utc"))),
             CentralCopyError = reader.IsDBNull(reader.GetOrdinal("central_copy_error")) ? null : reader.GetString(reader.GetOrdinal("central_copy_error")),
+            NextAttemptUtc = reader.IsDBNull(reader.GetOrdinal("next_attempt_utc"))
+                ? null
+                : DateTimeOffset.Parse(reader.GetString(reader.GetOrdinal("next_attempt_utc"))),
         };
     }
 

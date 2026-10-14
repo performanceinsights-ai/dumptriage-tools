@@ -22,8 +22,8 @@ namespace DumpTriageAgent.Upload;
 /// </summary>
 public sealed class UploadWorkerService : BackgroundService
 {
-    private const int MaxRetries = 5;
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(30);
+    private const string LastFlushKey = "last_scheduled_flush_utc";
 
     private readonly AgentConfig _config;
     private readonly DumpQueueStore _queueStore;
@@ -32,10 +32,11 @@ public sealed class UploadWorkerService : BackgroundService
     private readonly IApiKeyProtector _apiKeyProtector;
     private readonly AgentRuntimeState _runtimeState;
     private readonly ILogger<UploadWorkerService> _logger;
+    private readonly TimeProvider _time;
 
-    private DateTimeOffset? _lastScheduledFlushUtc;
+    // In memory: a new key needs a service restart (the config is read at start), which clears it.
     private DateTimeOffset _authBackoffUntilUtc = DateTimeOffset.MinValue;
-    private static readonly TimeSpan AuthBackoff = TimeSpan.FromMinutes(10);
+    private int _authRefusalsInARow;
 
     public UploadWorkerService(
         AgentConfig config,
@@ -44,8 +45,10 @@ public sealed class UploadWorkerService : BackgroundService
         IIdleTimeProvider idleTimeProvider,
         IApiKeyProtector apiKeyProtector,
         AgentRuntimeState runtimeState,
-        ILogger<UploadWorkerService> logger)
+        ILogger<UploadWorkerService> logger,
+        TimeProvider? time = null)
     {
+        _time = time ?? TimeProvider.System;
         _config = config;
         _queueStore = queueStore;
         _apiClient = apiClient;
@@ -74,28 +77,48 @@ public sealed class UploadWorkerService : BackgroundService
         }
     }
 
-    private async Task TickAsync(CancellationToken stoppingToken)
+    internal async Task TickAsync(CancellationToken stoppingToken)
     {
         if (_runtimeState.IsPaused) return;
-        if (DateTimeOffset.UtcNow < _authBackoffUntilUtc) return; // bad API key; don't hammer the server
-
+        var now = _time.GetUtcNow();
         var batching = _config.Policy.Batching;
-        var idle = _idleTimeProvider.GetIdleDuration();
-        var shouldFlush = BatchScheduler.ShouldSubmitNow(batching, DateTimeOffset.Now, idle, _lastScheduledFlushUtc);
-        _logger.LogDebug("Upload tick, shouldFlush={ShouldFlush}, batchMode={Mode}", shouldFlush, batching.Mode);
-        if (!shouldFlush) return;
 
-        var queued = await _queueStore.GetByStateAsync(DumpQueueState.Queued, stoppingToken);
-        _logger.LogDebug("Queued dumps ready to submit: {Count}", queued.Count);
-        foreach (var record in queued)
+        // Kept in the queue, so a restart neither forgets a slot nor uploads at once (#9).
+        DateTimeOffset? lastFlush = await _queueStore.GetMetaAsync(LastFlushKey, stoppingToken) is { } stored
+            ? DateTimeOffset.Parse(stored, null, System.Globalization.DateTimeStyles.RoundtripKind)
+            : null;
+        if (batching.Mode == BatchMode.ScheduledTimeOfDay && lastFlush is null)
         {
-            await SubmitAsync(record, stoppingToken);
-            if (DateTimeOffset.UtcNow < _authBackoffUntilUtc) break; // key rejected; rest would fail too
+            await _queueStore.SetMetaAsync(LastFlushKey, now.ToString("O"), stoppingToken); // first run: wait for a slot
+            return;
         }
 
-        if (batching.Mode == BatchMode.ScheduledTimeOfDay && queued.Count > 0)
+        var idle = _idleTimeProvider.GetIdleDuration();
+        var shouldFlush = BatchScheduler.ShouldSubmitNow(batching, now.ToLocalTime(), idle, lastFlush);
+        _logger.LogDebug("Upload tick, shouldFlush={ShouldFlush}, batchMode={Mode}", shouldFlush, batching.Mode);
+        if (!shouldFlush) return;
+        if (now < _authBackoffUntilUtc) return; // the key was refused; don't send dumps to be refused again
+
+        var due = (await _queueStore.GetByStateAsync(DumpQueueState.Queued, stoppingToken))
+            .Where(r => r.NextAttemptUtc is null || r.NextAttemptUtc <= now)
+            .ToList();
+        _logger.LogDebug("Queued dumps due for upload: {Count}", due.Count);
+        var refused = false;
+        foreach (var record in due)
         {
-            _lastScheduledFlushUtc = DateTimeOffset.UtcNow;
+            await SubmitAsync(record, stoppingToken);
+            if (_time.GetUtcNow() < _authBackoffUntilUtc)
+            {
+                refused = true;
+                break; // key rejected; the rest would be refused too
+            }
+        }
+
+        // The slot is used, even if nothing was due; not when the key was refused (or, above, during
+        // a pause), so it is taken once that clears.
+        if (batching.Mode == BatchMode.ScheduledTimeOfDay && !refused)
+        {
+            await _queueStore.SetMetaAsync(LastFlushKey, now.ToString("O"), stoppingToken);
         }
     }
 
@@ -109,7 +132,7 @@ public sealed class UploadWorkerService : BackgroundService
             return;
         }
 
-        if (DateTimeOffset.UtcNow < _authBackoffUntilUtc)
+        if (_time.GetUtcNow() < _authBackoffUntilUtc)
         {
             // Same rule as the tick loop: the key was just rejected, so don't
             // hammer the server. The record stays PendingApproval and listed.
@@ -167,8 +190,10 @@ public sealed class UploadWorkerService : BackgroundService
         {
             case UploadOutcome.Success:
                 record.State = DumpQueueState.Submitted;
-                record.SubmittedAtUtc = DateTimeOffset.UtcNow;
+                record.SubmittedAtUtc = _time.GetUtcNow();
                 record.LastError = null;
+                record.NextAttemptUtc = null;
+                _authRefusalsInARow = 0;
                 _logger.LogInformation("Submitted dump {Path}", record.FilePath);
                 break;
 
@@ -178,11 +203,12 @@ public sealed class UploadWorkerService : BackgroundService
                 // dump is still good. A manually submitted dump returns to
                 // PendingApproval so the tray keeps listing it as waiting.
                 record.State = stateOnRetry;
-                _authBackoffUntilUtc = DateTimeOffset.UtcNow + AuthBackoff;
+                var pause = RetryPolicy.AuthPause(++_authRefusalsInARow);
+                _authBackoffUntilUtc = _time.GetUtcNow() + pause;
                 record.LastError = $"Authentication failed ({(int?)result.StatusCode}): check the configured API key. {result.ErrorMessage}";
                 _logger.LogError(
-                    "Upload of {Path} refused ({Status}): API key is invalid or revoked; re-provision it with --set-api-key-stdin and restart the service; uploads paused for 10 minutes",
-                    record.FilePath, result.StatusCode);
+                    "Upload of {Path} refused ({Status}): API key is invalid or revoked; re-provision it with --set-api-key-stdin and restart the service; uploads paused for {Minutes} minutes",
+                    record.FilePath, result.StatusCode, pause.TotalMinutes);
                 break;
 
             case UploadOutcome.RejectedPermanently:
@@ -197,7 +223,7 @@ public sealed class UploadWorkerService : BackgroundService
             case UploadOutcome.TransientFailure:
                 record.RetryCount++;
                 record.LastError = result.ErrorMessage;
-                if (record.RetryCount >= MaxRetries)
+                if (record.RetryCount >= RetryPolicy.MaxAttempts)
                 {
                     record.State = DumpQueueState.Failed;
                     _logger.LogError(
@@ -206,10 +232,12 @@ public sealed class UploadWorkerService : BackgroundService
                 }
                 else
                 {
-                    record.State = stateOnRetry; // retry on a later tick (manual submits stay pending approval)
+                    record.State = stateOnRetry; // manual submits stay pending approval
+                    var delay = RetryPolicy.TransientDelay(record.RetryCount);
+                    record.NextAttemptUtc = _time.GetUtcNow() + delay;
                     _logger.LogWarning(
-                        "Transient failure submitting {Path} (attempt {Retry}/{Max}): {Error}",
-                        record.FilePath, record.RetryCount, MaxRetries, result.ErrorMessage);
+                        "Transient failure submitting {Path} (attempt {Retry}/{Max}), retrying in {Delay}: {Error}",
+                        record.FilePath, record.RetryCount, RetryPolicy.MaxAttempts, delay, result.ErrorMessage);
                 }
                 break;
         }

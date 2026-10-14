@@ -127,18 +127,48 @@ public sealed class DumpWatcherService : BackgroundService
         }
         watcher.Created += (_, e) => { _logger.LogDebug("FileSystemWatcher Created event for {Path}", e.FullPath); _candidatePaths.Writer.TryWrite(e.FullPath); };
         watcher.Renamed += (_, e) => { _logger.LogDebug("FileSystemWatcher Renamed event for {Path}", e.FullPath); _candidatePaths.Writer.TryWrite(e.FullPath); };
-        watcher.Error += (_, e) => _logger.LogError(e.GetException(), "FileSystemWatcher error for {Path}", expanded);
+        // MEMORY.DMP is overwritten in place by the next bugcheck: that is a Changed, not a Created (#5).
+        // IsAlreadyRecordedAsync makes the many Changed events of one write cheap (size + mtime, no rehash).
+        watcher.Changed += (_, e) => _candidatePaths.Writer.TryWrite(e.FullPath);
+        watcher.Error += (_, e) =>
+        {
+            // Usually a buffer overflow: events were lost, so look at everything again.
+            _logger.LogError(e.GetException(), "FileSystemWatcher error for {Path}; rescanning it", expanded);
+            EnqueueExisting(expanded);
+        };
         watcher.EnableRaisingEvents = true;
 
         lock (_watchers) { _watchers.Add(watcher); }
         _logger.LogInformation("Watching {Path} for dump files (filters: {Filters}, raising: {Raising})", expanded, string.Join(",", watcher.Filters), watcher.EnableRaisingEvents);
+
+        // A dump written while the service wasn't running (MEMORY.DMP during boot, a crash during an
+        // upgrade) raises no event: pick up what is already there (#5). Known files are skipped cheaply.
+        EnqueueExisting(expanded);
         return true;
+    }
+
+    private void EnqueueExisting(string path)
+    {
+        try
+        {
+            foreach (var filter in _config.WatchedFilters)
+            {
+                foreach (var file in Directory.EnumerateFiles(path, filter))
+                {
+                    _candidatePaths.Writer.TryWrite(file);
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "Could not scan {Path} for existing dumps", path);
+        }
     }
 
     /// <summary>
     /// A directory like /var/crash may not exist until the first crash. Keep
-    /// retrying, and on attach pick up files that landed before the watcher
-    /// did (ProcessCandidateAsync dedups).
+    /// retrying; attaching picks up files that landed before the watcher did
+    /// (ProcessCandidateAsync dedups).
     /// </summary>
     private async Task RetryMissingPathsAsync(CancellationToken stoppingToken)
     {
@@ -148,23 +178,9 @@ public sealed class DumpWatcherService : BackgroundService
 
             foreach (var path in _missingPaths.ToList())
             {
-                if (!TryAttachWatcher(path)) continue;
+                if (!TryAttachWatcher(path)) continue; // which also picks up files already there
 
                 _missingPaths.Remove(path);
-                try
-                {
-                    foreach (var filter in _config.WatchedFilters)
-                    {
-                        foreach (var file in Directory.EnumerateFiles(path, filter))
-                        {
-                            _candidatePaths.Writer.TryWrite(file);
-                        }
-                    }
-                }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                {
-                    _logger.LogWarning(ex, "Could not scan {Path} for pre-existing dumps", path);
-                }
             }
         }
     }

@@ -42,7 +42,7 @@ public class BatchSchedulerTests
     }
 
     [Fact]
-    public void ScheduledTimeOfDay_AfterScheduledTime_FirstFlush_Submits()
+    public void ScheduledTimeOfDay_NoFlushRecordedYet_WaitsForTheNextSlot()
     {
         var config = new BatchingConfig
         {
@@ -51,7 +51,7 @@ public class BatchSchedulerTests
         };
         var now = new DateTimeOffset(2026, 9, 22, 22, 30, 0, TimeSpan.Zero);
         var result = BatchScheduler.ShouldSubmitNow(config, now, TimeSpan.Zero, lastScheduledFlushUtc: null);
-        Assert.True(result);
+        Assert.False(result); // the caller records a first run as a flush (#9)
     }
 
     [Fact]

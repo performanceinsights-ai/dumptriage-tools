@@ -15,6 +15,9 @@ public sealed class DumpRecord
     public required DateTimeOffset DetectedAtUtc { get; init; }
     public DateTimeOffset? SubmittedAtUtc { get; set; }
     public int RetryCount { get; set; }
+
+    /// <summary>After a transient upload failure: not retried before this (backoff, #6).</summary>
+    public DateTimeOffset? NextAttemptUtc { get; set; }
     public string? LastError { get; set; }
 
     /// <summary>Set once the archival copy to the central location succeeds; independent of submission State.</summary>
