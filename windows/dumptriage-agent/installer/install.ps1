@@ -71,6 +71,29 @@ $TaskName = "DumpTriageTray"
 
 $existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 
+# The data folder holds the DPAPI-protected key, so it and everything in it must be owned by
+# SYSTEM, Administrators or a member of Administrators, with no junctions (#3). The agent enforces
+# this at every start (and then locks the ACL down); checked here too, so a refusal comes before
+# anything on the machine changes.
+$DataDir = Join-Path $env:ProgramData 'DumpTriage'
+if (Test-Path -LiteralPath $DataDir) {
+    $trusted = @('S-1-5-18', 'S-1-5-32-544') + @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue | ForEach-Object { $_.SID.Value })
+    # By hand rather than -Recurse: a junction is refused before anything below it is listed.
+    function Test-DataItem($item) {
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "$($item.FullName) is a junction or symlink. Delete $DataDir and run the installer again."
+        }
+        $owner = (Get-Acl -LiteralPath $item.FullName).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($owner -notin $trusted) {
+            throw "$($item.FullName) is owned by $owner, not SYSTEM or an administrator, so another account could have created or changed it. Delete $DataDir and run the installer again."
+        }
+        if ($item.PSIsContainer) {
+            Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction Stop | ForEach-Object { Test-DataItem $_ }
+        }
+    }
+    Test-DataItem (Get-Item -LiteralPath $DataDir -Force)
+}
+
 # Read the key before touching the installed service, so a bad key file or an
 # abandoned prompt leaves the current install running as it was.
 # A first install prompts unless the session can't answer (-NonInteractive, or no console).

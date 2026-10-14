@@ -30,6 +30,18 @@ jobs:
           dotnet-version: "8.0.x"
       - run: dotnet test windows/dumptriage-agent/tests/DumpTriage.Common.Tests
 
+  windows-agent-on-windows:
+    # The Windows-only parts (ACLs on the data folder) need a real Windows host.
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - run: dotnet test windows/dumptriage-agent/tests/DumpTriageAgent.Tests
+      - run: dotnet build windows/dumptriage-agent/src/DumpTriageTray
+
   powershell-parse:
     runs-on: ubuntu-latest
     timeout-minutes: 5
