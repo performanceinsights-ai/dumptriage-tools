@@ -138,15 +138,18 @@ def open_dir_safely(path, _depth=0):
     configure-dumps.sh does. As a real folder that is harmless: it only holds files that user could
     write anyway, and open_dump reads nothing through a symlink or hard link below it. A symlink
     could point anywhere, so one is followed only if it belongs to root or the agent's user and sits
-    in a folder that also does and that no one else can replace it in (only they can write to it,
-    or it is sticky); the walk then restarts at its target, which is checked the same way. Every
-    real folder is opened with O_NOFOLLOW relative to the previous one, so nothing can be swapped
-    for a symlink between a check and its use. Raises NotWatched for a refused symlink."""
+    in a folder that also does and that is not world-writable, or is sticky (then only they can
+    replace the link). Group write counts as theirs: granting a group is the owner's choice, and
+    user-private groups make ~ group-writable on some distributions. The walk then restarts at the
+    link's target, which is checked the same way, and `..` is resolved like the kernel does. Every
+    real folder is opened with O_PATH | O_NOFOLLOW relative to the previous one (search permission
+    is enough), so nothing can be swapped for a symlink between a check and its use. Raises
+    NotWatched for a refused symlink."""
     if _depth > 40:
         raise OSError(errno.ELOOP, "too many symlinks", path)
     ok = (0, os.geteuid())
     parts = [p for p in path.split("/") if p not in ("", ".")]
-    fd, cur = os.open("/", os.O_RDONLY | os.O_DIRECTORY), "/"
+    fd, cur = os.open("/", os.O_PATH | os.O_DIRECTORY), "/"
     try:
         for i, part in enumerate(parts):
             if part == "..":
@@ -156,9 +159,8 @@ def open_dir_safely(path, _depth=0):
                 st = os.stat(part, dir_fd=fd, follow_symlinks=False)
                 if stat.S_ISLNK(st.st_mode):
                     parent = os.fstat(fd)
-                    others_can_write = parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
                     if (st.st_uid not in ok or parent.st_uid not in ok
-                            or (others_can_write and not parent.st_mode & stat.S_ISVTX)):
+                            or (parent.st_mode & stat.S_IWOTH and not parent.st_mode & stat.S_ISVTX)):
                         raise NotWatched(errno.EPERM, "goes through a symlink another user could have planted",
                                          os.path.join(cur, part))
                     target = os.readlink(part, dir_fd=fd)
@@ -167,7 +169,7 @@ def open_dir_safely(path, _depth=0):
                     os.close(fd)
                     fd = None
                     return open_dir_safely(os.path.join(target, rest) if rest else target, _depth + 1)
-                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                next_fd = os.open(part, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
                 cur = os.path.join(cur, part)
             os.close(fd)
             fd = next_fd
@@ -178,10 +180,19 @@ def open_dir_safely(path, _depth=0):
             os.close(fd)
 
 
+def root_path(root):
+    """A configured watched path as the agent uses it: ~ expanded, made absolute, not normalised,
+    so a `..` after a symlink means what it means to the kernel (open_dir_safely resolves it)."""
+    root = os.path.expanduser(root)
+    if not root.startswith("/"):
+        root = os.path.join(os.getcwd(), root)
+    return root.rstrip("/") or "/"
+
+
 def trusted_root(root):
-    """Whether a watched root can be opened by open_dir_safely (see there)."""
+    """Whether open_dir_safely accepts a watched root (see there)."""
     try:
-        os.close(open_dir_safely(os.path.abspath(root)))
+        os.close(open_dir_safely(root_path(root)))
         return True
     except OSError:
         return False
@@ -195,25 +206,30 @@ def open_dump(path, roots):
     or copied. Every component below the root is opened with O_NOFOLLOW, relative to its parent, so a
     directory swapped for a symlink after the scan is refused too, and the file must be a regular file
     with a single link. The root itself is opened by open_dir_safely."""
-    path = os.path.abspath(path)
+    roots = [root_path(r) for r in roots]
     root = max((r for r in roots if path.startswith(r.rstrip("/") + "/")), key=len, default=None)
     if root is None:
         raise NotWatched(errno.EPERM, "no longer under a watched path; add its folder back to watchedPaths and run `retry`", path)
-    parts = os.path.relpath(path, root).split(os.sep)
+    parts = path[len(root.rstrip("/")) + 1:].split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise NotWatched(errno.EPERM, "not a plain path below its watched path", path)
     dir_fd = open_dir_safely(root)
     try:
         for part in parts[:-1]:
-            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            next_fd = os.open(part, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
             os.close(dir_fd)
             dir_fd = next_fd
         fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     finally:
         os.close(dir_fd)
-    st = os.fstat(fd)
-    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise OSError(errno.EPERM, "not a regular file with a single link", path)
+        return os.fdopen(fd, "rb")
+    except BaseException:
         os.close(fd)
-        raise OSError(errno.EPERM, "not a regular file with a single link", path)
-    return os.fdopen(fd, "rb")
+        raise
 
 
 # --- config ------------------------------------------------------------------
@@ -467,7 +483,7 @@ class Agent:
         self.uploader, self.clock = uploader, clock
         self.stable = {}  # path -> (size, mtime_ns, first_seen_unchanged_monotonic)
         self.ignored = set()  # (path, size, mtime_ns) already sniffed as not-a-dump
-        self.untrusted = set()  # watched roots refused by trusted_root, logged once
+        self.untrusted = set()  # (watched root, problem) already logged by candidates
         self.hostname = socket.gethostname() if config["sendHostname"] else None
         self.queue.recover()
 
@@ -477,28 +493,38 @@ class Agent:
 
     # discovery
     def candidates(self):
-        for root in self.cfg["watchedPaths"]:
-            root = os.path.expanduser(root)
-            if os.path.exists(root) and not trusted_root(root):
-                if root not in self.untrusted:
-                    log.error("not watching %s: its path goes through a symlink another user could have planted", root)
-                    self.untrusted.add(root)
+        """(path, lstat) of each file up to two folders deep in each watched path. The walk starts
+        from the descriptor open_dir_safely returns and never follows a symlink, so what is listed
+        is what that check accepted (#4)."""
+        for root in self.roots():
+            try:
+                root_fd = open_dir_safely(root)
+            except FileNotFoundError:
+                continue  # e.g. /var/crash before the first crash
+            except OSError as e:
+                problem = (f"its path goes through a symlink another user could have planted ({e.filename})"
+                           if isinstance(e, NotWatched) else str(e))
+                if (root, problem) not in self.untrusted:
+                    log.error("not watching %s: %s", root, problem)
+                    self.untrusted.add((root, problem))
                 continue
-            base_depth = root.rstrip("/").count("/")
-            for dirpath, dirs, files in os.walk(root, onerror=lambda e: None):
-                if dirpath.count("/") - base_depth >= 2:
-                    dirs[:] = []
-                for name in files:
-                    yield os.path.join(dirpath, name)
+            try:
+                for dirpath, dirs, files, dir_fd in os.fwalk(".", dir_fd=root_fd):
+                    if dirpath.count("/") >= 2:
+                        dirs[:] = []
+                    for name in files:
+                        try:
+                            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                        except OSError:
+                            continue
+                        yield os.path.join(root, dirpath[2:], name) if dirpath != "." else os.path.join(root, name), st
+            finally:
+                os.close(root_fd)
 
     def scan(self):
         """Returns True while any candidate is still settling (so --once knows to keep going)."""
         settling, live = False, set()
-        for path in self.candidates():
-            try:
-                st = os.lstat(path)
-            except OSError:
-                continue
+        for path, st in self.candidates():
             # Not a symlink, not a hard link: see open_dump (#4).
             if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size == 0:
                 continue
@@ -608,7 +634,7 @@ class Agent:
         return True
 
     def roots(self):
-        return [os.path.abspath(os.path.expanduser(r)) for r in self.cfg["watchedPaths"]]
+        return [root_path(r) for r in self.cfg["watchedPaths"]]
 
     def submit_one(self, r, key):
         self.queue.update(r["id"], state=SUBMITTING)

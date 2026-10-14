@@ -544,5 +544,49 @@ class ReviewFixTests(AgentTestBase):
             os.geteuid = orig
 
 
+    def test_search_only_folders_and_group_writable_own_folders(self):  # review of #14
+        outer = self.tmp / "outer"
+        (outer / "dumps").mkdir(parents=True)
+        (outer / "dumps" / "core.a.1.2").write_bytes(USER_CORE)
+        grp = self.tmp / "grp"
+        grp.mkdir()
+        grp.chmod(0o775)  # user-private group umask
+        (grp / "link").symlink_to(outer / "dumps")
+        outer.chmod(0o111)  # search only: enough to reach dumps/
+        try:
+            self.assertTrue(da.trusted_root(str(outer / "dumps")))
+            self.assertTrue(da.trusted_root(str(grp / "link")))
+            with da.open_dump(str(grp / "link" / "core.a.1.2"), [str(grp / "link")]) as f:
+                self.assertEqual(f.read(), USER_CORE)
+        finally:
+            outer.chmod(0o755)
+
+    def test_dotdot_after_a_symlink_means_what_it_means_to_the_kernel(self):  # review of #14
+        srv, data = self.tmp / "srv", self.tmp / "data"
+        (srv / "dumps").mkdir(parents=True)
+        (data / "a").mkdir(parents=True)
+        (data / "dumps").mkdir()
+        (srv / "link").symlink_to(data / "a")
+        (data / "dumps" / "core.k.1.2").write_bytes(USER_CORE)
+        (srv / "dumps" / "core.wrong.1.2").write_bytes(USER_CORE + b"wrong")
+        for d in (srv, data, data / "a"):
+            d.chmod(0o755)
+        a = self.agent(watchedPaths=[str(srv / "link" / ".." / "dumps")])
+        self.settle(a)
+        self.assertEqual(self.rows(a), {"core.k.1.2": da.SUBMITTED})
+        self.assertEqual(self.uploader.calls[0][4], USER_CORE)
+
+    def test_unreadable_root_is_logged_with_its_real_error(self):  # review of #14
+        not_a_dir = self.tmp / "file"
+        not_a_dir.write_text("x")
+        a = self.agent(watchedPaths=[str(not_a_dir)])
+        with self.assertLogs("dumptriage", "ERROR") as logs:
+            a.tick()
+            a.tick()
+        self.assertEqual(len(logs.output), 1)  # once
+        self.assertIn("Not a directory", logs.output[0])
+        self.assertNotIn("symlink", logs.output[0])
+
+
 if __name__ == "__main__":
     unittest.main()
