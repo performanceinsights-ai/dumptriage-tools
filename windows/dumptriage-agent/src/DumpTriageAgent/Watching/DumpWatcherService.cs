@@ -246,7 +246,9 @@ public sealed class DumpWatcherService : BackgroundService
         }
         else
         {
-            _watchingSinceUtc = DateTimeOffset.UtcNow;
+            // First start of this version. An existing install has been watching since its first
+            // record, so dumps written while it was down for this upgrade still count.
+            _watchingSinceUtc = await _queueStore.GetEarliestDetectedAsync(stoppingToken) ?? DateTimeOffset.UtcNow;
             await _queueStore.SetMetaAsync(WatchingSinceKey, _watchingSinceUtc.ToString("O"), stoppingToken);
         }
 
@@ -289,7 +291,7 @@ public sealed class DumpWatcherService : BackgroundService
                     continue;
                 }
 
-                if (ChangedSinceDetected(record))
+                if (await ChangedSinceDetectedAsync(record, stoppingToken))
                 {
                     // Path reused (e.g. MEMORY.DMP rewritten by a new crash)
                     // while we were down: this record no longer describes the
@@ -322,7 +324,7 @@ public sealed class DumpWatcherService : BackgroundService
             // the old record: retire them and look at the file afresh.
             foreach (var record in await _queueStore.GetByStateAsync(DumpQueueState.Queued, stoppingToken))
             {
-                if (File.Exists(record.FilePath) && ChangedSinceDetected(record))
+                if (File.Exists(record.FilePath) && await ChangedSinceDetectedAsync(record, stoppingToken))
                 {
                     await RetireAsync(record, "Overwritten by a newer dump at the same path before it was uploaded", stoppingToken);
                     _candidatePaths.Writer.TryWrite(record.FilePath);
@@ -337,12 +339,15 @@ public sealed class DumpWatcherService : BackgroundService
 
     /// <summary>
     /// The file at the record's path is no longer the dump it describes: MEMORY.DMP rewritten by a
-    /// new crash, possibly to the same size, so the write time counts too.
+    /// new crash, possibly to the same size. A changed size or write time is only a hint; the content
+    /// hash decides, so a file that was merely touched keeps its record.
     /// </summary>
-    private static bool ChangedSinceDetected(DumpRecord record)
+    private static async Task<bool> ChangedSinceDetectedAsync(DumpRecord record, CancellationToken stoppingToken)
     {
         var info = new FileInfo(record.FilePath);
-        return info.Length != record.SizeBytes || info.LastWriteTimeUtc > record.DetectedAtUtc.UtcDateTime;
+        if (info.Length == record.SizeBytes && info.LastWriteTimeUtc <= record.DetectedAtUtc.UtcDateTime) return false;
+        if (info.Length != record.SizeBytes || record.Sha256 is null) return true;
+        return await DumpHasher.ComputeSha256Async(record.FilePath, stoppingToken) != record.Sha256;
     }
 
     private async Task ResumeAsync(DumpRecord record, ApprovalOutcome outcome, CancellationToken stoppingToken)

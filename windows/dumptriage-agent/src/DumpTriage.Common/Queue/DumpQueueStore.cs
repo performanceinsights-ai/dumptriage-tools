@@ -84,6 +84,19 @@ public sealed class DumpQueueStore : IAsyncDisposable
         }
     }
 
+    /// <summary>When the oldest record in the queue was detected, or null for an empty queue.</summary>
+    public async Task<DateTimeOffset?> GetEarliestDetectedAsync(CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = "SELECT detected_at_utc FROM dumps ORDER BY detected_at_utc ASC LIMIT 1;";
+            return await command.ExecuteScalarAsync(cancellationToken) is string value ? DateTimeOffset.Parse(value) : null;
+        }
+        finally { _gate.Release(); }
+    }
+
     /// <summary>A small persistent value, such as when the last scheduled flush ran.</summary>
     public async Task<string?> GetMetaAsync(string key, CancellationToken cancellationToken = default)
     {

@@ -69,6 +69,7 @@ public sealed class UploadWorkerServiceTests : IAsyncDisposable
     {
         var path = Path.Combine(_dir, name);
         await File.WriteAllBytesAsync(path, "MDMP"u8.ToArray());
+        File.SetLastWriteTimeUtc(path, _time.GetUtcNow().UtcDateTime.AddMinutes(-1)); // written before detection
         var record = new DumpRecord
         {
             Id = name, FilePath = path, SizeBytes = 4, State = DumpQueueState.Queued, DetectedAtUtc = _time.GetUtcNow(),
@@ -102,6 +103,17 @@ public sealed class UploadWorkerServiceTests : IAsyncDisposable
         await worker.TickAsync(default);
         Assert.Equal(DumpQueueState.Submitted, (await Get("a.dmp")).State);
         Assert.Null((await Get("a.dmp")).NextAttemptUtc);
+    }
+
+    [Fact]
+    public async Task A_dump_changed_after_detection_is_not_uploaded_under_the_old_id()
+    {
+        var worker = await Worker();
+        var a = await Queued("a.dmp");
+        File.SetLastWriteTimeUtc(a.FilePath, _time.GetUtcNow().UtcDateTime.AddMinutes(1)); // overwritten in place
+        await worker.TickAsync(default);
+        Assert.Equal(0, _requests);
+        Assert.Equal(DumpQueueState.Skipped, (await Get("a.dmp")).State);
     }
 
     [Fact]

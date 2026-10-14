@@ -105,7 +105,7 @@ public sealed class UploadWorkerService : BackgroundService
         // A dump whose upload already started in a slot and failed transiently is retried on its own
         // backoff, not held for the next slot (a day away for a nightly one).
         var due = (await _queueStore.GetByStateAsync(DumpQueueState.Queued, stoppingToken))
-            .Where(r => shouldFlush || r.RetryCount > 0)
+            .Where(r => shouldFlush || (batching.Mode == BatchMode.ScheduledTimeOfDay && r.RetryCount > 0))
             .Where(r => r.NextAttemptUtc is null || r.NextAttemptUtc <= now)
             .ToList();
         if (!shouldFlush && due.Count == 0) return;
@@ -176,6 +176,19 @@ public sealed class UploadWorkerService : BackgroundService
         CancellationToken stoppingToken,
         DumpQueueState stateOnRetry = DumpQueueState.Queued)
     {
+        // The file must still be the dump this record describes: one overwritten in place after
+        // detection (a reused dump name, while an approval was pending) must not go up under this id.
+        // The watcher sees the change and records the new dump itself.
+        var info = new FileInfo(record.FilePath);
+        if (info.Exists && (info.Length != record.SizeBytes || info.LastWriteTimeUtc > record.DetectedAtUtc.UtcDateTime))
+        {
+            record.State = DumpQueueState.Skipped;
+            record.LastError = "Dump file changed after it was detected; the new dump is handled separately";
+            await _queueStore.UpsertAsync(record, stoppingToken);
+            _logger.LogWarning("Not uploading {Path} under {Id}: the file changed after it was detected", record.FilePath, record.Id);
+            return;
+        }
+
         record.State = DumpQueueState.Submitting;
         await _queueStore.UpsertAsync(record, stoppingToken);
 
