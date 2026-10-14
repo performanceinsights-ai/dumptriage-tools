@@ -1,6 +1,7 @@
 import json
 import lzma
 import os
+import shutil
 import struct
 import sys
 import tempfile
@@ -73,8 +74,8 @@ class PolicyTests(unittest.TestCase):
 
     def test_batching(self):
         b = {"mode": "ScheduledTimeOfDay", "scheduledTimesLocal": ["02:00"]}
-        self.assertFalse(da.should_submit_now(b, datetime(2026, 10, 7, 1, 0), None))
-        self.assertTrue(da.should_submit_now(b, datetime(2026, 10, 7, 3, 0), None))
+        self.assertFalse(da.should_submit_now(b, datetime(2026, 10, 7, 1, 0), datetime(2026, 10, 6, 3, 0)))
+        self.assertTrue(da.should_submit_now(b, datetime(2026, 10, 7, 3, 0), datetime(2026, 10, 6, 3, 0)))
         self.assertFalse(da.should_submit_now(b, datetime(2026, 10, 7, 3, 0), datetime(2026, 10, 7, 2, 30)))
         self.assertTrue(da.should_submit_now({"mode": "Immediate"}, self.NOW, None))
 
@@ -83,12 +84,12 @@ class FakeUploader:
     def __init__(self, *outcomes):
         self.outcomes, self.calls = list(outcomes), []
 
-    def __call__(self, url, key, path, hostname):
-        self.calls.append((url, key, os.path.basename(path), hostname, Path(path).read_bytes()))
+    def __call__(self, url, key, path, hostname, name):
+        self.calls.append((url, key, name, hostname, Path(path).read_bytes()))
         return self.outcomes.pop(0) if self.outcomes else (da.SUCCESS, 201, None)
 
 
-class AgentTests(unittest.TestCase):
+class AgentTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.watch = self.tmp / "dumps"
@@ -110,6 +111,9 @@ class AgentTests(unittest.TestCase):
 
     def rows(self, agent):
         return {Path(r["file_path"]).name: r["state"] for r in agent.queue.db.execute("SELECT * FROM dumps")}
+
+
+class AgentTests(AgentTestBase):
 
     def test_detects_and_uploads_core_ignores_other_files(self):
         (self.watch / "core.a.1.2").write_bytes(USER_CORE)
@@ -283,6 +287,320 @@ class UploadTests(unittest.TestCase):
         p = Path(tempfile.mkdtemp()) / "c"
         p.write_bytes(USER_CORE)
         self.assertEqual(da.upload_dump("http://127.0.0.1:1", "k", str(p), None)[0], da.TRANSIENT)
+
+
+
+
+class ReviewFixTests(AgentTestBase):
+    """Fixes from the 2026-10-14 agent review (dumptriage-tools #4, #9, #10, #11)."""
+
+    def test_symlinks_and_hard_links_are_never_read(self):  # #4
+        secret = self.tmp / "secret-core"
+        secret.write_bytes(USER_CORE)
+        (self.watch / "core.link").symlink_to(secret)
+        os.link(secret, self.watch / "core.hard")
+        a = self.agent()
+        self.settle(a)
+        self.assertEqual(self.rows(a), {})
+        self.assertEqual(self.uploader.calls, [])
+
+    def test_directory_swapped_for_symlink_after_scan_is_refused(self):  # #4
+        sub = self.watch / "d"
+        sub.mkdir()
+        (sub / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent(policy={"mode": "AskFirst"})
+        self.settle(a)
+        self.assertEqual(self.rows(a), {"core.a.1.2": da.PENDING})
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "core.a.1.2").write_bytes(USER_CORE + b"not this one")
+        sub.rename(self.tmp / "d-moved")
+        sub.symlink_to(elsewhere)
+        with self.assertRaises(OSError):
+            da.open_dump(str(sub / "core.a.1.2"), a.roots())
+        a.queue.update(a.queue.in_state(da.PENDING)[0]["id"], state=da.QUEUED)
+        a.submit_due()
+        self.assertEqual(self.uploader.calls, [])
+        self.assertEqual(self.rows(a), {"core.a.1.2": da.QUEUED})  # transient: retried, never read through the link
+
+    def test_uploads_under_the_original_name_from_the_opened_file(self):  # #4
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent()
+        self.settle(a)
+        self.assertEqual(self.uploader.calls[0][2], "core.a.1.2")
+        self.assertEqual(self.uploader.calls[0][4], USER_CORE)
+
+    def test_central_copies_with_the_same_name_do_not_overwrite(self):  # #10
+        dest = self.tmp / "archive"
+        for n, body in ((1, USER_CORE), (2, USER_CORE + b"second")):
+            d = self.watch / f"127.0.0.1-2026-10-0{n}"
+            d.mkdir()
+            (d / "vmcore").write_bytes(body)
+        a = self.agent(centralCopy={"enabled": True, "destinationPath": str(dest), "organizeByHostname": False})
+        self.settle(a)
+        copies = sorted(p.read_bytes() for p in dest.iterdir())
+        self.assertEqual(copies, sorted([USER_CORE, USER_CORE + b"second"]))
+
+    def test_auth_failure_uses_no_retry_and_pauses_uploads(self):  # #11
+        for n in (1, 2):
+            (self.watch / f"core.a.{n}").write_bytes(USER_CORE + bytes([n]))
+        a = self.agent(FakeUploader((da.AUTH, 401, "revoked")), maxRetries=1)
+        self.settle(a)
+        self.assertEqual(len(self.uploader.calls), 1)  # the second dump isn't tried with a refused key
+        self.assertEqual(set(self.rows(a).values()), {da.QUEUED})
+        self.assertEqual({r["retry_count"] for r in a.queue.in_state(da.QUEUED)}, {0})
+        self.now += timedelta(minutes=5)
+        a.tick()
+        self.assertEqual(len(self.uploader.calls), 1)  # still paused
+        self.now += timedelta(minutes=6)
+        a.tick()
+        self.assertEqual(set(self.rows(a).values()), {da.SUBMITTED})
+
+    def test_upload_dump_maps_401_and_403_to_auth(self):  # #11
+        for status in (401, 403):
+            srv = HTTPServer(("127.0.0.1", 0), type("H", (BaseHTTPRequestHandler,), {
+                "do_POST": lambda self, s=status: (self.rfile.read(int(self.headers["Content-Length"])), self.send_response(s), self.end_headers()),
+                "log_message": lambda *a: None}))
+            t = threading.Thread(target=srv.handle_request, daemon=True)
+            t.start()
+            p = self.tmp / "f"
+            p.write_bytes(b"x")
+            self.assertEqual(da.upload_dump(f"http://127.0.0.1:{srv.server_port}", "k", str(p), None)[0], da.AUTH)
+            t.join()
+            srv.server_close()
+
+    @unittest.skipUnless(shutil.which("zstd"), "zstd not installed")
+    def test_zst_core_is_decompressed_from_the_opened_file(self):  # #4: the decompressor reads stdin, not a path
+        import subprocess
+        subprocess.run(["zstd", "-q", "-o", str(self.watch / "core.z.1.2.zst")], input=USER_CORE, check=True)
+        a = self.agent()
+        self.settle(a)
+        self.assertEqual(self.uploader.calls[0][2:5:2], ("core.z.1.2", USER_CORE))
+
+    def test_scheduled_slot_with_nothing_queued_is_still_used(self):  # #9
+        batching = {"mode": "ScheduledTimeOfDay", "scheduledTimesLocal": ["02:00"]}
+        local = lambda h: datetime(2026, 10, 7, h, 0).astimezone().astimezone(timezone.utc)
+        self.now = local(1)
+        a = self.agent(policy={"mode": "AlwaysSubmit", "batching": batching})
+        a.tick()  # first run: records now, waits for the next slot
+        self.now = local(3)
+        a.tick()  # 02:00 slot passes with nothing queued
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        self.now = local(9)
+        self.settle(a)
+        self.assertEqual(self.uploader.calls, [])  # waits for tomorrow's 02:00
+        self.assertEqual(self.rows(a), {"core.a.1.2": da.QUEUED})
+        self.now = local(9) + timedelta(hours=18)  # 03:00 the next day
+        a.tick()
+        self.assertEqual(self.rows(a), {"core.a.1.2": da.SUBMITTED})
+
+    def test_central_copy_keeps_the_dump_mode_and_leaves_no_partial_file(self):  # review of #14
+        dest = self.tmp / "archive"
+        core = self.watch / "core.a.1.2"
+        core.write_bytes(USER_CORE)
+        core.chmod(0o600)
+        a = self.agent(centralCopy={"enabled": True, "destinationPath": str(dest), "organizeByHostname": False})
+        self.settle(a)
+        self.assertEqual((dest / "core.a.1.2").stat().st_mode & 0o777, 0o600)
+
+        def broken(src, dst, length=0):
+            dst.write(b"partial")
+            raise OSError("disk full")
+        (self.watch / "core.b.1.2").write_bytes(USER_CORE + b"b")
+        orig, da.shutil.copyfileobj = da.shutil.copyfileobj, broken
+        try:
+            self.settle(a)
+        finally:
+            da.shutil.copyfileobj = orig
+        self.assertFalse((dest / "core.b.1.2").exists())
+
+    def test_auth_pause_doubles_and_a_new_key_ends_it(self):  # review of #14
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent(FakeUploader(*[(da.AUTH, 401, "revoked")] * 2))
+        self.settle(a)  # refusal 1: 10 min
+        self.now += timedelta(minutes=11)
+        a.tick()  # refusal 2: 20 min
+        self.assertEqual(len(self.uploader.calls), 2)
+        self.now += timedelta(minutes=15)
+        a.tick()
+        self.assertEqual(len(self.uploader.calls), 2)  # still paused (20 min)
+        key = self.cfgdir / "api-key"
+        key.write_text("dts_new\n")
+        os.utime(key, ns=(1, 2))  # a different mtime, whatever the clock resolution
+        a.tick()
+        self.assertEqual(self.rows(a), {"core.a.1.2": da.SUBMITTED})
+
+    def test_scheduled_slot_during_an_auth_pause_is_taken_after_it(self):  # review of #14
+        batching = {"mode": "ScheduledTimeOfDay", "scheduledTimesLocal": ["02:00"]}
+        local = lambda h, m=0: datetime(2026, 10, 7, h, m).astimezone().astimezone(timezone.utc)
+        self.now = local(1)
+        a = self.agent(FakeUploader((da.AUTH, 401, "revoked")), policy={"mode": "AlwaysSubmit", "batching": batching})
+        a.tick()
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        self.settle(a)  # queued, waiting for 02:00
+        self.now = local(2, 1)
+        a.tick()  # refused: paused until 02:11
+        self.now = local(2, 5)
+        a.tick()
+        self.now = local(2, 12)
+        a.tick()  # the 02:00 slot was not used up by the refused attempt
+        self.assertEqual(self.rows(a), {"core.a.1.2": da.SUBMITTED})
+
+    def test_watched_root_through_a_planted_symlink_is_not_read(self):  # review of #14
+        shared = self.tmp / "shared"
+        shared.mkdir()
+        shared.chmod(0o1777)
+        (shared / "dumptriage").symlink_to(self.watch)  # as if another user planted it
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        orig = os.geteuid
+        os.geteuid = lambda: orig() + 12345  # the link (and the rest) now belongs to "someone else"
+        try:
+            a = self.agent(watchedPaths=[str(shared / "dumptriage")])
+            self.settle(a)
+            with self.assertRaises(da.NotWatched):
+                da.open_dump(str(shared / "dumptriage" / "core.a.1.2"), a.roots())
+        finally:
+            os.geteuid = orig
+        self.assertEqual(self.rows(a), {})
+        self.assertEqual(self.uploader.calls, [])
+
+    def test_dump_no_longer_under_a_watched_path_fails_with_a_reason(self):  # review of #14
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent(policy={"mode": "AskFirst"})
+        self.settle(a)
+        a.queue.update(a.queue.in_state(da.PENDING)[0]["id"], state=da.QUEUED)
+        a.cfg = da.merge(a.cfg, {"watchedPaths": [str(self.tmp / "other")]})
+        a.submit_due()
+        row = a.queue.db.execute("SELECT state, last_error FROM dumps").fetchone()
+        self.assertEqual(row["state"], da.FAILED)
+        self.assertIn("watchedPaths", row["last_error"])
+
+
+    def test_central_copy_is_not_repeated_after_a_crash_before_it_was_recorded(self):  # review of #14
+        dest = self.tmp / "archive"
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent(policy={"mode": "AskFirst"},
+                       centralCopy={"enabled": True, "destinationPath": str(dest), "organizeByHostname": False})
+        self.settle(a)
+        r = a.queue.in_state(da.PENDING)[0]
+        with da.open_dump(r["file_path"], a.roots()) as f:
+            a.central_copy(r, f)
+        a.queue.update(r["id"], central_copied_at_utc=None)  # as if killed before the queue recorded it
+        with da.open_dump(r["file_path"], a.roots()) as f:
+            a.central_copy(a.queue.get(r["id"]), f)
+        self.assertEqual(sorted(p.name for p in dest.iterdir()), ["core.a.1.2"])
+
+    def test_trusted_root_rules(self):  # review of #14
+        orig = os.geteuid
+        def as_other(fn):
+            os.geteuid = lambda: orig() + 12345
+            try:
+                return fn()
+            finally:
+                os.geteuid = orig
+        safe = self.tmp / "safe"
+        (safe / "app" / "dumps").mkdir(parents=True)
+        safe.chmod(0o755)  # whatever the umask: only we can write here
+        (safe / "app").chmod(0o755)
+        # Real folders owned by someone else (an app's service user) are fine.
+        self.assertTrue(as_other(lambda: da.trusted_root(str(safe / "app" / "dumps"))))
+        # A symlink only its trusted owner can replace is fine; one owned by someone else is not.
+        (safe / "link").symlink_to(safe / "app")
+        self.assertTrue(da.trusted_root(str(safe / "link" / "dumps")))
+        self.assertFalse(as_other(lambda: da.trusted_root(str(safe / "link" / "dumps"))))
+        # Our own symlink in a group/other-writable, non-sticky folder could be replaced: refused.
+        loose = self.tmp / "loose"
+        loose.mkdir()
+        loose.chmod(0o777)
+        (loose / "link").symlink_to(safe / "app")
+        self.assertFalse(da.trusted_root(str(loose / "link" / "dumps")))
+        # ... but in a sticky one only we can replace it.
+        loose.chmod(0o1777)
+        self.assertTrue(da.trusted_root(str(loose / "link" / "dumps")))
+        # A link inside the target is checked too: here one "someone else" owns, so it is refused.
+        (safe / "app" / "inner").symlink_to(safe / "app" / "dumps")
+        (safe / "outer").symlink_to(safe / "app" / "inner")
+        self.assertTrue(da.trusted_root(str(safe / "outer")))
+        self.assertFalse(as_other(lambda: da.trusted_root(str(safe / "outer"))))
+        # A relative link and .. resolve like the kernel does.
+        (safe / "rel").symlink_to("app/../app/dumps")
+        self.assertTrue(da.trusted_root(str(safe / "rel")))
+
+    def test_open_dump_walks_the_root_without_following_a_swap(self):  # review of #14
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        with da.open_dump(str(self.watch / "core.a.1.2"), [str(self.watch)]) as f:
+            self.assertEqual(f.read(), USER_CORE)
+        moved = self.tmp / "dumps-moved"
+        self.watch.rename(moved)
+        self.watch.symlink_to(moved)  # our own link in our own 0700 temp folder: allowed
+        with da.open_dump(str(self.watch / "core.a.1.2"), [str(self.watch)]) as f:
+            self.assertEqual(f.read(), USER_CORE)
+        orig = os.geteuid
+        os.geteuid = lambda: orig() + 12345  # now the link is "someone else's": refused at open
+        try:
+            with self.assertRaises(da.NotWatched):
+                da.open_dump(str(self.watch / "core.a.1.2"), [str(self.watch)])
+        finally:
+            os.geteuid = orig
+
+
+    def test_search_only_folders_and_group_writable_own_folders(self):  # review of #14
+        outer = self.tmp / "outer"
+        (outer / "dumps").mkdir(parents=True)
+        (outer / "dumps" / "core.a.1.2").write_bytes(USER_CORE)
+        grp = self.tmp / "grp"
+        grp.mkdir()
+        grp.chmod(0o775)  # user-private group umask
+        (grp / "link").symlink_to(outer / "dumps")
+        outer.chmod(0o111)  # search only: enough to reach dumps/
+        try:
+            self.assertTrue(da.trusted_root(str(outer / "dumps")))
+            self.assertTrue(da.trusted_root(str(grp / "link")))
+            with da.open_dump(str(grp / "link" / "core.a.1.2"), [str(grp / "link")]) as f:
+                self.assertEqual(f.read(), USER_CORE)
+        finally:
+            outer.chmod(0o755)
+
+    def test_dotdot_after_a_symlink_means_what_it_means_to_the_kernel(self):  # review of #14
+        srv, data = self.tmp / "srv", self.tmp / "data"
+        (srv / "dumps").mkdir(parents=True)
+        (data / "a").mkdir(parents=True)
+        (data / "dumps").mkdir()
+        (srv / "link").symlink_to(data / "a")
+        (data / "dumps" / "core.k.1.2").write_bytes(USER_CORE)
+        (srv / "dumps" / "core.wrong.1.2").write_bytes(USER_CORE + b"wrong")
+        for d in (srv, data, data / "a"):
+            d.chmod(0o755)
+        a = self.agent(watchedPaths=[str(srv / "link" / ".." / "dumps")])
+        self.settle(a)
+        self.assertEqual(self.rows(a), {"core.k.1.2": da.SUBMITTED})
+        self.assertEqual(self.uploader.calls[0][4], USER_CORE)
+
+    def test_unreadable_root_is_logged_with_its_real_error(self):  # review of #14
+        not_a_dir = self.tmp / "file"
+        not_a_dir.write_text("x")
+        a = self.agent(watchedPaths=[str(not_a_dir)])
+        with self.assertLogs("dumptriage", "ERROR") as logs:
+            a.tick()
+            a.tick()
+        self.assertEqual(len(logs.output), 1)  # once
+        self.assertIn("Not a directory", logs.output[0])
+        self.assertNotIn("symlink", logs.output[0])
+
+
+    def test_root_that_can_be_entered_but_not_read_is_skipped_not_fatal(self):  # review of #14
+        locked = self.tmp / "locked"
+        locked.mkdir()
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        locked.chmod(0o111)
+        try:
+            a = self.agent(watchedPaths=[str(locked), str(self.watch)])
+            with self.assertLogs("dumptriage", "ERROR") as logs:
+                self.settle(a)
+            self.assertIn("Permission denied", logs.output[0])
+            self.assertEqual(self.rows(a), {"core.a.1.2": da.SUBMITTED})  # the next root is still scanned
+        finally:
+            locked.chmod(0o755)
 
 
 if __name__ == "__main__":
