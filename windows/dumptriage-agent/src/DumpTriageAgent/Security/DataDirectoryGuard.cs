@@ -55,6 +55,14 @@ public static class DataDirectoryGuard
     {
         foreach (var entry in dir.EnumerateFileSystemInfos("*", AllEntries))
         {
+            // VetTree found none, but one could have been created before the folder was locked down
+            // a moment ago; the ACL calls below work by path and would follow it. Nobody else can
+            // create one any more, so this check can't be raced.
+            if (entry.Attributes.HasFlag(FileAttributes.ReparsePoint))
+            {
+                throw new UnauthorizedAccessException(
+                    $"{entry.FullName} is a junction or symlink. Delete {dir.FullName} and reinstall the agent.");
+            }
             Inherit(entry);
             if (entry is DirectoryInfo sub) InheritTree(sub);
         }
