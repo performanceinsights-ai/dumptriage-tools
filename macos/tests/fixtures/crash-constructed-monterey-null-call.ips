@@ -1,0 +1,102 @@
+{"app_name":"napper","timestamp":"2026-03-02 09:14:51.00 +0100","app_version":"","slice_uuid":"721328a1-784e-4ea2-b090-170d248b2e76","build_version":"","platform":1,"share_with_app_devs":0,"is_first_party":0,"bug_type":"309","os_version":"macOS 12.1 (21C52)","incident_id":"08DF54DA-5087-4311-B629-10D0DF31E4DC","name":"napper"}
+{
+  "uptime" : 86000,
+  "procLaunch" : "2026-03-02 09:14:43.2210 +0100",
+  "procRole" : "Unspecified",
+  "version" : 2,
+  "userID" : 501,
+  "deployVersion" : 210,
+  "modelCode" : "MacBookPro15,1",
+  "procStartAbsTime" : 86412377001234,
+  "coalitionID" : 2207,
+  "osVersion" : {
+    "train" : "macOS 12.1",
+    "build" : "21C52",
+    "releaseType" : "User"
+  },
+  "captureTime" : "2026-03-02 09:14:51.0147 +0100",
+  "incident" : "08DF54DA-5087-4311-B629-10D0DF31E4DC",
+  "bug_type" : "309",
+  "pid" : 48211,
+  "procExitAbsTime" : 86420191443321,
+  "cpuType" : "X86-64",
+  "procName" : "napper",
+  "procPath" : "\/usr\/local\/bin\/napper",
+  "parentProc" : "zsh",
+  "parentPid" : 48190,
+  "coalitionName" : "com.example.nightshell",
+  "crashReporterKey" : "4831A8C8-0938-400A-A40E-64DF4401628B",
+  "responsiblePid" : 1871,
+  "responsibleProc" : "NightShell",
+  "wakeTime" : 5120,
+  "bridgeVersion" : {"build":"19P647","train":"6.1"},
+  "sleepWakeUUID" : "28D4E0CB-DF9F-4C44-BA53-746C5C48E107",
+  "sip" : "enabled",
+  "vmRegionInfo" : "0 is not in any region.  Bytes before following region: 4426067968\n      REGION TYPE                    START - END         [ VSIZE] PRT\/MAX SHRMOD  REGION DETAIL\n      UNUSED SPACE AT START\n--->  \n      __TEXT                      107d0e000-107d14000    [   24K] r-x\/r-x SM=COW  \/usr\/local\/bin\/napper",
+  "isCorpse" : 1,
+  "exception" : {"codes":"0x0000000000000001, 0x0000000000000000","rawCodes":[1,0],"type":"EXC_BAD_ACCESS","signal":"SIGSEGV","subtype":"KERN_INVALID_ADDRESS at 0x0000000000000000"},
+  "termination" : {"flags":0,"code":11,"namespace":"SIGNAL","indicator":"Segmentation fault: 11","byProc":"exc handler","byPid":48211},
+  "vmregioninfo" : "0 is not in any region.  Bytes before following region: 4426067968\n      REGION TYPE                    START - END         [ VSIZE] PRT\/MAX SHRMOD  REGION DETAIL\n      UNUSED SPACE AT START\n--->  \n      __TEXT                      107d0e000-107d14000    [   24K] r-x\/r-x SM=COW  \/usr\/local\/bin\/napper",
+  "extMods" : {"caller":{"thread_create":0,"thread_set_state":0,"task_for_pid":0},"system":{"thread_create":0,"thread_set_state":0,"task_for_pid":4},"targeted":{"thread_create":0,"thread_set_state":0,"task_for_pid":0},"warnings":0},
+  "faultingThread" : 0,
+  "threads" : [{"triggered":true,"id":2210931,"threadState":{"r13":{"value":140732920755624},"rax":{"value":0},"rflags":{"value":66118},"cpu":{"value":2},"r14":{"value":140732920755400},"rsi":{"value":140732920755400},"r8":{"value":0},"cr2":{"value":0},"rdx":{"value":0},"r10":{"value":0},"r9":{"value":0},"r15":{"value":4426079520},"rbx":{"value":0},"trap":{"value":14,"description":"(no mapping for user instruction read)"},"err":{"value":20},"r11":{"value":514},"rip":{"value":0,"matchesCrashFrame":1},"rbp":{"value":140732920755376},"rsp":{"value":140732920755352},"r12":{"value":0},"rcx":{"value":140732920755336},"flavor":"x86_THREAD_STATE","rdi":{"value":3}},"queue":"com.apple.main-thread","frames":[{"imageOffset":0,"imageIndex":0},{"imageOffset":71492,"symbol":"nanosleep","symbolLocation":212,"imageIndex":1},{"imageOffset":12058,"imageIndex":2},{"imageOffset":21900,"symbol":"start","symbolLocation":520,"imageIndex":3}]},{"id":2210944,"name":"napper.timer","threadState":{"r13":{"value":0},"rax":{"value":33554468},"rflags":{"value":582},"cpu":{"value":0},"r14":{"value":0},"rsi":{"value":0},"r8":{"value":0},"cr2":{"value":0},"rdx":{"value":0},"r10":{"value":0},"r9":{"value":0},"r15":{"value":0},"rbx":{"value":0},"trap":{"value":133},"err":{"value":33554468},"r11":{"value":582},"rip":{"value":140703128502334},"rbp":{"value":123145305239424},"rsp":{"value":123145305239384},"r12":{"value":0},"rcx":{"value":123145305239384},"flavor":"x86_THREAD_STATE","rdi":{"value":0}},"frames":[{"imageOffset":10558,"symbol":"__semwait_signal","symbolLocation":10,"imageIndex":4},{"imageOffset":12058,"imageIndex":2}]}],
+  "usedImages" : [
+  {
+    "size" : 0,
+    "source" : "A",
+    "base" : 0,
+    "uuid" : "00000000-0000-0000-0000-000000000000"
+  },
+  {
+    "source" : "P",
+    "arch" : "x86_64",
+    "base" : 140703128698880,
+    "size" : 552960,
+    "uuid" : "2c5248dd-60fc-4c31-aedc-8b9500e940ad",
+    "path" : "\/usr\/lib\/system\/libsystem_c.dylib",
+    "name" : "libsystem_c.dylib"
+  },
+  {
+    "source" : "P",
+    "arch" : "x86_64",
+    "base" : 4426031104,
+    "size" : 24576,
+    "uuid" : "721328a1-784e-4ea2-b090-170d248b2e76",
+    "path" : "\/usr\/local\/bin\/napper",
+    "name" : "napper"
+  },
+  {
+    "source" : "P",
+    "arch" : "x86_64",
+    "base" : 4441821184,
+    "size" : 446464,
+    "uuid" : "34a30fb0-bad2-479f-8d75-cbf0cb591f62",
+    "path" : "\/usr\/lib\/dyld",
+    "name" : "dyld"
+  },
+  {
+    "source" : "P",
+    "arch" : "x86_64",
+    "base" : 140703128491776,
+    "size" : 229376,
+    "uuid" : "d4a0898e-b3df-412b-b76b-c0e026b63d76",
+    "path" : "\/usr\/lib\/system\/libsystem_kernel.dylib",
+    "name" : "libsystem_kernel.dylib"
+  }
+],
+  "sharedCache" : {"base":140703126241280,"size":15216738304,"uuid":"25d56cb7-b20d-4724-b9d1-911cda44095c"},
+  "vmSummary" : "ReadOnly portion of Libraries: Total=138.2M resident=0K(0%) swapped_out_or_unallocated=138.2M(100%)\nWritable regions: Total=8392K written=0K(0%) resident=0K(0%) swapped_out=0K(0%) unallocated=8392K(100%)\n\n                                VIRTUAL   REGION \nREGION TYPE                        SIZE    COUNT (non-coalesced) \n===========                     =======  ======= \nKernel Alloc Once                    8K        1 \nMALLOC                           148K        8 \nMALLOC guard page                   16K        4 \nSTACK GUARD                       56.0M        2 \nStack                             8708K        2 \n__DATA                             496K       44 \n__DATA_CONST                       308K       38 \n__LINKEDIT                       129.4M        3 \n__TEXT                             8.8M       46 \nshared memory                        8K        2 \n===========                     =======  ======= \nTOTAL                            204.0M      150 \n",
+  "legacyInfo" : {
+  "threadTriggered" : {
+    "queue" : "com.apple.main-thread"
+  }
+},
+  "trialInfo" : {
+  "rollouts" : [
+
+  ],
+  "experiments" : [
+
+  ]
+}
+}

@@ -58,3 +58,18 @@ jobs:
             if ($errors) { $failed = $true; Write-Host "$($f.FullName)"; $errors | ForEach-Object { Write-Host "  $_" } }
           }
           if ($failed) { exit 1 }
+
+  macos-collect:
+    # Plain bash with fake curl/security/spindump on PATH, so it runs on Linux too.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash macos/tests/test_collect.sh
+
+  ninjaone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: pwsh -NoProfile -NonInteractive -File rmm/ninjaone/tests/Run-Tests.ps1
