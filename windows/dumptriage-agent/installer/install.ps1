@@ -43,6 +43,8 @@ param(
     [switch]$PromptForApiKey,
     # Removed: kept only so an old call fails with a clear message.
     [Parameter(DontShow = $true)][string]$ApiKey,
+    # Pipeline input only (Get-Content key.txt | .\install.ps1 ...); refused as a named argument.
+    [Parameter(ValueFromPipeline = $true, DontShow = $true)][string]$PipedApiKey,
     [Parameter(Position = 0, Mandatory = $true)][string]$AgentPublishDir,
     [Parameter(Position = 1, Mandatory = $true)][string]$TrayPublishDir,
     [Parameter(Position = 2)][string]$InstallDir = "$env:ProgramFiles\DumpTriage"
@@ -53,6 +55,9 @@ $ErrorActionPreference = "Stop"
 # An old positional call (`install.ps1 dts_xxx <agent> <tray>`) binds the key to
 # a path parameter; catch it here so no later error message echoes it.
 $keyInPath = @($AgentPublishDir, $TrayPublishDir, $InstallDir) | Where-Object { $_ -like 'dts_*' }
+if ($PipedApiKey -and -not $MyInvocation.ExpectingInput) {
+    throw "-PipedApiKey is for pipeline input only (Get-Content key.txt | .\install.ps1 ...): a key on the command line is saved in PowerShell history and process audit logs. Revoke that key in the portal and use -ApiKeyFile <path> or -PromptForApiKey."
+}
 if ($ApiKey -or $keyInPath) {
     throw "-ApiKey is no longer accepted: a key on the command line is saved in PowerShell history and process audit logs. Revoke that key in the portal, then use -ApiKeyFile <path> or -PromptForApiKey. Clear it from history with: Remove-Item (Get-PSReadLineOption).HistorySavePath"
 }
@@ -133,7 +138,7 @@ function Read-ApiKeyForProvisioning {
 # PowerShell pipeline input (Get-Content key.txt | .\install.ps1 ...), never the
 # console's stdin: a deployment tool that redirects stdin and leaves it open
 # would block a reinstall that asked for no key at all.
-$pipedKey = "$(@($input) | Select-Object -First 1)".Trim()
+$pipedKey = "$PipedApiKey".Trim()
 $plaintextKey = Read-ApiKeyForProvisioning -ApiKeyFile $ApiKeyFile -PipedKey $pipedKey `
     -Prompt:($PromptForApiKey -or (-not $existingService -and $canPrompt)) -PromptRequired:$PromptForApiKey
 

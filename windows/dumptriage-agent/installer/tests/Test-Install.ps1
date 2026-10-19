@@ -87,6 +87,8 @@ finally {
 
 Assert-Equal (Read-ApiKeyForProvisioning -PipedKey "dts_piped") "dts_piped" "a key piped into the script is used"
 Assert-Equal (Read-ApiKeyForProvisioning) $null "with no file, no piped key and no prompt, the existing key is left alone"
+$refusesNamedPipe = $ast.Extent.Text -match 'if \(\$PipedApiKey -and -not \$MyInvocation\.ExpectingInput\) \{\s*throw'
+Assert-Equal $refusesNamedPipe $true "-PipedApiKey given as a named argument (not piped) is refused"
 Assert-Equal ($ast.Extent.Text -match '\[Console\]::In\.') $false "the console's stdin is never read (a redirected, open stdin would hang a reinstall)"
 
 $missingFile = Join-Path ([System.IO.Path]::GetTempPath()) "install-test-missing-$([guid]::NewGuid()).txt"
