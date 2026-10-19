@@ -213,6 +213,21 @@ assert_not_contains "$OUT" "Which to send?"  # only the fresh spindump, no picke
 [ -z "$(ls "$T"/dumptriage-spindump-* 2>/dev/null)" ] || fail "the temporary spindump was not removed"
 done_test
 
+setup a_declined_spindump_is_removed_too
+run "n
+" --dir "$REPORTS" --spindump Xcode
+assert_eq "$CODE" 0
+assert_contains "$OUT" "Not sent."
+assert_eq "$(grep -c '^curl' "$LOG")" 0
+[ -z "$(ls "$T"/dumptriage-spindump-* 2>/dev/null)" ] || fail "a declined spindump was left in TMPDIR"
+done_test
+
+setup a_spindump_without_a_key_is_removed_too
+DUMPTRIAGE_API_URL= run "" --dir "$REPORTS" --spindump Xcode
+assert_eq "$CODE" 2
+[ -z "$(ls "$T"/dumptriage-spindump-* 2>/dev/null)" ] || fail "a spindump that could not be sent was left in TMPDIR"
+done_test
+
 setup dry_run_spindump_runs_nothing
 run "" --dir "$REPORTS" --spindump 4242 --dry-run
 assert_eq "$CODE" 0

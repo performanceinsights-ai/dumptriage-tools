@@ -120,6 +120,8 @@ collect() {
 
 take_spindump() {
     out="${TMPDIR:-/tmp}/dumptriage-spindump-$$.txt"
+    # Removed on every exit (declined, no key, failed upload): it holds process paths and the user name.
+    trap 'rm -f "$out"' EXIT
     printf 'Sampling %s for %s seconds with spindump (sudo asks for your password)...\n' "$SPINDUMP_TARGET" "$SPINDUMP_SECONDS"
     if ! sudo spindump "$SPINDUMP_TARGET" "$SPINDUMP_SECONDS" -file "$out" >/dev/null; then
         die "spindump of '$SPINDUMP_TARGET' failed"
@@ -260,5 +262,4 @@ failed=0
 for f in "${SELECTED[@]}"; do
     upload "$f" || failed=1
 done
-[ -n "$SPINDUMP_FILE" ] && rm -f "$SPINDUMP_FILE"
 exit $failed

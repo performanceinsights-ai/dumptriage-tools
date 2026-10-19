@@ -1,6 +1,6 @@
 # macOS report fixtures
 
-Reports `../test_collect.sh` copies into a fake DiagnosticReports folder. Copied from the DumpTriage service's own fixtures (2026-10-19); each real one is kept under its upstream licence.
+Reports `../test_collect.sh` copies into a fake DiagnosticReports folder. Copied from the DumpTriage service's own fixtures (2026-10-19); each real one is kept under its upstream licence, whose full text (copyright and permission notice) is in `LICENSES/<fixture>.<licence>.txt`. The repository's MIT licence does not cover them.
 
 | Fixture | What it is | Source | Licence | Edits |
 |---|---|---|---|---|
