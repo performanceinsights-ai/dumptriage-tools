@@ -1,0 +1,70 @@
+name: Release
+
+# A v* tag publishes every tool as a GitHub Release asset. Asset names carry no
+# version, so https://github.com/performanceinsights-ai/dumptriage-tools/releases/latest/download/<name>
+# always serves the newest one: the downloads page on performanceinsights.ai links there.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-agent:
+    # The tray app needs the Windows Desktop SDK, so this builds on Windows.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Publish the agent and tray app
+        shell: pwsh
+        working-directory: windows/dumptriage-agent
+        run: |
+          $out = "$env:RUNNER_TEMP\dumptriage-agent-windows-x64"
+          dotnet publish src/DumpTriageAgent -c Release -r win-x64 --self-contained -o "$out\agent"
+          dotnet publish src/DumpTriageTray -c Release -r win-x64 --self-contained -o "$out\tray"
+          Copy-Item -Recurse installer -Destination "$out\installer"
+          Remove-Item -Recurse -Force "$out\installer\linux" -ErrorAction SilentlyContinue
+          Copy-Item README.md, ..\..\LICENSE -Destination $out
+          Compress-Archive -Path "$out\*" -DestinationPath "$env:RUNNER_TEMP\dumptriage-agent-windows-x64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-agent
+          path: ${{ runner.temp }}/dumptriage-agent-windows-x64.zip
+          if-no-files-found: error
+
+  release:
+    needs: windows-agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-agent
+          path: dist
+      - name: Package the Linux agent and the standalone scripts
+        run: |
+          set -euo pipefail
+          stage=$(mktemp -d)/dumptriage-agent-linux
+          mkdir -p "$stage"
+          # install.sh finds the agent at ../dumptriage_agent.py, so the tree keeps its shape.
+          cp -r linux/dumptriage-agent/dumptriage_agent.py linux/dumptriage-agent/installer linux/dumptriage-agent/README.md LICENSE "$stage/"
+          cp linux/configure-dumps.sh "$stage/"
+          tar -C "$(dirname "$stage")" -czf dist/dumptriage-agent-linux.tar.gz dumptriage-agent-linux
+          cp windows/Set-WerLocalDumps.ps1 windows/Set-WerLiveKernelReports.ps1 linux/configure-dumps.sh \
+             macos/dumptriage-collect.sh rmm/ninjaone/Invoke-DumpTriageCollect.ps1 dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
