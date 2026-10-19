@@ -33,8 +33,9 @@ public static class BatchScheduler
     private static bool IsAtOrPastAnyScheduledTimeSinceLastFlush(
         BatchingConfig config, DateTimeOffset nowLocal, DateTimeOffset? lastScheduledFlushUtc)
     {
-        var today = DateOnly.FromDateTime(nowLocal.LocalDateTime);
-        var nowTime = TimeOnly.FromDateTime(nowLocal.LocalDateTime);
+        // The clock time in the offset given, not converted to the machine's zone (website#1467).
+        var today = DateOnly.FromDateTime(nowLocal.DateTime);
+        var nowTime = TimeOnly.FromDateTime(nowLocal.DateTime);
 
         foreach (var scheduled in config.ScheduledTimesLocal)
         {

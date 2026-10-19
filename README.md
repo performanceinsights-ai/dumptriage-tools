@@ -49,6 +49,8 @@ agent with `configure-dumps.sh` (`dumptriage-agent-linux.tar.gz`), and `SHA256SU
 ```sh
 python3 -m unittest discover -s linux/dumptriage-agent/tests
 dotnet test windows/dumptriage-agent/tests/DumpTriage.Common.Tests
+dotnet test windows/dumptriage-agent/tests/DumpTriageAgent.Tests
+pwsh -NoProfile -File windows/dumptriage-agent/installer/tests/Test-Install.ps1
 bash macos/tests/test_collect.sh
 pwsh -NoProfile -File rmm/ninjaone/tests/Run-Tests.ps1
 ```

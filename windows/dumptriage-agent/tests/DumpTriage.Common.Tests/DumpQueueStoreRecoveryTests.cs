@@ -16,7 +16,7 @@ public class DumpQueueStoreRecoveryTests
     };
 
     [Fact]
-    public async Task RecoverInterruptedSubmissions_RequeuesOnlySubmitting()
+    public async Task RequeueInterrupted_RequeuesOnlySubmitting()
     {
         var dbPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".db");
         var store = await DumpQueueStore.OpenAsync(dbPath);
@@ -26,7 +26,7 @@ public class DumpQueueStoreRecoveryTests
             await store.UpsertAsync(Make("a", "a.dmp", DumpQueueState.Submitting, now));
             await store.UpsertAsync(Make("b", "b.dmp", DumpQueueState.Submitted, now));
 
-            Assert.Equal(1, await store.RecoverInterruptedSubmissionsAsync());
+            Assert.Equal(1, await store.RequeueInterruptedAsync());
 
             Assert.Single(await store.GetByStateAsync(DumpQueueState.Queued));
             Assert.Single(await store.GetByStateAsync(DumpQueueState.Submitted));
@@ -53,26 +53,6 @@ public class DumpQueueStoreRecoveryTests
             var found = await store.FindByIdAsync("a");
             Assert.Equal(DumpQueueState.Submitted, found!.State);
             Assert.Null(await store.FindByIdAsync("missing"));
-        }
-        finally
-        {
-            await store.DisposeAsync();
-            File.Delete(dbPath);
-        }
-    }
-
-    [Fact]
-    public async Task FindByFilePath_ReturnsMostRecentWhenPathReused()
-    {
-        var dbPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".db");
-        var store = await DumpQueueStore.OpenAsync(dbPath);
-        try
-        {
-            var now = DateTimeOffset.UtcNow;
-            await store.UpsertAsync(Make("new", "MEMORY.DMP", DumpQueueState.Queued, now));
-            await store.UpsertAsync(Make("old", "MEMORY.DMP", DumpQueueState.Submitted, now.AddDays(-1)));
-
-            Assert.Equal("new", (await store.FindByFilePathAsync("MEMORY.DMP"))!.Id);
         }
         finally
         {

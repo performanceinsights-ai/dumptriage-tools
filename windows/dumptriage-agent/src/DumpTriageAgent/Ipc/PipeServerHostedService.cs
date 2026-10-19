@@ -200,6 +200,9 @@ public sealed class PipeServerHostedService : BackgroundService, ITrayChannel
             case IpcMessageType.ResumeAgent:
                 _runtimeState.Resume();
                 break;
+            case IpcMessageType.RetryFailed:
+                _runtimeState.RequestRetryFailed();
+                break;
             default:
                 _logger.LogWarning("Unhandled or incomplete IPC message type {Type}", message.Type);
                 break;

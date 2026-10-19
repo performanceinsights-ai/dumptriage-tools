@@ -58,6 +58,9 @@ jobs:
             if ($errors) { $failed = $true; Write-Host "$($f.FullName)"; $errors | ForEach-Object { Write-Host "  $_" } }
           }
           if ($failed) { exit 1 }
+      - name: Windows installer checks
+        shell: pwsh
+        run: pwsh -NoProfile -NonInteractive -File windows/dumptriage-agent/installer/tests/Test-Install.ps1
 
   macos-collect:
     # Plain bash with fake curl/security/spindump on PATH, so it runs on Linux too.

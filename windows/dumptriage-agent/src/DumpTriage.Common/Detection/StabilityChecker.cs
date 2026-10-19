@@ -9,12 +9,25 @@ namespace DumpTriage.Common.Detection;
 /// </summary>
 public static class StabilityChecker
 {
-    public static async Task<bool> WaitUntilStableAsync(
+    public static Task<bool> WaitUntilStableAsync(
         string filePath,
         TimeSpan pollInterval,
         TimeSpan quietPeriod,
         TimeSpan timeout,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        WaitUntilStableAsync(filePath, pollInterval, quietPeriod, timeout, OpenForCheck, cancellationToken);
+
+    private static IDisposable OpenForCheck(string filePath) =>
+        new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+
+    /// <param name="open">Opens the file the way the upload will; a test seam.</param>
+    internal static async Task<bool> WaitUntilStableAsync(
+        string filePath,
+        TimeSpan pollInterval,
+        TimeSpan quietPeriod,
+        TimeSpan timeout,
+        Func<string, IDisposable> open,
+        CancellationToken cancellationToken)
     {
         var deadline = DateTimeOffset.UtcNow + timeout;
         long lastSize = -1;
@@ -58,7 +71,7 @@ public static class StabilityChecker
                 continue;
             }
 
-            if (IsUnlocked(filePath))
+            if (IsUnlocked(filePath, open))
             {
                 return true;
             }
@@ -69,17 +82,17 @@ public static class StabilityChecker
         return false;
     }
 
-    private static bool IsUnlocked(string filePath)
+    private static bool IsUnlocked(string filePath, Func<string, IDisposable> open)
     {
         try
         {
-            using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using var stream = open(filePath);
             return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // A sharing violation or a transient ACL denial while the writer
-            // still owns the file both mean "not ready yet".
+            // Access denied while the writer (WER, the kernel) still holds the
+            // file is "not ready yet", not a reason to drop the dump (website#1493).
             return false;
         }
     }

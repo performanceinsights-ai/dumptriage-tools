@@ -22,6 +22,9 @@
     first install in an interactive session when no -ApiKeyFile is given.
     On a reinstall without either option the existing key is left untouched.
 
+    A deployment tool can also pipe the key into this script's stdin
+    (Get-Content key.txt | .\install.ps1 ...).
+
     The key is never taken as a plain command-line argument: that would land
     in PowerShell history, process-creation audit logs and transcripts.
 
@@ -40,6 +43,8 @@ param(
     [switch]$PromptForApiKey,
     # Removed: kept only so an old call fails with a clear message.
     [Parameter(DontShow = $true)][string]$ApiKey,
+    # Pipeline input only (Get-Content key.txt | .\install.ps1 ...); refused as a named argument.
+    [Parameter(ValueFromPipeline = $true, DontShow = $true)][string]$PipedApiKey,
     [Parameter(Position = 0, Mandatory = $true)][string]$AgentPublishDir,
     [Parameter(Position = 1, Mandatory = $true)][string]$TrayPublishDir,
     [Parameter(Position = 2)][string]$InstallDir = "$env:ProgramFiles\DumpTriage"
@@ -50,6 +55,9 @@ $ErrorActionPreference = "Stop"
 # An old positional call (`install.ps1 dts_xxx <agent> <tray>`) binds the key to
 # a path parameter; catch it here so no later error message echoes it.
 $keyInPath = @($AgentPublishDir, $TrayPublishDir, $InstallDir) | Where-Object { $_ -like 'dts_*' }
+if ($PipedApiKey -and -not $MyInvocation.ExpectingInput) {
+    throw "-PipedApiKey is for pipeline input only (Get-Content key.txt | .\install.ps1 ...): a key on the command line is saved in PowerShell history and process audit logs. Revoke that key in the portal and use -ApiKeyFile <path> or -PromptForApiKey."
+}
 if ($ApiKey -or $keyInPath) {
     throw "-ApiKey is no longer accepted: a key on the command line is saved in PowerShell history and process audit logs. Revoke that key in the portal, then use -ApiKeyFile <path> or -PromptForApiKey. Clear it from history with: Remove-Item (Get-PSReadLineOption).HistorySavePath"
 }
@@ -99,23 +107,40 @@ if (Test-Path -LiteralPath $DataDir) {
 # A first install prompts unless the session can't answer (-NonInteractive, or no console).
 $canPrompt = [Environment]::UserInteractive -and
     -not ([Environment]::GetCommandLineArgs() | Where-Object { $_ -like '-NonI*' })
-$plaintextKey = $null
-if ($ApiKeyFile) {
-    if (-not (Test-Path -LiteralPath $ApiKeyFile -PathType Leaf)) {
-        throw "API key file not found: $ApiKeyFile"
+# Never a command-line argument: from a file the caller protects, from this
+# script's own stdin (a deployment tool piping it in), or a masked prompt.
+function Read-ApiKeyForProvisioning {
+    param([string]$ApiKeyFile, [string]$PipedKey, [switch]$Prompt, [switch]$PromptRequired)
+    if ($ApiKeyFile) {
+        if (-not (Test-Path -LiteralPath $ApiKeyFile -PathType Leaf)) {
+            throw "API key file not found: $ApiKeyFile"
+        }
+        $key = "$(Get-Content -LiteralPath $ApiKeyFile -Raw)".Trim()
+        if (-not $key) {
+            throw "API key file is empty: $ApiKeyFile"
+        }
+        return $key
     }
-    $plaintextKey = "$(Get-Content -LiteralPath $ApiKeyFile -Raw)".Trim()
-    if (-not $plaintextKey) {
-        throw "API key file is empty: $ApiKeyFile"
+    if ($PipedKey) {
+        return $PipedKey
     }
+    if ($Prompt) {
+        $secure = Read-Host -Prompt "DumpTriage API key (dts_...)" -AsSecureString
+        $key = [System.Net.NetworkCredential]::new("", $secure).Password.Trim()
+        if (-not $key -and $PromptRequired) {
+            throw "No API key entered."
+        }
+        return $key
+    }
+    return $null
 }
-elseif ($PromptForApiKey -or (-not $existingService -and $canPrompt)) {
-    $secure = Read-Host -Prompt "DumpTriage API key (dts_...)" -AsSecureString
-    $plaintextKey = [System.Net.NetworkCredential]::new("", $secure).Password.Trim()
-    if (-not $plaintextKey -and $PromptForApiKey) {
-        throw "No API key entered."
-    }
-}
+
+# PowerShell pipeline input (Get-Content key.txt | .\install.ps1 ...), never the
+# console's stdin: a deployment tool that redirects stdin and leaves it open
+# would block a reinstall that asked for no key at all.
+$pipedKey = "$PipedApiKey".Trim()
+$plaintextKey = Read-ApiKeyForProvisioning -ApiKeyFile $ApiKeyFile -PipedKey $pipedKey `
+    -Prompt:($PromptForApiKey -or (-not $existingService -and $canPrompt)) -PromptRequired:$PromptForApiKey
 
 Write-Host "Installing DumpTriage agent into $InstallDir"
 New-Item -ItemType Directory -Force -Path $AgentInstallDir | Out-Null
