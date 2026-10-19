@@ -1,8 +1,8 @@
+using System.Threading.Channels;
 using DumpTriage.Common.CentralCopy;
 using DumpTriage.Common.Config;
 using DumpTriage.Common.Detection;
 using DumpTriage.Common.Idle;
-using DumpTriage.Common.Ipc;
 using DumpTriage.Common.Models;
 using DumpTriage.Common.Policy;
 using DumpTriage.Common.Queue;
@@ -25,7 +25,26 @@ namespace DumpTriageAgent.Upload;
 public sealed class UploadWorkerService : BackgroundService
 {
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(30);
-    private const string LastFlushKey = "last_scheduled_flush_utc";
+    // Meta key: when the last ScheduledTimeOfDay slot opened. Kept in the queue, so a restart
+    // neither forgets a slot nor uploads at once (#9).
+    internal const string LastFlushKey = "last_scheduled_flush_utc";
+    // After a transient failure a dump waits RetryBackoffBase, doubling per
+    // failure up to RetryBackoffMax, and gives up GiveUpAfter its first
+    // failure (website#1488): a short outage no longer fails the queue for good
+    // (it was 5 tries, one per 30 s poll), and a long one still ends.
+    internal static readonly TimeSpan RetryBackoffBase = TimeSpan.FromMinutes(1);
+    internal static readonly TimeSpan RetryBackoffMax = TimeSpan.FromHours(6);
+    internal static readonly TimeSpan GiveUpAfter = TimeSpan.FromDays(7);
+    // How long the whole queue waits after an answer that no dump can get
+    // past, before one dump tries again; each try may re-send a whole dump,
+    // so not every poll. Terms (website#1313) are a click in the portal away; a key
+    // or a closed account needs someone to act; a monthly quota resets.
+    internal static readonly TimeSpan TermsHold = TimeSpan.FromMinutes(15);
+    internal static readonly TimeSpan CredentialsHold = TimeSpan.FromHours(1);
+    internal static readonly TimeSpan QuotaHold = TimeSpan.FromHours(6);
+    internal const string FileChangedError =
+        "the dump file changed after it was detected; it is detected again as a new dump";
+    internal const string NoUsableKeyReason = "Uploads paused: no usable API key on this machine; set one with the installer";
 
     private readonly AgentConfig _config;
     private readonly DumpQueueStore _queueStore;
@@ -34,12 +53,19 @@ public sealed class UploadWorkerService : BackgroundService
     private readonly IApiKeyProtector _apiKeyProtector;
     private readonly AgentRuntimeState _runtimeState;
     private readonly ILogger<UploadWorkerService> _logger;
-    private readonly TimeProvider _time;
-    private readonly ITrayChannel _tray;
 
-    // In memory: a new key needs a service restart (the config is read at start), which clears it.
-    private DateTimeOffset _authBackoffUntilUtc = DateTimeOffset.MinValue;
-    private int _authRefusalsInARow;
+    // When the last ScheduledTimeOfDay slot opened, and the ids of the dumps
+    // it opened with that are still to go (null once none is left).
+    private DateTimeOffset? _lastScheduledFlushUtc;
+    private HashSet<string>? _openSlotDumpIds;
+
+    /// <summary>The local clock the batching schedule is read on; tests move it to the next slot.</summary>
+    internal Func<DateTimeOffset> ScheduleClock { get; set; } = () => DateTimeOffset.Now;
+
+    // Requests from the tray, handled on the worker's loop: a dump id to
+    // submit now, or RetryFailedRequest.
+    private readonly Channel<object> _trayRequests = Channel.CreateUnbounded<object>();
+    private sealed record RetryFailedRequest;
 
     public UploadWorkerService(
         AgentConfig config,
@@ -48,12 +74,8 @@ public sealed class UploadWorkerService : BackgroundService
         IIdleTimeProvider idleTimeProvider,
         IApiKeyProtector apiKeyProtector,
         AgentRuntimeState runtimeState,
-        ILogger<UploadWorkerService> logger,
-        ITrayChannel? tray = null,
-        TimeProvider? time = null)
+        ILogger<UploadWorkerService> logger)
     {
-        _time = time ?? TimeProvider.System;
-        _tray = tray ?? new NullTrayChannel();
         _config = config;
         _queueStore = queueStore;
         _apiClient = apiClient;
@@ -62,72 +84,169 @@ public sealed class UploadWorkerService : BackgroundService
         _runtimeState = runtimeState;
         _logger = logger;
 
-        _runtimeState.ManualSubmitRequested += dumpId => _ = SubmitByIdAsync(dumpId, CancellationToken.None);
+        // Handled on the worker's own loop, not fire-and-forget from the pipe
+        // thread (website#1492): that path's exceptions were never observed, it raced
+        // the ticks, and it ignored the pause, the terms hold and shutdown.
+        _runtimeState.ManualSubmitRequested += dumpId => _trayRequests.Writer.TryWrite(dumpId);
+        _runtimeState.RetryFailedRequested += () => _trayRequests.Writer.TryWrite(new RetryFailedRequest());
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        try
+        {
+            await RecoverInterruptedAsync(stoppingToken);
+        }
+        catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+        {
+            _logger.LogError(ex, "Could not requeue uploads interrupted by the last shutdown");
+        }
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
+                await ProcessTrayRequestsAsync(stoppingToken);
                 await TickAsync(stoppingToken);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
             {
                 _logger.LogError(ex, "Upload worker tick failed");
             }
 
-            await Task.Delay(PollInterval, stoppingToken);
+            await WaitForNextTickAsync(stoppingToken);
+        }
+    }
+
+    /// <summary>
+    /// A record still in Submitting at start was cut off by a crash, reboot or
+    /// service stop mid-upload (website#1485); nothing else would ever send it.
+    /// </summary>
+    internal async Task RecoverInterruptedAsync(CancellationToken stoppingToken)
+    {
+        var requeued = await _queueStore.RequeueInterruptedAsync(stoppingToken);
+        if (requeued > 0)
+        {
+            _logger.LogInformation("Requeued {Count} dump(s) whose upload was interrupted", requeued);
+        }
+    }
+
+    /// <summary>The poll interval, cut short by a request from the tray.</summary>
+    private async Task WaitForNextTickAsync(CancellationToken stoppingToken)
+    {
+        using var wake = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        var delay = Task.Delay(PollInterval, wake.Token);
+        var trayRequest = _trayRequests.Reader.WaitToReadAsync(wake.Token).AsTask();
+        await Task.WhenAny(delay, trayRequest);
+        wake.Cancel();
+        stoppingToken.ThrowIfCancellationRequested();
+    }
+
+    internal async Task ProcessTrayRequestsAsync(CancellationToken stoppingToken)
+    {
+        while (_trayRequests.Reader.TryRead(out var request))
+        {
+            switch (request)
+            {
+                case string dumpId:
+                    await SubmitByIdAsync(dumpId, stoppingToken);
+                    break;
+                case RetryFailedRequest:
+                    // Nothing else ever takes a dump out of Failed (website#1488).
+                    var requeued = await _queueStore.RequeueFailedAsync(stoppingToken);
+                    _logger.LogInformation("Retry requested from the tray: requeued {Count} failed dump(s)", requeued);
+                    break;
+            }
         }
     }
 
     internal async Task TickAsync(CancellationToken stoppingToken)
     {
         if (_runtimeState.IsPaused) return;
-        var now = _time.GetUtcNow();
+        if (_runtimeState.ActiveUploadHold(DateTimeOffset.UtcNow) is not null) return;
+
         var batching = _config.Policy.Batching;
-
-        // Kept in the queue, so a restart neither forgets a slot nor uploads at once (#9).
-        DateTimeOffset? lastFlush = await _queueStore.GetMetaAsync(LastFlushKey, stoppingToken) is { } stored
-            ? DateTimeOffset.Parse(stored, null, System.Globalization.DateTimeStyles.RoundtripKind)
-            : null;
-        if (batching.Mode == BatchMode.ScheduledTimeOfDay && lastFlush is null)
+        if (batching.Mode == BatchMode.ScheduledTimeOfDay && _lastScheduledFlushUtc is null)
         {
-            await _queueStore.SetMetaAsync(LastFlushKey, now.ToString("O"), stoppingToken); // first run: wait for a slot
-            return;
+            if (await _queueStore.GetMetaAsync(LastFlushKey, stoppingToken) is { } stored)
+            {
+                _lastScheduledFlushUtc = DateTimeOffset.Parse(stored, null, System.Globalization.DateTimeStyles.RoundtripKind);
+            }
+            else
+            {
+                // First run under a schedule: wait for the first slot rather than uploading at once (#9).
+                await SaveSlotAsync(ScheduleClock().ToUniversalTime(), stoppingToken);
+                return;
+            }
         }
-
         var idle = _idleTimeProvider.GetIdleDuration();
-        var shouldFlush = BatchScheduler.ShouldSubmitNow(batching, now.ToLocalTime(), idle, lastFlush);
-        _logger.LogDebug("Upload tick, shouldFlush={ShouldFlush}, batchMode={Mode}", shouldFlush, batching.Mode);
-        if (now < _authBackoffUntilUtc) return; // the key was refused; don't send dumps to be refused again
+        var scheduleNow = ScheduleClock();
+        var shouldFlush = BatchScheduler.ShouldSubmitNow(batching, scheduleNow, idle, _lastScheduledFlushUtc);
+        var scheduled = batching.Mode == BatchMode.ScheduledTimeOfDay;
+        var continuingSlot = scheduled && !shouldFlush && _openSlotDumpIds is not null;
+        _logger.LogDebug(
+            "Upload tick, shouldFlush={ShouldFlush}, continuingSlot={ContinuingSlot}, batchMode={Mode}",
+            shouldFlush, continuingSlot, batching.Mode);
+        if (!shouldFlush && !continuingSlot) return;
 
-        // A dump whose upload already started in a slot and failed transiently is retried on its own
-        // backoff, not held for the next slot (a day away for a nightly one).
-        var due = (await _queueStore.GetByStateAsync(DumpQueueState.Queued, stoppingToken))
-            .Where(r => shouldFlush || (batching.Mode == BatchMode.ScheduledTimeOfDay && r.RetryCount > 0))
-            .Where(r => r.NextAttemptUtc is null || r.NextAttemptUtc <= now)
-            .ToList();
-        if (!shouldFlush && due.Count == 0) return;
-        _logger.LogDebug("Queued dumps due for upload: {Count}", due.Count);
-        var refused = false;
+        var queued = await _queueStore.GetByStateAsync(DumpQueueState.Queued, stoppingToken);
+        if (continuingSlot)
+        {
+            // Only the dumps the open slot started with (website#1567): one queued
+            // since waits for the next slot, so a dump stuck in its backoff
+            // can't turn ScheduledTimeOfDay into Immediate.
+            queued = queued.Where(r => _openSlotDumpIds!.Contains(r.Id)).ToList();
+        }
+        else if (scheduled)
+        {
+            // A slot opens: it is used up from here on, also with nothing
+            // queued, so a dump queued later that day waits for the next slot
+            // instead of going at once (#9). A later tick only continues the
+            // dumps queued now. An earlier slot still open is replaced, so a
+            // failing dump never holds one past the next slot time; it is
+            // simply one of this slot's dumps.
+            await SaveSlotAsync(scheduleNow.ToUniversalTime(), stoppingToken);
+            if (queued.Count == 0)
+            {
+                _openSlotDumpIds = null;
+                return;
+            }
+            _openSlotDumpIds = queued.Select(r => r.Id).ToHashSet();
+        }
+        var now = DateTimeOffset.UtcNow;
+        var due = queued.Where(r => r.NextAttemptAtUtc is null || r.NextAttemptAtUtc <= now).ToList();
+        _logger.LogDebug("Queued dumps: {Count}, due now: {Due}", queued.Count, due.Count);
         foreach (var record in due)
         {
-            await SubmitAsync(record, stoppingToken);
-            if (_time.GetUtcNow() < _authBackoffUntilUtc)
+            if (_runtimeState.ActiveUploadHold(DateTimeOffset.UtcNow) is not null) break;
+            var outcome = await SubmitAsync(record, stoppingToken);
+            if (outcome == UploadOutcome.TransientFailure)
             {
-                refused = true;
-                break; // key rejected; the rest would be refused too
+                // The server or the network is in trouble: the next dump
+                // would most likely fail the same way, and each try may
+                // re-send a whole dump. The rest wait for the next tick.
+                break;
             }
         }
 
-        // The slot is used, even if nothing was due; not when the key was refused (or, above, during
-        // a pause), so it is taken once that clears.
-        if (batching.Mode == BatchMode.ScheduledTimeOfDay && shouldFlush && !refused)
+        // A slot's dump still left in the queue (SubmitAsync updates each
+        // record it tries in place), because the pass was cut short by an
+        // outage or a hold (website#1516 review) or because it is in its retry
+        // backoff and so not due yet (website#1567), keeps the slot open for it: it
+        // goes on the first tick it is due instead of at the next slot. Its
+        // own backoff still paces those retries. The slot closes once none of
+        // its dumps is left, or when the next slot opens.
+        if (scheduled)
         {
-            await _queueStore.SetMetaAsync(LastFlushKey, now.ToString("O"), stoppingToken);
+            var left = queued.Where(r => r.State == DumpQueueState.Queued).Select(r => r.Id).ToHashSet();
+            _openSlotDumpIds = left.Count > 0 ? left : null;
         }
+    }
+
+    private async Task SaveSlotAsync(DateTimeOffset slotUtc, CancellationToken stoppingToken)
+    {
+        _lastScheduledFlushUtc = slotUtc;
+        await _queueStore.SetMetaAsync(LastFlushKey, slotUtc.ToString("O"), stoppingToken);
     }
 
     private async Task SubmitByIdAsync(string dumpId, CancellationToken stoppingToken)
@@ -140,131 +259,159 @@ public sealed class UploadWorkerService : BackgroundService
             return;
         }
 
-        if (_time.GetUtcNow() < _authBackoffUntilUtc)
+        if (_runtimeState.IsPaused || _runtimeState.ActiveUploadHold(DateTimeOffset.UtcNow) is not null)
         {
-            // Same rule as the tick loop: the key was just rejected, so don't
-            // hammer the server. The record stays PendingApproval and listed.
-            _logger.LogWarning("Manual submit of {DumpId} skipped: uploads are paused after an authentication failure", dumpId);
-            record.LastError = "Submit skipped: uploads are paused after an authentication failure; try again later.";
+            // Approved, so it joins the queue and goes when uploads resume.
+            record.State = DumpQueueState.Queued;
             await _queueStore.UpsertAsync(record, stoppingToken);
-            await ListAgainInTrayAsync(record, stoppingToken);
+            _logger.LogInformation("Manual submit of {Path} queued: uploads are paused or held", record.FilePath);
             return;
         }
 
-        await SubmitAsync(record, stoppingToken, DumpQueueState.PendingApproval);
-        if (record.State == DumpQueueState.PendingApproval)
-        {
-            await ListAgainInTrayAsync(record, stoppingToken);
-        }
+        await SubmitAsync(record, stoppingToken);
     }
 
-    /// <summary>
-    /// The tray drops a NotifyOnly dump from its "Submit dump" menu when it is clicked; one that
-    /// wasn't sent after all (paused, or a transient failure) goes back on the list (#7).
-    /// </summary>
-    private Task ListAgainInTrayAsync(DumpRecord record, CancellationToken stoppingToken) =>
-        _tray.SendAsync(new IpcMessage
-        {
-            Type = IpcMessageType.AskApproval,
-            DumpId = record.Id,
-            DumpFileName = Path.GetFileName(record.FilePath),
-            DumpSizeBytes = record.SizeBytes,
-            DumpType = record.DumpType,
-        }, stoppingToken);
-
-    private async Task SubmitAsync(
-        DumpRecord record,
-        CancellationToken stoppingToken,
-        DumpQueueState stateOnRetry = DumpQueueState.Queued)
+    /// <summary>Exponential: RetryBackoffBase after the first failure, doubling, at most RetryBackoffMax.</summary>
+    internal static TimeSpan RetryDelay(int retryCount)
     {
-        // The file must still be the dump this record describes: one overwritten in place after
-        // detection (a reused dump name, while an approval was pending) must not go up under this id.
-        // The watcher sees the change and records the new dump itself.
-        bool changed;
-        try
+        var exponent = Math.Clamp(retryCount - 1, 0, 30);
+        var delay = RetryBackoffBase * Math.Pow(2, exponent);
+        return delay < RetryBackoffMax ? delay : RetryBackoffMax;
+    }
+
+    /// <summary>Uploads one record and stores the outcome; returns it.</summary>
+    private async Task<UploadOutcome> SubmitAsync(DumpRecord record, CancellationToken stoppingToken)
+    {
+        // Before Submitting, so a shutdown mid-hash leaves the record as it was.
+        if (await CheckFileUnchangedAsync(record, stoppingToken) is { } notSendable)
         {
-            var info = new FileInfo(record.FilePath);
-            changed = info.Exists && (info.Length != record.SizeBytes
-                // A newer write time alone may be a touch (a backup or scan tool): the hash decides.
-                || (info.LastWriteTimeUtc > record.DetectedAtUtc.UtcDateTime
-                    && (record.Sha256 is null || await DumpHasher.ComputeSha256Async(record.FilePath, stoppingToken) != record.Sha256)));
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            changed = true; // locked for writing: a new dump is being written over it
-        }
-        if (changed)
-        {
-            record.State = DumpQueueState.Skipped;
-            record.LastError = "Dump file changed after it was detected; the new dump is handled separately";
-            await _queueStore.UpsertAsync(record, stoppingToken);
-            _logger.LogWarning("Not uploading {Path} under {Id}: the file changed after it was detected", record.FilePath, record.Id);
-            return;
+            return await RecordResultAsync(record, notSendable);
         }
 
         record.State = DumpQueueState.Submitting;
         await _queueStore.UpsertAsync(record, stoppingToken);
 
-        UploadResult result;
+        string apiKey;
         try
         {
-            var apiKey = _apiKeyProtector.Unprotect(_config.ProtectedApiKey
+            apiKey = _apiKeyProtector.Unprotect(_config.ProtectedApiKey
                 ?? throw new InvalidOperationException("No API key configured — run the installer to set one."));
-            var hostnameHash = _config.SendHostname ? Environment.MachineName : null;
-
-            var uploadTask = _apiClient.UploadDumpAsync(record.FilePath, apiKey, hostnameHash, stoppingToken);
-            var copyTask = MaybeCopyToCentralLocationAsync(record, stoppingToken);
-            await Task.WhenAll(uploadTask, copyTask);
-            result = uploadTask.Result;
-        }
-        catch (OperationCanceledException)
-        {
-            // Service stopping mid-upload: put it back so it isn't stranded in
-            // Submitting (the token is cancelled, so persist without it).
-            record.State = stateOnRetry;
-            await _queueStore.UpsertAsync(record, CancellationToken.None);
-            throw;
         }
         catch (Exception ex)
         {
-            // Anything thrown here (corrupted DPAPI blob, missing source file
-            // because two dumps collided on the same content hash, etc.) must
-            // not leave the record stuck in Submitting forever — nothing else
-            // ever polls that state again.
-            record.State = DumpQueueState.Failed;
+            // No key, or a DPAPI blob this machine can't open: no dump can
+            // upload, and it's not this dump's fault (website#1489).
+            record.State = DumpQueueState.Queued;
             record.LastError = ex.Message;
-            _logger.LogError(ex, "Submission of {Path} failed before an upload result was available", record.FilePath);
+            _runtimeState.HoldUploads(NoUsableKeyReason, CredentialsHold, DateTimeOffset.UtcNow);
+            _logger.LogError(ex, "Uploads held: no usable API key");
             await _queueStore.UpsertAsync(record, stoppingToken);
-            return;
+            return UploadOutcome.CredentialsRejected;
         }
 
+        // The archival copy runs alongside the upload but its outcome is its
+        // own: a failed copy used to fail an upload the server had accepted
+        // (website#1490). MaybeCopyToCentralLocationAsync only throws on shutdown.
+        var copyTask = MaybeCopyToCentralLocationAsync(record, stoppingToken);
+        UploadResult result;
+        try
+        {
+            var hostnameHash = _config.SendHostname ? Environment.MachineName : null;
+            result = await _apiClient.UploadDumpAsync(
+                record.FilePath, apiKey, hostnameHash, record.Sha256 ?? record.Id, stoppingToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Must not leave the record stuck in Submitting. Not proof the
+            // dump is bad either, so it is retried like a transient failure
+            // rather than failed for good (website#1489).
+            _logger.LogError(ex, "Submission of {Path} failed before an upload result was available", record.FilePath);
+            result = new UploadResult(UploadOutcome.FileUnavailable, null, ex.Message);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            // Service stopping mid-upload (website#1485): back to the queue, without
+            // counting a retry. CancellationToken.None: the stopping token is
+            // already cancelled, and this write must still happen.
+            await AwaitCopyAsync(copyTask);
+            record.State = DumpQueueState.Queued;
+            await _queueStore.UpsertAsync(record, CancellationToken.None);
+            _logger.LogInformation("Upload of {Path} interrupted by shutdown; requeued", record.FilePath);
+            throw;
+        }
+
+        // The upload's answer is recorded even if shutdown cuts the copy off.
+        await AwaitCopyAsync(copyTask);
+
+        return await RecordResultAsync(record, result);
+    }
+
+    /// <summary>
+    /// The upload may come hours after the dump was hashed. If the file's size
+    /// or last-write time moved since, it is hashed again: same bytes, it goes
+    /// up; different bytes, this record is done and the watcher detects the
+    /// file again as a new dump (website#1493). Null when the file is fine to send.
+    /// </summary>
+    internal async Task<UploadResult?> CheckFileUnchangedAsync(DumpRecord record, CancellationToken stoppingToken)
+    {
+        try
+        {
+            var now = FileIdentity.Read(record.FilePath);
+            if (now.SizeBytes == record.SizeBytes
+                && (record.FileLastWriteUtc is null || now.LastWriteUtc == record.FileLastWriteUtc))
+            {
+                return null;
+            }
+
+            var sha256 = await DumpHasher.ComputeSha256Async(record.FilePath, stoppingToken);
+            if (sha256 == record.Id)
+            {
+                record.SizeBytes = now.SizeBytes;
+                record.FileLastWriteUtc = now.LastWriteUtc;
+                return null;
+            }
+
+            return new UploadResult(UploadOutcome.FileChanged, null, FileChangedError);
+        }
+        catch (FileNotFoundException ex)
+        {
+            return new UploadResult(UploadOutcome.FileMissing, null, ex.Message);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return new UploadResult(UploadOutcome.FileUnavailable, null, ex.Message);
+        }
+    }
+
+    private async Task<UploadOutcome> RecordResultAsync(DumpRecord record, UploadResult result)
+    {
         switch (result.Outcome)
         {
             case UploadOutcome.Success:
+                _runtimeState.ClearUploadHold();
                 record.State = DumpQueueState.Submitted;
-                record.SubmittedAtUtc = _time.GetUtcNow();
+                record.SubmittedAtUtc = DateTimeOffset.UtcNow;
                 record.LastError = null;
-                record.NextAttemptUtc = null;
-                _authRefusalsInARow = 0;
+                record.NextAttemptAtUtc = null;
+                record.FirstFailedAtUtc = null;
                 _logger.LogInformation("Submitted dump {Path}", record.FilePath);
                 break;
 
-            case UploadOutcome.AuthFailed:
-                // Put the dump back where it came from (not Failed, no retry
-                // burned): the key may simply be rotated or mistyped, and the
-                // dump is still good. A manually submitted dump returns to
-                // PendingApproval so the tray keeps listing it as waiting.
-                record.State = stateOnRetry;
-                var pause = RetryPolicy.AuthPause(++_authRefusalsInARow);
-                _authBackoffUntilUtc = _time.GetUtcNow() + pause;
-                record.LastError = $"Authentication failed ({(int?)result.StatusCode}): check the configured API key. {result.ErrorMessage}";
-                _logger.LogError(
-                    "Upload of {Path} refused ({Status}): API key is invalid or revoked; re-provision it with --set-api-key-stdin and restart the service; uploads paused for {Minutes} minutes",
-                    record.FilePath, result.StatusCode, pause.TotalMinutes);
+            case UploadOutcome.FileChanged:
+                // Superseded, not Failed: the file's new contents are detected
+                // again as a dump of their own, and this record has nothing
+                // left to retry. As Failed it sat in the tray's "Retry failed
+                // uploads" count for good, and each retry re-hashed the whole
+                // file only to end the same way (website#1516 review).
+                record.State = DumpQueueState.Superseded;
+                record.LastError = result.ErrorMessage;
+                record.NextAttemptAtUtc = null;
+                _runtimeState.RequestRescan(record.FilePath);
+                _logger.LogWarning("Dump {Path} changed after it was detected; detecting it again", record.FilePath);
                 break;
 
             case UploadOutcome.RejectedPermanently:
-            case UploadOutcome.QuotaExceeded:
+            case UploadOutcome.FileMissing:
                 record.State = DumpQueueState.Failed;
                 record.LastError = result.ErrorMessage;
                 _logger.LogWarning(
@@ -272,37 +419,87 @@ public sealed class UploadWorkerService : BackgroundService
                     record.FilePath, result.StatusCode, result.ErrorMessage);
                 break;
 
+            case UploadOutcome.AwaitingTerms:
+            case UploadOutcome.CredentialsRejected:
+            case UploadOutcome.AccountClosed:
+            case UploadOutcome.QuotaExceeded:
+                // Not this dump's fault, and every other dump would get the
+                // same answer: hold the whole queue, spend no retry (website#1487).
+                var (reason, duration) = QueueHoldFor(result.Outcome);
+                record.State = DumpQueueState.Queued;
+                record.LastError = result.ErrorMessage;
+                _runtimeState.HoldUploads(reason, duration, DateTimeOffset.UtcNow);
+                _logger.LogWarning(
+                    "Uploads held for {Duration}: {Reason} ({Status}: {Error})",
+                    duration, reason, result.StatusCode, result.ErrorMessage);
+                break;
+
             case UploadOutcome.TransientFailure:
+            case UploadOutcome.FileUnavailable:
+                var now = DateTimeOffset.UtcNow;
                 record.RetryCount++;
                 record.LastError = result.ErrorMessage;
-                if (record.RetryCount >= RetryPolicy.MaxAttempts)
+                record.FirstFailedAtUtc ??= now;
+                if (now - record.FirstFailedAtUtc >= GiveUpAfter)
                 {
                     record.State = DumpQueueState.Failed;
+                    record.NextAttemptAtUtc = null;
                     _logger.LogError(
-                        "Dump {Path} failed permanently after {Retries} retries: {Error}",
-                        record.FilePath, record.RetryCount, result.ErrorMessage);
+                        "Dump {Path} failed after {Retries} attempts since {Since}: {Error}",
+                        record.FilePath, record.RetryCount, record.FirstFailedAtUtc, result.ErrorMessage);
                 }
                 else
                 {
-                    record.State = stateOnRetry; // manual submits stay pending approval
-                    var delay = RetryPolicy.TransientDelay(record.RetryCount);
-                    record.NextAttemptUtc = _time.GetUtcNow() + delay;
+                    record.State = DumpQueueState.Queued;
+                    record.NextAttemptAtUtc = now + RetryDelay(record.RetryCount);
                     _logger.LogWarning(
-                        "Transient failure submitting {Path} (attempt {Retry}/{Max}), retrying in {Delay}: {Error}",
-                        record.FilePath, record.RetryCount, RetryPolicy.MaxAttempts, delay, result.ErrorMessage);
+                        "Transient failure submitting {Path} (attempt {Retry}, next at {Next}): {Error}",
+                        record.FilePath, record.RetryCount, record.NextAttemptAtUtc, result.ErrorMessage);
                 }
                 break;
         }
 
-        await _queueStore.UpsertAsync(record, stoppingToken);
+        await _queueStore.UpsertAsync(record, CancellationToken.None);
+        return result.Outcome;
     }
+
+    private static async Task AwaitCopyAsync(Task copyTask)
+    {
+        try
+        {
+            await copyTask;
+        }
+        catch (OperationCanceledException)
+        {
+            // Cut off by shutdown; TryCopyAsync removed its partial file.
+        }
+    }
+
+    /// <summary>The tray text and hold length for an answer that holds the whole queue.</summary>
+    internal static (string Reason, TimeSpan Duration) QueueHoldFor(UploadOutcome outcome) => outcome switch
+    {
+        UploadOutcome.AwaitingTerms => ("Uploads held: accept the Terms of Service in the DumpTriage portal", TermsHold),
+        UploadOutcome.CredentialsRejected => ("Uploads paused: the API key was rejected; set a current key with the installer", CredentialsHold),
+        UploadOutcome.AccountClosed => ("Uploads paused: this DumpTriage account has been closed", CredentialsHold),
+        UploadOutcome.QuotaExceeded => ("Uploads held: the account's monthly upload quota is used up", QuotaHold),
+        _ => throw new ArgumentOutOfRangeException(nameof(outcome), outcome, "not a queue-wide hold"),
+    };
 
     private async Task MaybeCopyToCentralLocationAsync(DumpRecord record, CancellationToken stoppingToken)
     {
         if (record.CentralCopiedAtUtc is not null) return; // already archived on a prior attempt
 
-        var (success, error) = await CentralCopyService.TryCopyAsync(
-            record, _config.CentralCopy, Environment.MachineName, stoppingToken);
+        bool success;
+        string? error;
+        try
+        {
+            (success, error) = await CentralCopyService.TryCopyAsync(
+                record, _config.CentralCopy, Environment.MachineName, stoppingToken);
+        }
+        catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+        {
+            (success, error) = (false, ex.Message);
+        }
 
         if (success)
         {

@@ -15,7 +15,9 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly SynchronizationContext _uiContext;
     private readonly ToolStripMenuItem _pauseResumeItem;
     private readonly ToolStripMenuItem _submitMenu;
+    private readonly ToolStripMenuItem _retryFailedItem;
     private bool _paused;
+    private string? _uploadHoldMessage;
 
     // One approval popup at a time (#12): the rest wait here, each dump once. A re-sent ask (after a
     // service restart) replaces the waiting one, since it carries the service's new deadline.
@@ -37,6 +39,9 @@ public sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(_submitMenu);
         _pauseResumeItem = new ToolStripMenuItem("Pause", null, OnPauseResumeClicked);
         menu.Items.Add(_pauseResumeItem);
+        // The only way back from Failed (website#1488): enabled while any dump is.
+        _retryFailedItem = new ToolStripMenuItem("Retry failed uploads", null, OnRetryFailedClicked) { Enabled = false };
+        menu.Items.Add(_retryFailedItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("Exit", null, (_, _) => ExitThread()));
 
@@ -182,10 +187,40 @@ public sealed class TrayApplicationContext : ApplicationContext
             _pauseResumeItem.Text = _paused ? "Resume" : "Pause";
         }
 
-        if (message.QueuedCount is { } queued && queued > 0)
+        if (message.FailedCount is { } failed)
+        {
+            _retryFailedItem.Enabled = failed > 0;
+            _retryFailedItem.Text = failed > 0 ? $"Retry failed uploads ({failed})" : "Retry failed uploads";
+        }
+
+        // StatusMessage on a StatusUpdate: the server stopped uploads for the
+        // whole queue (terms, key, closed account, quota) — website#1487.
+        if (message.StatusMessage != _uploadHoldMessage)
+        {
+            _uploadHoldMessage = message.StatusMessage;
+            if (_uploadHoldMessage is not null)
+            {
+                _notifyIcon.ShowBalloonTip(10_000, "DumpTriage", _uploadHoldMessage, ToolTipIcon.Warning);
+            }
+        }
+
+        if (_uploadHoldMessage is not null)
+        {
+            _notifyIcon.Text = TrayText(_uploadHoldMessage);
+        }
+        else if (message.QueuedCount is { } queued && queued > 0)
         {
             _notifyIcon.Text = $"DumpTriage Agent — {queued} queued";
         }
+    }
+
+    // NotifyIcon.Text throws past 127 characters.
+    private static string TrayText(string text) => text.Length <= 127 ? text : text[..126] + "…";
+
+    private void OnRetryFailedClicked(object? sender, EventArgs e)
+    {
+        _retryFailedItem.Enabled = false; // until the next status update says otherwise
+        _ = _pipeClient.SendAsync(new IpcMessage { Type = IpcMessageType.RetryFailed });
     }
 
     private void OnPauseResumeClicked(object? sender, EventArgs e)

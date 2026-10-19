@@ -21,6 +21,8 @@ public enum IpcMessageType
     ManualSubmit,
     PauseAgent,
     ResumeAgent,
+    // Tray -> service: put every Failed dump back in the queue (website#1488).
+    RetryFailed,
 }
 
 /// <summary>
@@ -45,6 +47,12 @@ public sealed class IpcMessage
     /// <summary>Service -&gt; tray, for StatusUpdate.</summary>
     public int? QueuedCount { get; init; }
     public int? PendingApprovalCount { get; init; }
+    public int? FailedCount { get; init; }
     public bool? Paused { get; init; }
+
+    /// <summary>
+    /// AskApproval: a note for the prompt. StatusUpdate: why the server has
+    /// stopped uploads for the whole queue, or null when nothing holds them.
+    /// </summary>
     public string? StatusMessage { get; init; }
 }

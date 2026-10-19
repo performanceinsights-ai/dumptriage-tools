@@ -36,6 +36,64 @@ public class CentralCopyServiceTests
     }
 
     [Fact]
+    public async Task An_unexpected_error_is_returned_not_thrown()
+    {
+        // website#1490: only IOException/UnauthorizedAccess/DirectoryNotFound were
+        // caught, so e.g. a bad DestinationPath threw into the upload.
+        var config = new CentralCopyConfig { Enabled = true, DestinationPath = "bad\0path" };
+        var (success, error) = await CentralCopyService.TryCopyAsync(MakeRecord("/nonexistent"), config, "HOST1");
+        Assert.False(success);
+        Assert.NotNull(error);
+    }
+
+    [Fact]
+    public async Task A_copy_cut_off_leaves_no_partial_file_behind()
+    {
+        // website#1490: a partial copy sat at the final name and clashed on every retry.
+        var destRoot = Path.Combine(Path.GetTempPath(), "dt-central-" + Guid.NewGuid().ToString("N"));
+        var sourceFile = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".dmp");
+        await File.WriteAllBytesAsync(sourceFile, new byte[4096]);
+        try
+        {
+            var config = new CentralCopyConfig { Enabled = true, DestinationPath = destRoot, OrganizeByHostname = false };
+            using var cancelled = new CancellationTokenSource();
+            cancelled.Cancel();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => CentralCopyService.TryCopyAsync(MakeRecord(sourceFile), config, "HOST1", cancelled.Token));
+
+            Assert.Empty(Directory.GetFiles(destRoot));
+        }
+        finally
+        {
+            File.Delete(sourceFile);
+            if (Directory.Exists(destRoot)) Directory.Delete(destRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task A_completed_copy_leaves_only_the_final_file()
+    {
+        var destRoot = Path.Combine(Path.GetTempPath(), "dt-central-" + Guid.NewGuid().ToString("N"));
+        var sourceFile = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".dmp");
+        await File.WriteAllBytesAsync(sourceFile, new byte[] { 7 });
+        try
+        {
+            var config = new CentralCopyConfig { Enabled = true, DestinationPath = destRoot, OrganizeByHostname = false };
+
+            var (success, _) = await CentralCopyService.TryCopyAsync(MakeRecord(sourceFile), config, "HOST1");
+
+            Assert.True(success);
+            Assert.Equal(Path.GetFileName(sourceFile), Path.GetFileName(Assert.Single(Directory.GetFiles(destRoot))));
+        }
+        finally
+        {
+            File.Delete(sourceFile);
+            if (Directory.Exists(destRoot)) Directory.Delete(destRoot, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task CopiesFileIntoHostnameSubfolder()
     {
         var destRoot = Path.Combine(Path.GetTempPath(), "dt-central-" + Guid.NewGuid().ToString("N"));

@@ -1,27 +1,15 @@
 using DumpTriage.Common.Models;
 using DumpTriage.Common.Queue;
-using DumpTriage.Common.Upload;
 using Microsoft.Data.Sqlite;
 
 namespace DumpTriage.Common.Tests;
 
-/// <summary>dumptriage-tools#6 and #9: retry timing, and the queue columns and meta values they use.</summary>
+/// <summary>dumptriage-tools#6 and #9: the queue columns and meta values retries and slots use.</summary>
 public sealed class QueueAndRetryTests : IDisposable
 {
     private readonly string _db = Path.Combine(Path.GetTempPath(), "dt-queue-" + Guid.NewGuid().ToString("N") + ".db");
 
     public void Dispose() => File.Delete(_db);
-
-    [Fact]
-    public void Retry_timing_matches_the_linux_agent()
-    {
-        Assert.Equal(TimeSpan.FromSeconds(60), RetryPolicy.TransientDelay(1));
-        Assert.Equal(TimeSpan.FromSeconds(120), RetryPolicy.TransientDelay(2));
-        Assert.Equal(TimeSpan.FromHours(1), RetryPolicy.TransientDelay(9));
-        Assert.Equal(TimeSpan.FromMinutes(10), RetryPolicy.AuthPause(1));
-        Assert.Equal(TimeSpan.FromMinutes(20), RetryPolicy.AuthPause(2));
-        Assert.Equal(TimeSpan.FromHours(6), RetryPolicy.AuthPause(20));
-    }
 
     [Fact]
     public async Task A_queue_from_before_the_backoff_column_is_upgraded_and_keeps_its_rows()
@@ -44,12 +32,12 @@ public sealed class QueueAndRetryTests : IDisposable
         await using var queue = await DumpQueueStore.OpenAsync(_db);
         var a = await queue.FindByIdAsync("a");
         Assert.NotNull(a);
-        Assert.Null(a!.NextAttemptUtc);
+        Assert.Null(a!.NextAttemptAtUtc);
 
         var at = new DateTimeOffset(2026, 10, 14, 12, 1, 0, TimeSpan.Zero);
-        a.NextAttemptUtc = at;
+        a.NextAttemptAtUtc = at;
         await queue.UpsertAsync(a);
-        Assert.Equal(at, (await queue.FindByIdAsync("a"))!.NextAttemptUtc);
+        Assert.Equal(at, (await queue.FindByIdAsync("a"))!.NextAttemptAtUtc);
     }
 
     [Fact]

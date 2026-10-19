@@ -6,8 +6,9 @@ namespace DumpTriage.Common.CentralCopy;
 /// <summary>
 /// Best-effort archival copy to a shared location (see CentralCopyConfig).
 /// Streams rather than using File.Copy so a multi-GB kernel dump doesn't
-/// block the calling async pipeline, and never throws — a share being
-/// offline shouldn't affect submission, only get logged.
+/// block the calling async pipeline, and never throws except on
+/// cancellation — a share being offline shouldn't affect submission, only
+/// get logged.
 /// </summary>
 public static class CentralCopyService
 {
@@ -29,6 +30,7 @@ public static class CentralCopyService
             return (false, "CentralCopy is enabled but no DestinationPath is configured");
         }
 
+        string? tempPath = null;
         try
         {
             var destinationDir = config.OrganizeByHostname
@@ -39,30 +41,46 @@ public static class CentralCopyService
 
             var destinationPath = ResolveNonClashingDestination(destinationDir, record);
 
-            await using var source = new FileStream(
-                record.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize, useAsync: true);
-            await using var destination = new FileStream(
-                destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, BufferSize, useAsync: true);
-
-            try
+            // Copied under a temporary name and renamed once complete, so a
+            // copy cut off half-way never sits at the final name, where it
+            // clashed with every retry (website#1490).
+            tempPath = $"{destinationPath}.{Guid.NewGuid():N}.tmp";
+            await using (var source = new FileStream(
+                record.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize, useAsync: true))
+            await using (var destination = new FileStream(
+                tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, BufferSize, useAsync: true))
             {
                 await source.CopyToAsync(destination, BufferSize, cancellationToken);
             }
-            catch
-            {
-                // Don't leave a truncated archival copy behind: it would look
-                // like a valid file and force the retry onto a suffixed name.
-                await destination.DisposeAsync();
-                TryDelete(destinationPath);
-                throw;
-            }
 
+            File.Move(tempPath, destinationPath, overwrite: false);
+            tempPath = null;
             return (true, null);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or DirectoryNotFoundException)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // Share offline, permissions issue, etc. — not fatal to submission.
+            // Share offline, permissions, a bad DestinationPath, a path too
+            // long — anything: it must never touch submission (website#1490).
             return (false, ex.Message);
+        }
+        finally
+        {
+            if (tempPath is not null)
+            {
+                TryDelete(tempPath);
+            }
+        }
+    }
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception)
+        {
+            // Best effort: the share may have gone away mid-copy.
         }
     }
 
@@ -84,12 +102,6 @@ public static class CentralCopyService
         var nameWithoutExt = Path.GetFileNameWithoutExtension(fileName);
         var ext = Path.GetExtension(fileName);
         return Path.Combine(destinationDir, $"{nameWithoutExt}.{shortId}{ext}");
-    }
-
-    private static void TryDelete(string path)
-    {
-        try { File.Delete(path); }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
     }
 
     private static string SanitizeForPath(string value)

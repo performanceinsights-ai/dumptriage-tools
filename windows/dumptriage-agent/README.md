@@ -68,15 +68,30 @@ fine on Linux/macOS too, which is how this was developed/tested.)
 
 ## Installing
 
+Use an **upload-only** key, not the account's primary key. An upload key can
+only call `POST /api/v1/dumps`, so a key copied off one machine can't list or
+download the org's other dumps. Make one on the portal's Account page (or with
+the API), one per fleet or group, and revoke it by id if a machine is lost:
+
+```sh
+curl -X POST https://api.performanceinsights.ai/api/v1/customers/me/api-keys \
+  -H "Authorization: Bearer <primary key>" -H "Content-Type: application/json" \
+  -d '{"name": "workstations", "scope": "upload"}'
+# -> {"id": "...", "api_key": "dts_...", "scope": "upload", ...}  (shown once)
+curl -X DELETE https://api.performanceinsights.ai/api/v1/customers/me/api-keys/<id> \
+  -H "Authorization: Bearer <primary key>"
+```
+
 ```powershell
 .\installer\install.ps1 -AgentPublishDir .\publish\agent -TrayPublishDir .\publish\tray
 ```
 
 On a first install the script asks for the API key at a masked prompt. For an
-unattended install, put the key in a file and pass `-ApiKeyFile key.txt`; the
-file is deleted once the key is stored. The key is never accepted as a
-command-line argument, because that would leave it in PowerShell history and
-in process-creation audit logs.
+unattended install, put the key in a file and pass `-ApiKeyFile key.txt` (the
+file is deleted once the key is stored), or pipe it into the script's stdin
+(`Get-Content key.txt | .\installer\install.ps1 ...`). The key is never
+accepted as a command-line argument, because that would leave it in PowerShell
+history and in process-creation audit logs.
 
 Registers the `DumpTriageAgent` Windows Service (auto-start), provisions the
 API key (encrypted at rest with machine-scope DPAPI — never written to disk
@@ -100,6 +115,8 @@ first; delete it and reinstall.
   "apiBaseUrl": "https://api.performanceinsights.ai",
   "sendHostname": true,
   "watchedPaths": ["%LOCALAPPDATA%\\CrashDumps", "%WINDIR%\\Minidump", "%WINDIR%"],
+  "watchedFilters": ["*.dmp", "MEMORY.DMP"],
+  "startupScanMaxAgeDays": 30,    // on start, also look at dumps already there from the last N days; 0 = off
   "policy": {
     "mode": "AskFirst",           // AlwaysSubmit | AskFirst | NotifyOnly | RuleBased
     "rules": [],                   // used only when mode == RuleBased
@@ -133,17 +150,6 @@ once.
 choosing one uploads it. Approval popups (`AskFirst`) are shown one at a time,
 each with the time the service has left to wait for it.
 
-Existing dumps are picked up when the service starts (a `MEMORY.DMP` written
-during boot, or a crash while the service was stopped), and a dump overwritten
-in place is seen as new. Known files are recognised by size and time, so this
-doesn't rehash them.
-
-A transient upload failure is retried with backoff (30 s doubling, capped at
-1 h) up to 10 times before the dump is marked `Failed`; a 400, 413 or 429 is
-final. A 401 or 403 (wrong or revoked key) uses up no attempt and pauses all
-uploads for 10 minutes, doubling with each refusal in a row up to 6 hours;
-restarting the service after `--set-api-key-stdin` ends the pause.
-
 `RuleBased` mode evaluates `policy.rules` in order, first match wins:
 
 ```jsonc
@@ -157,7 +163,57 @@ restarting the service after `--set-api-key-stdin` ends the pause.
 local/mapped folder) alongside submitting it to the API. It's a best-effort
 archival step: if the share is offline, submission still proceeds and the
 failure is only logged (`CentralCopyError` on the queue record), not retried
-automatically.
+automatically. The copy is written under a `.tmp` name and renamed when
+complete, so an interrupted copy never sits at the final name.
+
+## Uploads, retries and holds
+
+- **Detection.** A dump is recorded once it has stopped changing and can be
+  opened; one still being written after 30 minutes is looked at again 5
+  minutes later. A file is known by its path, size and last-write time, and
+  a dump by its sha256: a new crash written over `MEMORY.DMP` is a new dump,
+  and a copy of a dump already in the queue doesn't touch that record. A
+  watched folder that doesn't exist yet, or is deleted later, is watched once
+  it (re)appears.
+- **On start** the service also looks at the dumps already in the watched
+  folders (`watchedFilters`) last written within `startupScanMaxAgeDays`
+  (default 30) and since the agent's first start: a dump written while it was
+  stopped, or a `MEMORY.DMP` Windows wrote early in the boot after a crash,
+  raises no watcher event, but a fresh install leaves older dumps alone. Ones
+  already in the queue are skipped without hashing them again. A dump the last
+  run left waiting for a decision or an approval gets one again.
+- **Before upload** the file's size and last-write time are checked against
+  what was hashed. If they moved, the file is hashed again; changed bytes end
+  that record (`Superseded`) and the file is detected again as a new dump. Every
+  upload sends `X-Content-SHA256`, and the server refuses other bytes with a
+  422, handled the same way.
+- **No whole-upload timeout.** An upload is abandoned when the body stops
+  moving for 5 minutes, or when the server hasn't answered 30 minutes after
+  the last byte (it scans and stores a large dump before it answers).
+- **Transient failures** (network, 5xx, a file held open by antivirus or a
+  backup) are retried with exponential backoff per dump (1 minute, doubling,
+  up to 6 hours); a network or server failure ends that pass over the queue.
+  A dump gives up 7 days after its first failure. With `ScheduledTimeOfDay`
+  a slot opens at the first check at or after its time and is used up even
+  with nothing queued, so a dump queued later that day waits for the next
+  one; the last slot is kept in the queue, so a fresh install or a restart
+  waits for the next slot rather than uploading at once. A slot stays open for the dumps that were queued when it opened, while any
+  of them is still waiting (in its backoff, or behind an outage or hold), so
+  it goes once its backoff ends rather than at the next slot. A dump queued
+  after the slot opened waits for the next slot, and the next slot replaces
+  one still held open, so a failing dump never keeps uploads going outside
+  the schedule.
+- **Permanent rejections** (400, 413, 415, 422) and a deleted file fail the
+  dump at once.
+- **Queue-wide holds**, which spend no retries and show in the tray: Terms
+  of Service not accepted (15 minutes), API key rejected or account closed
+  (401/403, 1 hour), monthly quota used up (429, 6 hours).
+- **Retry failed uploads** in the tray menu puts every `Failed` dump back in
+  the queue.
+- A dump cut off mid-upload by a crash, reboot or service stop is requeued at
+  the next start. A corrupt `queue.db` is moved to `queue.db.corrupt-<time>`
+  and an empty queue started. A `queue.db` made by an older agent gets the
+  new columns added in place and keeps its rows.
 
 ## Known limitations / follow-ups
 

@@ -22,6 +22,9 @@
     first install in an interactive session when no -ApiKeyFile is given.
     On a reinstall without either option the existing key is left untouched.
 
+    A deployment tool can also pipe the key into this script's stdin
+    (Get-Content key.txt | .\install.ps1 ...).
+
     The key is never taken as a plain command-line argument: that would land
     in PowerShell history, process-creation audit logs and transcripts.
 
@@ -99,23 +102,39 @@ if (Test-Path -LiteralPath $DataDir) {
 # A first install prompts unless the session can't answer (-NonInteractive, or no console).
 $canPrompt = [Environment]::UserInteractive -and
     -not ([Environment]::GetCommandLineArgs() | Where-Object { $_ -like '-NonI*' })
-$plaintextKey = $null
-if ($ApiKeyFile) {
-    if (-not (Test-Path -LiteralPath $ApiKeyFile -PathType Leaf)) {
-        throw "API key file not found: $ApiKeyFile"
+# Never a command-line argument: from a file the caller protects, from this
+# script's own stdin (a deployment tool piping it in), or a masked prompt.
+function Read-ApiKeyForProvisioning {
+    param([string]$ApiKeyFile, [switch]$Prompt, [switch]$PromptRequired)
+    if ($ApiKeyFile) {
+        if (-not (Test-Path -LiteralPath $ApiKeyFile -PathType Leaf)) {
+            throw "API key file not found: $ApiKeyFile"
+        }
+        $key = "$(Get-Content -LiteralPath $ApiKeyFile -Raw)".Trim()
+        if (-not $key) {
+            throw "API key file is empty: $ApiKeyFile"
+        }
+        return $key
     }
-    $plaintextKey = "$(Get-Content -LiteralPath $ApiKeyFile -Raw)".Trim()
-    if (-not $plaintextKey) {
-        throw "API key file is empty: $ApiKeyFile"
+    if ([Console]::IsInputRedirected) {
+        $line = [Console]::In.ReadLine()
+        if ($line -and $line.Trim()) {
+            return $line.Trim()
+        }
     }
+    if ($Prompt) {
+        $secure = Read-Host -Prompt "DumpTriage API key (dts_...)" -AsSecureString
+        $key = [System.Net.NetworkCredential]::new("", $secure).Password.Trim()
+        if (-not $key -and $PromptRequired) {
+            throw "No API key entered."
+        }
+        return $key
+    }
+    return $null
 }
-elseif ($PromptForApiKey -or (-not $existingService -and $canPrompt)) {
-    $secure = Read-Host -Prompt "DumpTriage API key (dts_...)" -AsSecureString
-    $plaintextKey = [System.Net.NetworkCredential]::new("", $secure).Password.Trim()
-    if (-not $plaintextKey -and $PromptForApiKey) {
-        throw "No API key entered."
-    }
-}
+
+$plaintextKey = Read-ApiKeyForProvisioning -ApiKeyFile $ApiKeyFile `
+    -Prompt:($PromptForApiKey -or (-not $existingService -and $canPrompt)) -PromptRequired:$PromptForApiKey
 
 Write-Host "Installing DumpTriage agent into $InstallDir"
 New-Item -ItemType Directory -Force -Path $AgentInstallDir | Out-Null

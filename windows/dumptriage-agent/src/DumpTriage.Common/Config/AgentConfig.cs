@@ -29,6 +29,16 @@ public sealed class AgentConfig
         ? new() { "*.dmp", "MEMORY.DMP" }
         : new() { "*.dmp", "*.DMP" };
 
+    /// <summary>
+    /// On start, dumps already in the watched folders that were last written
+    /// within this many days are looked at too (website#1514): a dump written while
+    /// the service was stopped, or a MEMORY.DMP Windows wrote early in the boot
+    /// after a crash, raises no watcher event. Ones already in the queue are
+    /// skipped cheaply. The cutoff keeps a first install from offering years
+    /// of old dumps; 0 turns the scan off.
+    /// </summary>
+    public int StartupScanMaxAgeDays { get; init; } = 30;
+
     public AgentPolicyConfig Policy { get; init; } = new();
 
     public CentralCopyConfig CentralCopy { get; init; } = new();

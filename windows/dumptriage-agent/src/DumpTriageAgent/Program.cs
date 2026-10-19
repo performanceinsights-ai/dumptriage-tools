@@ -46,33 +46,36 @@ IApiKeyProtector CreateApiKeyProtector() => OperatingSystem.IsWindows()
     ? new DpapiApiKeyProtector()
     : new FileApiKeyProtector(paths.ApiKeyPath);
 
-// Bootstrap mode: `DumpTriageAgent.exe --set-api-key-stdin` reads the key from
-// standard input, protects it with machine-scope DPAPI and writes it into
+// Bootstrap mode: `DumpTriageAgent.exe --set-api-key-stdin` (or `--set-api-key`) reads the key
+// from stdin (one line), protects it (machine-scope DPAPI on Windows), writes it into
 // config.json, then exits. This lets install.ps1 provision the key without
-// reimplementing DPAPI in PowerShell — it just shells out to the
-// already-published exe once. There is deliberately no form that takes the key
-// as an argument: the process command line is visible to other users and is
-// recorded by process-creation audit logs.
-if (args is ["--set-api-key", ..])
+// reimplementing DPAPI in PowerShell — it just shells out to the already-
+// published exe once. The key used to be a command-line argument, which put
+// it in plaintext process listings and shell history (website#261); stdin avoids both.
+switch (ApiKeyBootstrapArgs.Parse(args))
 {
-    Console.Error.WriteLine("--set-api-key <key> is not supported: pipe the key in with --set-api-key-stdin.");
-    return 2;
-}
-if (args is ["--set-api-key-stdin"])
-{
-    var plaintextApiKey = (await Console.In.ReadLineAsync())?.Trim();
-    if (string.IsNullOrEmpty(plaintextApiKey))
+    case ApiKeyBootstrapMode.ReadFromStdin:
     {
-        Console.Error.WriteLine("No API key provided.");
-        return 1;
-    }
+        var plaintextApiKey = Console.In.ReadLine()?.Trim();
+        if (string.IsNullOrEmpty(plaintextApiKey))
+        {
+            await Console.Error.WriteLineAsync("Expected the API key on stdin (one line); got none.");
+            return 1;
+        }
 
-    var bootstrapConfig = await ConfigLoader.LoadOrCreateDefaultAsync(configPath);
-    var protector = CreateApiKeyProtector();
-    bootstrapConfig.ProtectedApiKey = protector.Protect(plaintextApiKey);
-    await ConfigLoader.SaveAsync(configPath, bootstrapConfig);
-    Console.WriteLine($"API key stored in {configPath}");
-    return 0;
+        var bootstrapConfig = await ConfigLoader.LoadOrCreateDefaultAsync(configPath);
+        var protector = CreateApiKeyProtector();
+        bootstrapConfig.ProtectedApiKey = protector.Protect(plaintextApiKey);
+        await ConfigLoader.SaveAsync(configPath, bootstrapConfig);
+        Console.WriteLine($"API key stored in {configPath}");
+        return 0;
+    }
+    case ApiKeyBootstrapMode.RejectLegacyArgument:
+        await Console.Error.WriteLineAsync(
+            "--set-api-key takes the key on stdin now, not as an argument (it used to be " +
+            "visible in process listings and shell history). Pipe it in instead, e.g.: " +
+            "Get-Content key.txt | DumpTriageAgent.exe --set-api-key-stdin");
+        return 1;
 }
 
 #pragma warning disable CA1416 // guarded by OperatingSystem.IsWindows() below; only ever deployed on Windows anyway
@@ -91,9 +94,8 @@ Log.Logger = new LoggerConfiguration()
 try
 {
     var config = await ConfigLoader.LoadOrCreateDefaultAsync(configPath);
-    var queueStore = await DumpQueueStore.OpenAsync(dbPath);
-    var recovered = await queueStore.RecoverInterruptedSubmissionsAsync();
-    if (recovered > 0) Log.Warning("Re-queued {Count} dump(s) interrupted mid-submission", recovered);
+    var queueStore = await DumpQueueStore.OpenAsync(
+        dbPath, new Serilog.Extensions.Logging.SerilogLoggerFactory(Log.Logger).CreateLogger<DumpQueueStore>());
 
     var builder = Host.CreateApplicationBuilder(args);
     builder.Services.AddSerilog();
@@ -127,7 +129,10 @@ try
     builder.Services.AddHttpClient<DumpTriageApiClient>(client =>
     {
         client.BaseAddress = new Uri(config.ApiBaseUrl);
-        client.Timeout = TimeSpan.FromMinutes(30); // large kernel dumps over a slow link
+        // No whole-request timeout: it capped an upload at about 4.5 GB on a
+        // 20 Mbit/s line (website#1488). DumpTriageApiClient cancels a stalled upload
+        // or a missing answer itself (StallTimeout, ResponseTimeout).
+        client.Timeout = Timeout.InfiniteTimeSpan;
     });
 
     if (OperatingSystem.IsWindows())
