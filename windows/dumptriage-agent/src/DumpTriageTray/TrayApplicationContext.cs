@@ -212,6 +212,11 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             _notifyIcon.Text = $"DumpTriage Agent — {queued} queued";
         }
+        else
+        {
+            // A hold that ended with nothing queued must not leave its text behind.
+            _notifyIcon.Text = "DumpTriage Agent — connected";
+        }
     }
 
     // NotifyIcon.Text throws past 127 characters.

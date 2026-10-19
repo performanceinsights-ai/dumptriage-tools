@@ -307,6 +307,8 @@ public class DumpQueueStoreTests
             Assert.Single(aside);
             Assert.Equal(8192, new FileInfo(aside[0]).Length);
             File.Delete(aside[0]);
+            // Not a first install: the startup scan must still find the dumps the lost queue had.
+            Assert.Equal(DateTimeOffset.UnixEpoch.ToString("O"), await store.GetMetaAsync(DumpQueueStore.WatchingSinceKey));
         }
         finally
         {

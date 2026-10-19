@@ -85,6 +85,10 @@ finally {
     Remove-Item -Path $keyFile -ErrorAction SilentlyContinue
 }
 
+Assert-Equal (Read-ApiKeyForProvisioning -PipedKey "dts_piped") "dts_piped" "a key piped into the script is used"
+Assert-Equal (Read-ApiKeyForProvisioning) $null "with no file, no piped key and no prompt, the existing key is left alone"
+Assert-Equal ($ast.Extent.Text -match '\[Console\]::In\.') $false "the console's stdin is never read (a redirected, open stdin would hang a reinstall)"
+
 $missingFile = Join-Path ([System.IO.Path]::GetTempPath()) "install-test-missing-$([guid]::NewGuid()).txt"
 $threw = $false
 try { Read-ApiKeyForProvisioning -ApiKeyFile $missingFile | Out-Null } catch { $threw = $true }

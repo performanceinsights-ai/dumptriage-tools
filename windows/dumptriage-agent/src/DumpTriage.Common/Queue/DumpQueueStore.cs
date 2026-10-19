@@ -68,7 +68,11 @@ public sealed class DumpQueueStore : IAsyncDisposable
                     File.Move(dbPath + suffix, asidePath + suffix, overwrite: true);
                 }
             }
-            return await OpenFileAsync(dbPath, logger, cancellationToken);
+            var store = await OpenFileAsync(dbPath, logger, cancellationToken);
+            // Not a first install: the dumps the lost queue still had are on disk,
+            // and the startup scan must not skip them as older than "now".
+            await store.SetMetaAsync(WatchingSinceKey, DateTimeOffset.UnixEpoch.ToString("O"), cancellationToken);
+            return store;
         }
     }
 

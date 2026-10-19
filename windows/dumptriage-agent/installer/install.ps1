@@ -105,7 +105,7 @@ $canPrompt = [Environment]::UserInteractive -and
 # Never a command-line argument: from a file the caller protects, from this
 # script's own stdin (a deployment tool piping it in), or a masked prompt.
 function Read-ApiKeyForProvisioning {
-    param([string]$ApiKeyFile, [switch]$Prompt, [switch]$PromptRequired)
+    param([string]$ApiKeyFile, [string]$PipedKey, [switch]$Prompt, [switch]$PromptRequired)
     if ($ApiKeyFile) {
         if (-not (Test-Path -LiteralPath $ApiKeyFile -PathType Leaf)) {
             throw "API key file not found: $ApiKeyFile"
@@ -116,11 +116,8 @@ function Read-ApiKeyForProvisioning {
         }
         return $key
     }
-    if ([Console]::IsInputRedirected) {
-        $line = [Console]::In.ReadLine()
-        if ($line -and $line.Trim()) {
-            return $line.Trim()
-        }
+    if ($PipedKey) {
+        return $PipedKey
     }
     if ($Prompt) {
         $secure = Read-Host -Prompt "DumpTriage API key (dts_...)" -AsSecureString
@@ -133,7 +130,11 @@ function Read-ApiKeyForProvisioning {
     return $null
 }
 
-$plaintextKey = Read-ApiKeyForProvisioning -ApiKeyFile $ApiKeyFile `
+# PowerShell pipeline input (Get-Content key.txt | .\install.ps1 ...), never the
+# console's stdin: a deployment tool that redirects stdin and leaves it open
+# would block a reinstall that asked for no key at all.
+$pipedKey = "$(@($input) | Select-Object -First 1)".Trim()
+$plaintextKey = Read-ApiKeyForProvisioning -ApiKeyFile $ApiKeyFile -PipedKey $pipedKey `
     -Prompt:($PromptForApiKey -or (-not $existingService -and $canPrompt)) -PromptRequired:$PromptForApiKey
 
 Write-Host "Installing DumpTriage agent into $InstallDir"
