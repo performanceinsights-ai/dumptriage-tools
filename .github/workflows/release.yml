@@ -7,6 +7,9 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+  # A change to this file builds everything without publishing, so a broken package shows up before a tag.
+  pull_request:
+    paths: [".github/workflows/release.yml"]
 
 permissions:
   contents: read
