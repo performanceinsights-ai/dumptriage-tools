@@ -64,10 +64,21 @@ setup() {
 
     cat > "$T/bin/curl" <<EOF
 #!/bin/bash
-# fake curl: logs its arguments and the config it reads on stdin, answers \$FAKE_STATUS
+# fake curl: logs its arguments and the config it reads on stdin, answers \$FAKE_STATUS;
+# GET /api/v1/config answers \$FAKE_CONFIG, or fails as an unreachable service would
+for a in "\$@"; do last=\$a; done
+case "\$last" in
+    */api/v1/config)
+        printf 'curl config %s\n' "\$last" >> "$LOG"
+        [ -n "\${FAKE_CONFIG:-}" ] || exit 7
+        printf '%s\n' "\$FAKE_CONFIG"
+        exit 0 ;;
+esac
 { printf 'curl'; for a in "\$@"; do printf ' [%s]' "\$a"; done; printf '\n'; sed 's/^/config: /'; } >> "$LOG"
 status=\${FAKE_STATUS:-201}
-if [ "\$status" = 201 ]; then
+if [ "\$status" = 401 ]; then
+    printf '{"detail":"invalid API key"}\n%s' "\$status"
+elif [ "\$status" = 201 ]; then
     printf '{"id":"11111111-2222-3333-4444-555555555555","dump_type":"macos_crash","status":"uploaded"}\n%s' "\$status"
 else
     printf '{"detail":"macOS crash reports, kernel panics and spindumps are not supported on this service yet"}\n%s' "\$status"
@@ -106,7 +117,7 @@ done_test() {
 
 export DUMPTRIAGE_API_URL=https://triage.example.com
 export DUMPTRIAGE_API_KEY=dt_test_key_123
-unset DUMPTRIAGE_PORTAL_URL FAKE_STATUS FAKE_KEYCHAIN
+unset DUMPTRIAGE_PORTAL_URL FAKE_STATUS FAKE_KEYCHAIN FAKE_CONFIG
 
 setup lists_recent_reports_by_kind_newest_first
 run "" --dir "$REPORTS" --dry-run --all
@@ -184,13 +195,65 @@ assert_contains "$(cat "$LOG")" "security find-generic-password -s dumptriage -w
 assert_contains "$(cat "$LOG")" 'config: header = "Authorization: Bearer dt_from_keychain"'
 done_test
 
-setup no_key_anywhere_stops_before_sending
-DUMPTRIAGE_API_KEY="" run "1
+setup no_key_anywhere_says_to_sign_up_before_listing_reports
+DUMPTRIAGE_API_KEY="" FAKE_CONFIG='{"self_hosted": false, "signup_enabled": true, "llm_providers": []}' \
+    DUMPTRIAGE_PORTAL_URL=https://portal.example.com/ run "1
 y
 " --dir "$REPORTS"
 assert_eq "$CODE" 2
 assert_contains "$OUT" "no API key"
-assert_eq "$(grep -c '^curl' "$LOG")" 0
+assert_contains "$OUT" "1. Sign up at https://portal.example.com/signup"
+assert_contains "$OUT" "2. Create an upload-only API key on https://portal.example.com/account"
+assert_contains "$OUT" 'security add-generic-password -U -s dumptriage -a "$USER" -w'
+assert_contains "$OUT" "4. Run this again."
+assert_contains "$OUT" "Note: to sign up yourself, open https://portal.example.com/signup in a browser."
+assert_not_contains "$OUT" "Which to send?"  # told before picking anything
+assert_contains "$(cat "$LOG")" "curl config https://triage.example.com/api/v1/config"
+assert_eq "$(grep -c '^curl \[' "$LOG")" 0
+done_test
+
+setup no_key_on_a_service_without_sign_up_says_to_ask_for_an_account
+DUMPTRIAGE_API_KEY="" FAKE_CONFIG='{"self_hosted":true,"signup_enabled":false}' run "" --dir "$REPORTS"
+assert_eq "$CODE" 2
+assert_contains "$OUT" "1. Ask whoever runs https://triage.example.com for an account"
+assert_not_contains "$OUT" "/signup"  # a service without sign-up has no such page
+assert_not_contains "$OUT" "Note: to sign up"
+done_test
+
+setup no_key_and_an_unreachable_service_still_says_where_a_key_comes_from
+DUMPTRIAGE_API_KEY="" run "" --dir "$REPORTS"
+assert_eq "$CODE" 2
+assert_contains "$OUT" "1. Sign up, or sign in if you have an account, at https://triage.example.com"
+assert_contains "$OUT" "https://triage.example.com/account"
+# Sign-up may still be open; name the page in case the customer wants to sign up by hand.
+assert_contains "$OUT" "Note: to sign up yourself, open https://triage.example.com/signup in a browser."
+done_test
+
+setup no_key_stops_before_asking_for_sudo
+DUMPTRIAGE_API_KEY="" run "" --dir "$REPORTS" --spindump Xcode
+assert_eq "$CODE" 2
+assert_contains "$OUT" "no API key"
+assert_eq "$(grep -c '^sudo' "$LOG")" 0
+done_test
+
+setup a_refused_key_says_to_replace_it_and_stops_sending
+DUMPTRIAGE_API_KEY="" FAKE_KEYCHAIN=dt_revoked FAKE_STATUS=401 run "y
+" --dir "$REPORTS" --all
+assert_eq "$CODE" 1
+assert_contains "$OUT" "NOT sent $REPORTS/napper-2026-10-15-101010.ips"
+assert_contains "$OUT" "refused the API key (HTTP 401)"
+assert_contains "$OUT" "https://triage.example.com/account"
+assert_contains "$OUT" 'security add-generic-password -U -s dumptriage -a "$USER" -w'
+assert_eq "$(grep -c '^curl \[' "$LOG")" 1  # the other two would be refused the same way
+done_test
+
+setup a_refused_key_from_the_environment_says_to_set_it_there
+FAKE_STATUS=401 run "1
+y
+" --dir "$REPORTS"
+assert_eq "$CODE" 1
+assert_contains "$OUT" "in DUMPTRIAGE_API_KEY."
+assert_not_contains "$OUT" "security add-generic-password"
 done_test
 
 setup a_refused_upload_says_why_and_fails
@@ -222,9 +285,10 @@ assert_eq "$(grep -c '^curl' "$LOG")" 0
 [ -z "$(ls "$T"/dumptriage-spindump-* 2>/dev/null)" ] || fail "a declined spindump was left in TMPDIR"
 done_test
 
-setup a_spindump_without_a_key_is_removed_too
+setup no_url_stops_before_taking_a_spindump
 DUMPTRIAGE_API_URL= run "" --dir "$REPORTS" --spindump Xcode
 assert_eq "$CODE" 2
+assert_eq "$(grep -c '^sudo' "$LOG")" 0
 [ -z "$(ls "$T"/dumptriage-spindump-* 2>/dev/null)" ] || fail "a spindump that could not be sent was left in TMPDIR"
 done_test
 

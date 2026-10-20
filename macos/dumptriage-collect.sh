@@ -23,7 +23,8 @@
 # Environment:
 #   DUMPTRIAGE_API_URL     the service, e.g. https://dumptriage.example.com (required to send)
 #   DUMPTRIAGE_API_KEY     your API key; if unset, read from the login keychain:
-#                          security add-generic-password -s dumptriage -a "$USER" -w
+#                          security add-generic-password -U -s dumptriage -a "$USER" -w
+#                          No account yet? Run this anyway: it says where to sign up.
 #   DUMPTRIAGE_PORTAL_URL  where report links point (defaults to DUMPTRIAGE_API_URL)
 
 set -u
@@ -120,7 +121,7 @@ collect() {
 
 take_spindump() {
     out="${TMPDIR:-/tmp}/dumptriage-spindump-$$.txt"
-    # Removed on every exit (declined, no key, failed upload): it holds process paths and the user name.
+    # Removed on every exit (declined, failed upload): it holds process paths and the user name.
     trap 'rm -f "$out"' EXIT
     printf 'Sampling %s for %s seconds with spindump (sudo asks for your password)...\n' "$SPINDUMP_TARGET" "$SPINDUMP_SECONDS"
     if ! sudo spindump "$SPINDUMP_TARGET" "$SPINDUMP_SECONDS" -file "$out" >/dev/null; then
@@ -164,15 +165,63 @@ select_files() {
     done
 }
 
+KEY_SOURCE=""
 api_key() {
     if [ -n "${DUMPTRIAGE_API_KEY:-}" ]; then
-        printf '%s' "$DUMPTRIAGE_API_KEY"
+        KEY_SOURCE=environment
+        KEY=$DUMPTRIAGE_API_KEY
         return 0
     fi
     if command -v security >/dev/null 2>&1; then
-        security find-generic-password -s dumptriage -w 2>/dev/null && return 0
+        KEY_SOURCE=keychain
+        KEY=$(security find-generic-password -s dumptriage -w 2>/dev/null) && [ -n "$KEY" ] && return 0
     fi
     return 1
+}
+
+STORE_KEY='security add-generic-password -U -s dumptriage -a "$USER" -w'
+
+# No key found: a first-time customer has no account yet, so say where a key
+# comes from (website#1969). The service's public config says whether it takes
+# sign-ups; a self-hosted one does not, and its /signup page does not exist.
+no_key() {
+    portal=${PORTAL_URL%/}
+    config=$(curl -fsS --max-time 10 "${API_URL%/}/api/v1/config" 2>/dev/null)
+    signup=$(printf '%s' "$config" | sed -n 's/.*"signup_enabled"[[:space:]]*:[[:space:]]*\([a-z]*\).*/\1/p')
+    {
+        echo "dumptriage-collect: no API key: DUMPTRIAGE_API_KEY is not set and the login keychain has no 'dumptriage' item."
+        echo "To send reports you need a Dump Triage account and an API key:"
+        case "$signup" in
+            true) echo "  1. Sign up at $portal/signup (skip this if you already have an account)" ;;
+            false) echo "  1. Ask whoever runs $portal for an account (this service does not take sign-ups)" ;;
+            *) echo "  1. Sign up, or sign in if you have an account, at $portal" ;;
+        esac
+        echo "  2. Create an upload-only API key on $portal/account"
+        echo "  3. Store it in your login keychain (paste the key when asked):"
+        echo "       $STORE_KEY"
+        echo "  4. Run this again."
+        # Unless the service said it has none, name the sign-up page outright:
+        # a customer may sign up in a browser first and come back to this.
+        if [ "$signup" != false ]; then
+            echo
+            echo "Note: to sign up yourself, open $portal/signup in a browser."
+        fi
+    } >&2
+    exit 2
+}
+
+# The key was refused: mistyped, revoked, or replaced on the Account page.
+refused_key() {
+    {
+        echo "The service refused the API key (HTTP 401): it may be mistyped, revoked or replaced."
+        echo "Create a new upload-only key on ${PORTAL_URL%/}/account, then run this again with it"
+        if [ "$KEY_SOURCE" = environment ]; then
+            echo "in DUMPTRIAGE_API_KEY."
+        else
+            echo "stored over the old one:"
+            echo "  $STORE_KEY"
+        fi
+    } >&2
 }
 
 # One upload: curl reads the Authorization header from its config on stdin, so
@@ -194,6 +243,10 @@ upload() {
     status=$(printf '%s\n' "$response" | tail -n 1)
     body=$(printf '%s\n' "$response" | sed '$d')
     case "$status" in
+        401)
+            printf 'NOT sent %s\n' "$file" >&2
+            refused_key
+            return 2 ;;
         200|201)
             id=$(printf '%s' "$body" | sed -n 's/^[^"]*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
             printf 'sent %s\n  report: %s/dumps/%s\n' "$file" "${PORTAL_URL%/}" "$id"
@@ -204,6 +257,16 @@ upload() {
             return 1 ;;
     esac
 }
+
+# Where to send, and the key, before anything else: a customer with no key
+# learns it before picking reports or typing a sudo password for a spindump.
+if [ "$DRY_RUN" -eq 0 ]; then
+    API_URL=${DUMPTRIAGE_API_URL:-}
+    [ -n "$API_URL" ] || die "set DUMPTRIAGE_API_URL to the service's address, e.g. https://dumptriage.example.com" 2
+    PORTAL_URL=${DUMPTRIAGE_PORTAL_URL:-$API_URL}
+    KEY=""
+    api_key || no_key
+fi
 
 collect
 SPINDUMP_FILE=""
@@ -246,11 +309,6 @@ if [ "$DRY_RUN" -eq 1 ]; then
     exit 0
 fi
 
-API_URL=${DUMPTRIAGE_API_URL:-}
-[ -n "$API_URL" ] || die "set DUMPTRIAGE_API_URL to the service's address, e.g. https://dumptriage.example.com" 2
-PORTAL_URL=${DUMPTRIAGE_PORTAL_URL:-$API_URL}
-KEY=$(api_key) || die "no API key: set DUMPTRIAGE_API_KEY, or store it with: security add-generic-password -s dumptriage -a \"\$USER\" -w" 2
-
 printf 'Send %d file(s) to %s? [y/N] ' ${#SELECTED[@]} "$API_URL"
 read -r answer || answer=""
 case "$answer" in
@@ -260,6 +318,11 @@ esac
 
 failed=0
 for f in "${SELECTED[@]}"; do
-    upload "$f" || failed=1
+    upload "$f"
+    case $? in
+        0) ;;
+        2) failed=1; break ;;  # a refused key refuses the rest too
+        *) failed=1 ;;
+    esac
 done
 exit $failed
