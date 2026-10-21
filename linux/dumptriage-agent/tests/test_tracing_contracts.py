@@ -98,6 +98,14 @@ class SchemaTests(unittest.TestCase):
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.validate(bad, self.manifest)
 
+    def test_a_scoped_trigger_names_its_process(self):
+        m = manifest()
+        m["trigger"]["process"] = "sqlservr"
+        jsonschema.validate(m, self.manifest)
+        m["trigger"]["process"] = ""
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(m, self.manifest)
+
     def test_a_manifest_missing_its_command_is_rejected(self):
         m = manifest()
         del m["tool"]["command"]
