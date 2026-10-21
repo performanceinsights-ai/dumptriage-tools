@@ -313,5 +313,24 @@ run "" --frobnicate
 assert_eq "$CODE" 2
 done_test
 
+# The shared tracing fixture (#26): this suite only checks it loads and is well formed; the
+# trigger loop that uses it lands with the macOS capture (#31). jq on Linux CI, python3 on a Mac.
+setup tracing_fixture_is_well_formed
+TRIGGERS="$HERE/../../tests/fixtures/tracing/triggers.json"
+if command -v jq > /dev/null 2>&1; then
+    BAD=$(jq -r '[.cases[] | select((.expect.outcome | IN("fire","no_fire","cooldown","capped") | not)
+        or ((.expect | has("atSec")) != (.expect.outcome != "no_fire")))] | length' "$TRIGGERS")
+    OUTCOMES=$(jq -r '[.cases[].expect.outcome] | unique | join(",")' "$TRIGGERS")
+elif command -v python3 > /dev/null 2>&1; then
+    BAD=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sum(1 for c in d["cases"] if c["expect"]["outcome"] not in ("fire","no_fire","cooldown","capped") or ("atSec" in c["expect"]) != (c["expect"]["outcome"] != "no_fire")))' "$TRIGGERS")
+    OUTCOMES=$(python3 -c 'import json,sys; print(",".join(sorted({c["expect"]["outcome"] for c in json.load(open(sys.argv[1]))["cases"]})))' "$TRIGGERS")
+else
+    fail "neither jq nor python3 to read the fixture"
+    BAD=0 OUTCOMES=capped,cooldown,fire,no_fire
+fi
+assert_eq "$BAD" 0
+assert_eq "$OUTCOMES" "capped,cooldown,fire,no_fire"
+done_test
+
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

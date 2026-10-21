@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://performanceinsights.ai/schemas/tracing-config.schema.json",
+  "title": "DumpTriage tracing config",
+  "description": "The `tracing` section of the Windows agent config (AgentConfig.cs), the Linux agent config.json and ~/.config/dumptriage/tracing.json on macOS. Same keys on every platform; website#1999, dumptriage-tools#26.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "enabled": { "type": "boolean", "default": false, "description": "Off until the host opts in." },
+    "backend": { "enum": ["wpr", "perf", "perfetto", "spindump", "xctrace"] },
+    "submission": {
+      "enum": ["AlwaysSubmit", "AskFirst", "NotifyOnly", "RuleBased"],
+      "default": "AskFirst",
+      "description": "The existing submission policy. Traces are held for approval by default (PRD Q9)."
+    },
+    "triggers": { "type": "array", "items": { "$ref": "#/$defs/trigger" } },
+    "limits": { "$ref": "#/$defs/limits" }
+  },
+  "required": ["enabled"],
+  "$defs": {
+    "trigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9._-]+$" },
+        "type": { "enum": ["cpuPercent", "loadPerCpu", "psiSomeAvg10", "diskLatencyMs", "process", "hangEvent", "schedule"] },
+        "threshold": { "type": "number", "minimum": 0, "description": "Required for every type except hangEvent and schedule." },
+        "process": { "type": "string", "minLength": 1, "description": "Process name: scopes cpuPercent to one process, and is the target of a `process` trigger." },
+        "sustainSec": { "type": "integer", "minimum": 0, "default": 0, "description": "The metric must stay at or above the threshold this long." },
+        "intervalMin": { "type": "integer", "minimum": 1, "description": "schedule only: minutes between baseline captures." }
+      },
+      "allOf": [
+        { "if": { "properties": { "type": { "enum": ["cpuPercent", "loadPerCpu", "psiSomeAvg10", "diskLatencyMs", "process"] } } }, "then": { "required": ["threshold"] } },
+        { "if": { "properties": { "type": { "const": "process" } } }, "then": { "required": ["process"] } },
+        { "if": { "properties": { "type": { "const": "schedule" } } }, "then": { "required": ["intervalMin"] } },
+        { "if": { "properties": { "type": { "const": "psiSomeAvg10" } } }, "then": { "properties": { "threshold": { "maximum": 100 } } } }
+      ]
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Enforced by the tool on the host, never by the service.",
+      "properties": {
+        "maxDurationSec": { "type": "integer", "minimum": 1, "default": 60 },
+        "maxDiskMB": { "type": "integer", "minimum": 1, "default": 512 },
+        "maxOverheadPercent": { "type": "number", "exclusiveMinimum": 0, "maximum": 100, "default": 2 },
+        "cooldownMin": { "type": "integer", "minimum": 0, "default": 60 },
+        "dailyCap": { "type": "integer", "minimum": 0, "default": 4 }
+      }
+    }
+  }
+}

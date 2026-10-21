@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://performanceinsights.ai/schemas/trace-manifest.schema.json",
+  "title": "DumpTriage trace manifest",
+  "description": "manifest.json uploaded with every trace. website#1999, dumptriage-tools#26. The backend validates it (website /api/v1/traces).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "traceType", "trigger", "window", "tool", "os", "hostToken", "agentVersion"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "traceType": { "enum": ["perf_script_text", "folded", "perfetto", "etl", "spindump_text", "sample_text", "xctrace_export"] },
+    "trigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "type": { "enum": ["cpuPercent", "loadPerCpu", "psiSomeAvg10", "diskLatencyMs", "process", "hangEvent", "schedule", "manual"] },
+        "threshold": { "type": "number" },
+        "observed": { "type": "number", "description": "The metric value that fired the trigger." }
+      }
+    },
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startUtc", "stopUtc"],
+      "properties": {
+        "startUtc": { "type": "string", "format": "date-time" },
+        "stopUtc": { "type": "string", "format": "date-time" },
+        "lookbackSec": { "type": "integer", "minimum": 0, "description": "Flight-recorder history kept before the trigger." }
+      }
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "command"],
+      "properties": {
+        "name": { "enum": ["wpr", "perf", "perfetto", "spindump", "sample", "xctrace"] },
+        "version": { "type": "string" },
+        "command": { "type": "string", "description": "The exact command line, with secrets and home directories already redacted on the host." }
+      }
+    },
+    "os": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["family", "build"],
+      "properties": {
+        "family": { "enum": ["windows", "linux", "macos"] },
+        "build": { "type": "string", "description": "Windows build number, Linux kernel release or macOS build." }
+      }
+    },
+    "hostToken": { "type": "string", "minLength": 1, "description": "The hostname hash the agents already send. Never the hostname." },
+    "agentVersion": { "type": "string", "minLength": 1 }
+  }
+}
