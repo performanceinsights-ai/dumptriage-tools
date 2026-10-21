@@ -44,6 +44,21 @@ agent with `configure-dumps.sh` (`dumptriage-agent-linux.tar.gz`), and `SHA256SU
 [performanceinsights.ai/downloads](https://performanceinsights.ai/downloads/). A `v*` tag publishes a release
 (`.github/workflows/release.yml`).
 
+## Tracing contracts
+
+Automated performance-trace capture (website#1999) is defined once here so the three platforms cannot drift:
+
+- [`schemas/tracing-config.schema.json`](schemas/tracing-config.schema.json): the `tracing` config section (off by default,
+  `backend`, `triggers[]`, limits, submission policy defaulting to `AskFirst`). Same keys in the Windows agent, the Linux
+  agent and `~/.config/dumptriage/tracing.json` on macOS.
+- [`schemas/trace-manifest.schema.json`](schemas/trace-manifest.schema.json): the `manifest.json` uploaded with every trace.
+  It carries the host token, never the hostname.
+- [`tests/fixtures/tracing/triggers.json`](tests/fixtures/tracing/triggers.json): metric series in, `fire` / `no_fire` /
+  `cooldown` / `capped` out. Its `semantics` list defines the rules; the Python suite holds a reference evaluator, and every
+  platform's trigger loop is tested against every case.
+
+Both schemas are release assets, and the website copies them for its own validation.
+
 ## Tests
 
 ```sh

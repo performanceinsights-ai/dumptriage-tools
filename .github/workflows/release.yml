@@ -63,7 +63,8 @@ jobs:
           cp linux/configure-dumps.sh "$stage/"
           tar -C "$(dirname "$stage")" -czf dist/dumptriage-agent-linux.tar.gz dumptriage-agent-linux
           cp windows/Set-WerLocalDumps.ps1 windows/Set-WerLiveKernelReports.ps1 linux/configure-dumps.sh \
-             macos/dumptriage-collect.sh rmm/ninjaone/Invoke-DumpTriageCollect.ps1 dist/
+             macos/dumptriage-collect.sh rmm/ninjaone/Invoke-DumpTriageCollect.ps1 \
+             schemas/tracing-config.schema.json schemas/trace-manifest.schema.json dist/
           (cd dist && sha256sum * > SHA256SUMS)
           cat dist/SHA256SUMS
       - name: Publish the release
