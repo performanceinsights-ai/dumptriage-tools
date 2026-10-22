@@ -9,6 +9,7 @@ using DumpTriageAgent.Idle;
 using DumpTriageAgent.Ipc;
 using DumpTriageAgent.Runtime;
 using DumpTriageAgent.Security;
+using DumpTriageAgent.Tracing;
 using DumpTriageAgent.Upload;
 using DumpTriageAgent.Watching;
 using Serilog;
@@ -149,6 +150,18 @@ try
     builder.Services.AddHostedService<DumpWatcherService>();
     builder.Services.AddHostedService<UploadWorkerService>();
     builder.Services.AddHostedService<StatusBroadcastService>();
+    // Performance traces (website#1999): idle unless the tracing section is enabled.
+    builder.Services.AddSingleton<IWpr, WprCli>();
+    if (OperatingSystem.IsWindows())
+    {
+#pragma warning disable CA1416 // inside OperatingSystem.IsWindows(); the analyzer does not follow it into the lambda
+        builder.Services.AddSingleton<IMetricSource>(_ => new WindowsMetricSource(MetricNeeds.For(config.Tracing.Triggers)));
+#pragma warning restore CA1416
+    }
+    builder.Services.AddHostedService(sp => new TracingService(
+        config, queueStore, sp.GetRequiredService<ApprovalCoordinator>(), sp.GetRequiredService<ITrayChannel>(),
+        sp.GetRequiredService<IWpr>(), sp.GetService<IMetricSource>(), sp.GetRequiredService<ILogger<TracingService>>(),
+        traceDir: Path.Combine(Path.GetDirectoryName(dbPath)!, "traces")));
 
     var host = builder.Build();
     await host.RunAsync();

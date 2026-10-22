@@ -62,7 +62,8 @@ jobs:
           cp -r linux/dumptriage-agent/dumptriage_agent.py linux/dumptriage-agent/installer linux/dumptriage-agent/perfetto linux/dumptriage-agent/README.md LICENSE "$stage/"
           cp linux/configure-dumps.sh linux/configure-tracing.sh "$stage/"
           tar -C "$(dirname "$stage")" -czf dist/dumptriage-agent-linux.tar.gz dumptriage-agent-linux
-          cp windows/Set-WerLocalDumps.ps1 windows/Set-WerLiveKernelReports.ps1 linux/configure-dumps.sh linux/configure-tracing.sh \
+          cp windows/Set-WerLocalDumps.ps1 windows/Set-WerLiveKernelReports.ps1 windows/Start-PerfTrace.ps1 windows/PerfInsights.wprp \
+             linux/configure-dumps.sh linux/configure-tracing.sh \
              macos/dumptriage-collect.sh rmm/ninjaone/Invoke-DumpTriageCollect.ps1 \
              schemas/tracing-config.schema.json schemas/trace-manifest.schema.json dist/
           (cd dist && sha256sum * > SHA256SUMS)

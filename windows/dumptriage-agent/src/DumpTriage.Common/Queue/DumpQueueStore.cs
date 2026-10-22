@@ -172,6 +172,7 @@ public sealed class DumpQueueStore : IAsyncDisposable
         ("next_attempt_at_utc", "TEXT NULL"), // website#1488
         ("first_failed_at_utc", "TEXT NULL"), // website#1488
         ("file_last_write_utc", "TEXT NULL"), // website#1486
+        ("manifest", "TEXT NULL"), // a trace's manifest.json, website#1999
     };
 
     private async Task AddMissingColumnsAsync(CancellationToken cancellationToken)
@@ -221,8 +222,8 @@ public sealed class DumpQueueStore : IAsyncDisposable
     {
         using var _ = await LockAsync(cancellationToken);
         const string sql = """
-            INSERT INTO dumps (id, file_path, size_bytes, sha256, dump_type, state, detected_at_utc, submitted_at_utc, retry_count, last_error, central_copied_at_utc, central_copy_error, next_attempt_at_utc, first_failed_at_utc, file_last_write_utc)
-            VALUES ($id, $filePath, $sizeBytes, $sha256, $dumpType, $state, $detectedAtUtc, $submittedAtUtc, $retryCount, $lastError, $centralCopiedAtUtc, $centralCopyError, $nextAttemptAtUtc, $firstFailedAtUtc, $fileLastWriteUtc)
+            INSERT INTO dumps (id, file_path, size_bytes, sha256, dump_type, state, detected_at_utc, submitted_at_utc, retry_count, last_error, central_copied_at_utc, central_copy_error, next_attempt_at_utc, first_failed_at_utc, file_last_write_utc, manifest)
+            VALUES ($id, $filePath, $sizeBytes, $sha256, $dumpType, $state, $detectedAtUtc, $submittedAtUtc, $retryCount, $lastError, $centralCopiedAtUtc, $centralCopyError, $nextAttemptAtUtc, $firstFailedAtUtc, $fileLastWriteUtc, $manifest)
             ON CONFLICT(id) DO UPDATE SET
                 file_path = excluded.file_path,
                 size_bytes = excluded.size_bytes,
@@ -236,7 +237,8 @@ public sealed class DumpQueueStore : IAsyncDisposable
                 central_copied_at_utc = excluded.central_copied_at_utc,
                 central_copy_error = excluded.central_copy_error,
                 next_attempt_at_utc = excluded.next_attempt_at_utc,
-                first_failed_at_utc = excluded.first_failed_at_utc;
+                first_failed_at_utc = excluded.first_failed_at_utc,
+                manifest = excluded.manifest;
             """;
 
         var command = _connection.CreateCommand();
@@ -256,6 +258,7 @@ public sealed class DumpQueueStore : IAsyncDisposable
         command.Parameters.AddWithValue("$nextAttemptAtUtc", (object?)record.NextAttemptAtUtc?.ToString("O") ?? DBNull.Value);
         command.Parameters.AddWithValue("$firstFailedAtUtc", (object?)record.FirstFailedAtUtc?.ToString("O") ?? DBNull.Value);
         command.Parameters.AddWithValue("$fileLastWriteUtc", (object?)FormatLastWrite(record.FileLastWriteUtc) ?? DBNull.Value);
+        command.Parameters.AddWithValue("$manifest", (object?)record.Manifest ?? DBNull.Value);
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
@@ -334,11 +337,12 @@ public sealed class DumpQueueStore : IAsyncDisposable
         using var _ = await LockAsync(cancellationToken);
         var command = _connection.CreateCommand();
         command.CommandText = """
-            INSERT INTO dumps (id, file_path, size_bytes, sha256, dump_type, state, detected_at_utc, retry_count, file_last_write_utc)
-            VALUES ($id, $filePath, $sizeBytes, $sha256, $dumpType, $state, $detectedAtUtc, 0, $fileLastWriteUtc)
+            INSERT INTO dumps (id, file_path, size_bytes, sha256, dump_type, state, detected_at_utc, retry_count, file_last_write_utc, manifest)
+            VALUES ($id, $filePath, $sizeBytes, $sha256, $dumpType, $state, $detectedAtUtc, 0, $fileLastWriteUtc, $manifest)
             ON CONFLICT(id) DO NOTHING;
             """;
         command.Parameters.AddWithValue("$fileLastWriteUtc", (object?)FormatLastWrite(record.FileLastWriteUtc) ?? DBNull.Value);
+        command.Parameters.AddWithValue("$manifest", (object?)record.Manifest ?? DBNull.Value);
         command.Parameters.AddWithValue("$id", record.Id);
         command.Parameters.AddWithValue("$filePath", record.FilePath);
         command.Parameters.AddWithValue("$sizeBytes", record.SizeBytes);
@@ -356,11 +360,12 @@ public sealed class DumpQueueStore : IAsyncDisposable
     /// worker or the tray set in the meantime (website#1491).
     /// </summary>
     public async Task<bool> TransitionStateAsync(
-        string id, DumpQueueState from, DumpQueueState to, CancellationToken cancellationToken = default)
+        string id, DumpQueueState from, DumpQueueState to, CancellationToken cancellationToken = default, string? lastError = null)
     {
         using var _ = await LockAsync(cancellationToken);
         var command = _connection.CreateCommand();
-        command.CommandText = "UPDATE dumps SET state = $to WHERE id = $id AND state = $from;";
+        command.CommandText = "UPDATE dumps SET state = $to, last_error = COALESCE($lastError, last_error) WHERE id = $id AND state = $from;";
+        command.Parameters.AddWithValue("$lastError", (object?)lastError ?? DBNull.Value);
         command.Parameters.AddWithValue("$id", id);
         command.Parameters.AddWithValue("$from", from.ToString());
         command.Parameters.AddWithValue("$to", to.ToString());
@@ -472,6 +477,7 @@ public sealed class DumpQueueStore : IAsyncDisposable
             NextAttemptAtUtc = nextAttemptAtUtc,
             FirstFailedAtUtc = firstFailedAtUtc,
             FileLastWriteUtc = fileLastWriteUtc,
+            Manifest = reader.IsDBNull(reader.GetOrdinal("manifest")) ? null : reader.GetString(reader.GetOrdinal("manifest")),
         };
     }
 

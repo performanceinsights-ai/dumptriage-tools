@@ -32,6 +32,9 @@ public sealed class DumpRecord
     /// <summary>Not uploaded before this time: exponential backoff after a transient failure (website#1488).</summary>
     public DateTimeOffset? NextAttemptAtUtc { get; set; }
 
+    /// <summary>A trace's manifest.json (DumpType.Trace only); null for a dump.</summary>
+    public string? Manifest { get; set; }
+
     /// <summary>First failure in the current run of transient failures; the dump gives up a fixed time after it.</summary>
     public DateTimeOffset? FirstFailedAtUtc { get; set; }
 }

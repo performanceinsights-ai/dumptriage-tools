@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DumpTriage performance trace profile (website#1999, dumptriage-tools#29).
+
+    wpr -setprofint 40000                                   (CPU sampling every 4 ms; WPR's default is 1 ms)
+    wpr -start PerfInsights.wprp!FlightRecorder             (memory mode: a ring of buffers, written only on stop)
+    wpr -stop trace.etl
+
+  What it records, and why each is here: CPU samples with stacks (where CPU time went); context switches with the stack a
+  thread resumes at (how long working threads waited, and on what: the off-CPU data a "blocked or waiting" verdict needs);
+  ready-thread events, no stack (run-queue latency); disk I/O and its issuing thread (latency and who asked); DPC and ISR
+  time (drivers); hard faults (paging); process, thread and image load events (names and symbols). The .NET runtime's
+  loader and JIT events, and its rundown when the trace is saved, name JIT-compiled code: without them most frames of a
+  managed process are unresolved (85% of a PowerShell workload's busy samples on the lab VM, 1% with them).
+
+  Lighter than the first lab draft (poc/repros/1999-trace-lab in the website repo), which cost about 4% of a CPU-bound
+  workload on Server 2022: no ReadyThread stacks, no file I/O events, sampling at 4 ms. The ring's size (Buffers) is set
+  by the agent from limits.maxDiskMB; the .NET events have their own small ring.
+-->
+<WindowsPerformanceRecorder Version="1.0" Author="DumpTriage" Comments="dumptriage-tools#29">
+  <Profiles>
+    <SystemCollector Id="SC_DumpTriage" Name="NT Kernel Logger">
+      <BufferSize Value="1024"/>
+      <Buffers Value="64"/>
+    </SystemCollector>
+    <EventCollector Id="EC_DumpTriage" Name="DumpTriage .NET events">
+      <BufferSize Value="1024"/>
+      <Buffers Value="32"/>
+    </EventCollector>
+    <SystemProvider Id="SP_DumpTriage">
+      <Keywords>
+        <Keyword Value="ProcessThread"/>
+        <Keyword Value="Loader"/>
+        <Keyword Value="SampledProfile"/>
+        <Keyword Value="CSwitch"/>
+        <Keyword Value="ReadyThread"/>
+        <Keyword Value="DiskIO"/>
+        <Keyword Value="DiskIOInit"/>
+        <Keyword Value="DPC"/>
+        <Keyword Value="Interrupt"/>
+        <Keyword Value="HardFaults"/>
+      </Keywords>
+      <Stacks>
+        <Stack Value="SampledProfile"/>
+        <Stack Value="CSwitch"/>
+      </Stacks>
+    </SystemProvider>
+    <!-- Microsoft-Windows-DotNETRuntime: Loader (0x8) and Jit (0x10), verbose for MethodLoadVerbose. -->
+    <EventProvider Id="EP_ClrRuntime" Name="e13c0d23-ccbc-4e12-931b-d9cc2eee27e4" Level="5">
+      <Keywords>
+        <Keyword Value="0x18"/>
+      </Keywords>
+    </EventProvider>
+    <!-- Microsoft-Windows-DotNETRuntimeRundown on save: methods and modules loaded before the window (WPR's own keywords). -->
+    <EventProvider Id="EP_ClrRundown" Name="a669021c-c450-4609-a035-5af59af4df18" Level="5" CaptureStateOnly="true">
+      <CaptureStateOnSave Timeout="30">
+        <Keyword Value="0x70138"/>
+      </CaptureStateOnSave>
+    </EventProvider>
+    <Profile Id="FlightRecorder.Verbose.Memory" Name="FlightRecorder" Description="DumpTriage flight recorder" LoggingMode="Memory" DetailLevel="Verbose">
+      <Collectors>
+        <SystemCollectorId Value="SC_DumpTriage">
+          <SystemProviderId Value="SP_DumpTriage"/>
+        </SystemCollectorId>
+        <EventCollectorId Value="EC_DumpTriage">
+          <EventProviders>
+            <EventProviderId Value="EP_ClrRuntime"/>
+            <EventProviderId Value="EP_ClrRundown"/>
+          </EventProviders>
+        </EventCollectorId>
+      </Collectors>
+    </Profile>
+    <Profile Id="FlightRecorder.Verbose.File" Name="FlightRecorder" Description="DumpTriage recorder, file mode (Start-PerfTrace.ps1)" LoggingMode="File" DetailLevel="Verbose">
+      <Collectors>
+        <SystemCollectorId Value="SC_DumpTriage">
+          <SystemProviderId Value="SP_DumpTriage"/>
+        </SystemCollectorId>
+        <EventCollectorId Value="EC_DumpTriage">
+          <EventProviders>
+            <EventProviderId Value="EP_ClrRuntime"/>
+            <EventProviderId Value="EP_ClrRundown"/>
+          </EventProviders>
+        </EventCollectorId>
+      </Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>
