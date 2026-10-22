@@ -10,6 +10,10 @@ request. Python 3 standard library only, so installing it is copying one file.
 Run it as a daemon (`run`, what the systemd unit does), or as a bounded pass
 (`run --once`, what the cron fallback does). The other subcommands operate on
 the local queue: status, list, approve, skip, retry, set-api-key.
+
+Performance tracing (website#1999, off by default; see the `tracing` config section and the README): a perf
+flight recorder runs under the daemon, a trigger on /proc metrics takes a snapshot, the snapshot is folded to
+stacks on the host and queued like a dump (held for approval by default), then uploaded to POST /api/v1/traces.
 """
 import argparse
 import errno
@@ -20,6 +24,8 @@ import json
 import logging
 import lzma
 import os
+import platform
+import re
 import shutil
 import signal
 import socket
@@ -28,13 +34,18 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.parse
 import uuid
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 log = logging.getLogger("dumptriage")
+
+AGENT_VERSION = "0.3.0"
 
 # --- dump sniffing -----------------------------------------------------------
 # Mirrors the backend's detect_dump_type (service/backend/app/services/dump_sniff.py),
@@ -250,6 +261,14 @@ DEFAULT_CONFIG = {
         "batching": {"mode": "Immediate", "scheduledTimesLocal": [], "idleMinutes": 15},
     },
     "centralCopy": {"enabled": False, "destinationPath": None, "organizeByHostname": True},
+    # Performance tracing (dumptriage-tools schemas/tracing-config.schema.json, #26): off until the host opts in.
+    "tracing": {
+        "enabled": False,
+        "backend": "perf",
+        "submission": "AskFirst",  # a trace is held for approval by default (PRD Q9)
+        "triggers": [],
+        "limits": {"maxDurationSec": 60, "maxDiskMB": 512, "maxOverheadPercent": 2, "cooldownMin": 60, "dailyCap": 4},
+    },
 }
 
 
@@ -364,6 +383,14 @@ class Queue:
             CREATE INDEX IF NOT EXISTS idx_dumps_state ON dumps(state);
             CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
         """)
+        # A trace is a second kind of row in the same queue (website#1999): the same states, policy, approve/skip/retry
+        # and upload retry. A queue from before it gets the two columns added; its rows are all dumps.
+        columns = {r["name"] for r in self.db.execute("PRAGMA table_info(dumps)")}
+        if "kind" not in columns:
+            self.db.execute("ALTER TABLE dumps ADD COLUMN kind TEXT NOT NULL DEFAULT 'dump'")
+        if "manifest" not in columns:
+            self.db.execute("ALTER TABLE dumps ADD COLUMN manifest TEXT")
+        self.db.commit()
         if self.created:
             # Recorded with the file itself, so a first run that dies before the agent starts
             # watching isn't later mistaken for an upgrade (which filters nothing, #17).
@@ -481,11 +508,520 @@ def open_by_other_process(path):
 
 # --- agent -------------------------------------------------------------------
 
+# --- performance tracing -------------------------------------------------------
+# website#1999 / dumptriage-tools#27. Everything here is standard library. The kernel's own perf does the sampling;
+# the agent decides when (triggers on /proc), keeps the recorder inside its limits, folds the snapshot to text on the
+# host and queues it like a dump. The shared trigger rules are tests/fixtures/tracing/triggers.json (#26).
+
+TRACE_TYPE = "folded"
+TRIGGER_TYPES = ("cpuPercent", "loadPerCpu", "psiSomeAvg10", "diskLatencyMs", "process", "hangEvent", "schedule")
+THRESHOLD_TYPES = ("cpuPercent", "loadPerCpu", "psiSomeAvg10", "diskLatencyMs", "process")
+SUBMISSION_MODES = ("AlwaysSubmit", "AskFirst", "NotifyOnly", "RuleBased")
+SECONDS_PER_DAY = 86400
+PERF_MAX_STACK = 127
+FOLDED_MAX_BYTES = 8 * 1024 * 1024
+RECORDER_RETRY_SECONDS = 300
+RECORDER_START_GRACE_SECONDS = 3.0  # perf that dies this soon failed to start (no permission, no events)
+OVERHEAD_WINDOW_SECONDS = 60
+OVERHEAD_BACKOFF_SECONDS = 1800
+SNAPSHOT_WAIT_SECONDS = 60
+SCRIPT_TIMEOUT_SECONDS = 300
+
+
+def validate_tracing(tracing):
+    """Problems with a `tracing` config section, as the schema (schemas/tracing-config.schema.json) and this agent's
+    backends would report them; an empty list means usable. Fail closed: the agent does not trace on a config it
+    cannot read."""
+    problems = []
+    if tracing.get("backend") != "perf":
+        problems.append(f"backend {tracing.get('backend')!r} is not available in this agent (perf is)")
+    if tracing.get("submission") not in SUBMISSION_MODES:
+        problems.append(f"submission {tracing.get('submission')!r} is not one of {', '.join(SUBMISSION_MODES)}")
+    if not tracing.get("triggers"):
+        problems.append("no triggers are configured")
+    names = set()
+    for i, t in enumerate(tracing.get("triggers", [])):
+        where = f"triggers[{i}]"
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", str(t.get("name", ""))):
+            problems.append(f"{where}: name must be 1 to 64 letters, digits, '.', '_' or '-'")
+        elif t["name"] in names:
+            problems.append(f"{where}: name {t['name']!r} is used twice")
+        names.add(t.get("name"))
+        if t.get("type") not in TRIGGER_TYPES:
+            problems.append(f"{where}: type {t.get('type')!r} is not one of {', '.join(TRIGGER_TYPES)}")
+            continue
+        if t["type"] in THRESHOLD_TYPES and not isinstance(t.get("threshold"), (int, float)):
+            problems.append(f"{where}: {t['type']} needs a numeric threshold")
+        if t["type"] == "process" and not t.get("process"):
+            problems.append(f"{where}: a process trigger needs a process name")
+        if t["type"] == "schedule" and not (isinstance(t.get("intervalMin"), int) and t["intervalMin"] >= 1):
+            problems.append(f"{where}: a schedule trigger needs intervalMin of 1 or more")
+        if t["type"] == "psiSomeAvg10" and isinstance(t.get("threshold"), (int, float)) and t["threshold"] > 100:
+            problems.append(f"{where}: psiSomeAvg10 is a percentage, at most 100")
+        if not isinstance(t.get("sustainSec", 0), int) or t.get("sustainSec", 0) < 0:
+            problems.append(f"{where}: sustainSec must be a whole number of seconds, 0 or more")
+    limits = tracing.get("limits", {})
+    for key in ("maxDurationSec", "maxDiskMB"):
+        if not isinstance(limits.get(key), int) or limits[key] < 1:
+            problems.append(f"limits.{key} must be a whole number, 1 or more")
+    if not isinstance(limits.get("maxOverheadPercent"), (int, float)) or not 0 < limits["maxOverheadPercent"] <= 100:
+        problems.append("limits.maxOverheadPercent must be above 0 and at most 100")
+    for key in ("cooldownMin", "dailyCap"):
+        if not isinstance(limits.get(key), int) or limits[key] < 0:
+            problems.append(f"limits.{key} must be a whole number, 0 or more")
+    return problems
+
+
+# Trigger rules. One implementation, run by the daemon and by the shared fixture's test.
+
+class TriggerRunner:
+    """A trigger is met when its metric stays at or above the threshold for sustainSec. A dip below, or no reading,
+    restarts the clock; once met it must be sustained again."""
+
+    def __init__(self, trigger):
+        self.threshold = trigger.get("threshold")
+        self.sustain = trigger.get("sustainSec", 0)
+        self.run_start = None
+
+    def feed(self, t, value):
+        if value is None or value < self.threshold:
+            self.run_start = None
+            return False
+        if self.run_start is None:
+            self.run_start = t
+        if t - self.run_start >= self.sustain:
+            self.run_start = None
+            return True
+        return False
+
+
+def capture_outcome(t, limits, history):
+    """What a met trigger does at time `t`: cooldown (a capture within cooldownMin), capped (dailyCap captures in
+    the last 24 h), else fire. Cooldown is reported before the cap."""
+    if any(a > t - limits["cooldownMin"] * 60 for a in history):
+        return "cooldown"
+    if sum(1 for a in history if a > t - SECONDS_PER_DAY) >= limits["dailyCap"]:
+        return "capped"
+    return "fire"
+
+
+def evaluate_series(trigger, limits, history, series):
+    """The shared fixture's contract: (tSec, value) samples in, the first met moment decided. Returns
+    {"outcome": ..., "atSec": ...} (atSec absent for no_fire)."""
+    runner = TriggerRunner(trigger)
+    for t, value in series:
+        if runner.feed(t, value):
+            return {"outcome": capture_outcome(t, limits, history), "atSec": t}
+    return {"outcome": "no_fire"}
+
+
+# /proc readers
+
+class ProcSampler:
+    """Reads the metrics triggers use from /proc (a fake tree in tests). cpuPercent, per-process percent and disk
+    latency are deltas between two reads, so the first read has none of them (None)."""
+
+    DISK = re.compile(r"(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme\d+n\d+|mmcblk\d+|md\d+|dm-\d+)")
+
+    def __init__(self, root="/proc", want_processes=False):
+        self.root = Path(root)
+        self.want_processes = want_processes
+        self.clk = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+        self.prev = None
+        self.ncpu = 1
+
+    def _read(self, name):
+        try:
+            return (self.root / name).read_text()
+        except OSError:
+            return ""
+
+    def _cpu(self):
+        total = busy = None
+        ncpu = 0
+        for line in self._read("stat").splitlines():
+            f = line.split()
+            if f and f[0] == "cpu":
+                v = [int(x) for x in f[1:9]]
+                total, busy = sum(v), sum(v) - v[3] - v[4]  # not idle, not iowait
+            elif f and re.fullmatch(r"cpu\d+", f[0]):
+                ncpu += 1
+        self.ncpu = max(ncpu, 1)
+        return total, busy
+
+    def _psi(self):
+        best = None
+        for res in ("cpu", "io", "memory"):
+            m = re.search(r"^some .*?avg10=([0-9.]+)", self._read(f"pressure/{res}"), re.M)
+            if m:
+                best = max(best or 0.0, float(m.group(1)))
+        return best
+
+    def _disks(self):
+        out = {}
+        for line in self._read("diskstats").splitlines():
+            f = line.split()
+            if len(f) >= 11 and self.DISK.fullmatch(f[2]):
+                out[f[2]] = (int(f[3]) + int(f[7]), int(f[6]) + int(f[10]))  # completed ios, ms spent on them
+        return out
+
+    def _procs(self):
+        out = {}
+        try:
+            entries = [e for e in os.listdir(self.root) if e.isdigit()]
+        except OSError:
+            return out
+        for pid in entries:
+            try:
+                text = (self.root / pid / "stat").read_text()
+            except OSError:
+                continue
+            end = text.rfind(")")
+            if end == -1:
+                continue
+            rest = text[end + 2:].split()
+            if len(rest) > 12:
+                out[pid] = (text[text.find("(") + 1:end], int(rest[11]) + int(rest[12]))
+        return out
+
+    def read(self, now):
+        """Metrics at epoch seconds `now`: cpuPercent, loadPerCpu, psiSomeAvg10, diskLatencyMs, procs {comm: percent of
+        one CPU}. A metric that cannot be read (or has no previous read to compare with) is None."""
+        total, busy = self._cpu()
+        try:
+            load = float(self._read("loadavg").split()[0]) / self.ncpu
+        except (IndexError, ValueError):
+            load = None
+        disks = self._disks()
+        procs = self._procs() if self.want_processes else {}
+        cur = {"t": now, "total": total, "busy": busy, "disks": disks, "procs": procs}
+        out = {"cpuPercent": None, "loadPerCpu": load, "psiSomeAvg10": self._psi(), "diskLatencyMs": None, "procs": {}}
+        prev, self.prev = self.prev, cur
+        if prev is None:
+            return out
+        if total is not None and total > prev["total"]:
+            out["cpuPercent"] = 100.0 * (busy - prev["busy"]) / (total - prev["total"])
+        worst = 0.0
+        for name, (ios, ms) in disks.items():
+            if name in prev["disks"] and ios > prev["disks"][name][0]:
+                worst = max(worst, (ms - prev["disks"][name][1]) / (ios - prev["disks"][name][0]))
+        out["diskLatencyMs"] = worst if disks else None
+        elapsed = now - prev["t"]
+        if self.want_processes and elapsed > 0:
+            per = Counter()
+            for pid, (comm, ticks) in procs.items():
+                if pid in prev["procs"]:
+                    per[comm] += max(ticks - prev["procs"][pid][1], 0) / self.clk / elapsed * 100.0
+            out["procs"] = dict(per)
+        return out
+
+
+def trigger_value(trigger, metrics):
+    kind = trigger["type"]
+    if kind in ("process",) or (kind == "cpuPercent" and trigger.get("process")):
+        return metrics["procs"].get(trigger["process"][:15])  # comm is at most 15 characters
+    return metrics.get(kind)
+
+
+# Folding: perf script text to `process;root;...;leaf count` (what stackcollapse-perf.pl writes, with its --kernel
+# marker: a kernel frame ends in `_[k]`). Only these stacks leave the host.
+
+_SAMPLE_LINE = re.compile(
+    r"^(?P<comm>\S.*?)\s+(?P<pid>\d+)(?:/\d+)?\s+(?:\[\d+\]\s+)?(?P<time>\d+\.\d+):\s*(?:\d+\s+)?(?P<event>[^\s:][^\s]*?):(?:\s|$)"
+)
+_OFFSET = re.compile(r"\+0x[0-9a-fA-F]+$")
+_HOME = (
+    (re.compile(r"(/home/)[^/\s;:)]+"), r"\1<user>"),
+    (re.compile(r"(/Users/)[^/\s;:)]+"), r"\1<user>"),
+)
+
+
+def redact_home(text):
+    for pattern, repl in _HOME:
+        text = pattern.sub(repl, text)
+    return text
+
+
+_NOT_KERNEL_PSEUDO = ("[unknown]", "[vdso]", "[vsyscall]", "[heap]", "[stack]", "[anon]")
+
+
+def _is_kernel_dso(dso):
+    """The kernel itself (`[kernel.kallsyms]`, `[kernel.vmlinux]`) or a loaded module: perf names a module's DSO `[name]` or its .ko file
+    under /lib/modules. (No module frame was in any real capture here, so the module forms are not checked against real output.)"""
+    if dso.startswith("[kernel"):
+        return True
+    if dso.startswith("[") and dso not in _NOT_KERNEL_PSEUDO:
+        return True
+    return dso.startswith("/lib/modules/") or re.search(r"\.ko(\.(xz|zst|gz))?$", dso) is not None
+
+
+def _frame_name(line):
+    """The symbol of a `perf script` frame line, with `_[k]` for the kernel; None if the line is not a frame."""
+    body = line.strip().split(None, 1)
+    if len(body) != 2 or not re.fullmatch(r"[0-9a-fA-F]+", body[0]):
+        return None
+    rest = body[1]
+    cut = rest.rfind(" (")
+    if cut == -1 or not rest.endswith(")"):
+        return None
+    symbol = _OFFSET.sub("", rest[:cut].strip()) or "[unknown]"
+    symbol = redact_home(symbol).replace(";", ",")
+    return symbol + "_[k]" if _is_kernel_dso(rest[cut + 2:-1]) and symbol != "[unknown]" else symbol
+
+
+class Folded:
+    def __init__(self, stacks, first, last, samples, other_events, lines_unread):
+        self.stacks, self.first, self.last = stacks, first, last
+        self.samples, self.other_events, self.lines_unread = samples, other_events, lines_unread
+
+    @property
+    def span(self):
+        return (self.last - self.first) if self.samples else 0.0
+
+    def text(self, max_bytes=FOLDED_MAX_BYTES):
+        out, used = [], 0
+        for stack, count in self.stacks.most_common():
+            line = f"{stack} {count}\n"
+            if used + len(line) > max_bytes:
+                break
+            out.append(line)
+            used += len(line)
+        return "".join(out)
+
+
+def fold_perf_script(lines, window_sec=None):
+    """Fold `perf script [--header]` lines. Only the first event's samples count (another event's would double-count
+    the same time). With `window_sec`, only the samples within that many seconds of the last one are kept: the
+    flight recorder's ring buffer can hold more than the limits allow to be sent."""
+    interned, samples = {}, []
+    comm = None
+    frames = []
+    other = unread = 0
+    first_event = None
+
+    def flush():
+        nonlocal comm, frames
+        if comm is not None:
+            key = ";".join([redact_home(comm).replace(";", ","), *reversed(frames[:512])])
+            samples.append((current_t, interned.setdefault(key, key)))
+        comm, frames = None, []
+
+    current_t = 0.0
+    for line in lines:
+        line = line.rstrip("\n")
+        if not line.strip():
+            flush()
+            continue
+        if line.startswith("#"):
+            continue
+        if line[0] in " \t":
+            if comm is not None:
+                name = _frame_name(line)
+                if name is None:
+                    unread += 1
+                else:
+                    frames.append(name)
+            continue
+        flush()
+        m = _SAMPLE_LINE.match(line)
+        if m is None:
+            unread += 1
+            continue
+        if first_event is None:
+            first_event = m.group("event")
+        if m.group("event") != first_event:
+            other += 1
+            continue
+        comm, current_t = m.group("comm"), float(m.group("time"))
+    flush()
+    if not samples:
+        return Folded(Counter(), 0.0, 0.0, 0, other, unread)
+    last = max(t for t, _ in samples)
+    cutoff = last - window_sec if window_sec else None
+    kept = [(t, k) for t, k in samples if cutoff is None or t >= cutoff]
+    return Folded(Counter(k for _, k in kept), min(t for t, _ in kept), last, len(kept), other, unread)
+
+
+# Upload
+
+def upload_trace(base_url, api_key, path, manifest_json, hostname, name="trace.folded", timeout=600):
+    """POST /api/v1/traces as multipart/form-data: the manifest.json text, the optional hostname and the folded
+    stacks as `file`. Returns (outcome, status, message), like upload_dump."""
+    u = urllib.parse.urlsplit(base_url)
+    boundary = uuid.uuid4().hex
+    pre = b""
+    for field, value in (("manifest", manifest_json), ("hostname", hostname)):
+        if value:
+            pre += f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"\r\n\r\n{value}\r\n'.encode()
+    name = name.replace('"', "")
+    pre += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
+            "Content-Type: text/plain\r\n\r\n").encode()
+    post = f"\r\n--{boundary}--\r\n".encode()
+    size = os.path.getsize(path)
+    conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+    conn = conn_cls(u.hostname, u.port, timeout=timeout)
+    try:
+        conn.putrequest("POST", (u.path.rstrip("/") or "") + "/api/v1/traces")
+        conn.putheader("Authorization", f"Bearer {api_key}")
+        conn.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
+        conn.putheader("Content-Length", str(len(pre) + size + len(post)))
+        conn.endheaders()
+        conn.send(pre)
+        with open(path, "rb") as f:
+            while chunk := f.read(1 << 20):
+                conn.send(chunk)
+        conn.send(post)
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8", "replace")[:500]
+    except (OSError, http.client.HTTPException) as e:
+        return TRANSIENT, None, str(e)
+    finally:
+        conn.close()
+    if resp.status == 201:
+        return SUCCESS, 201, None
+    if resp.status in (400, 422):
+        return REJECTED, resp.status, body
+    if resp.status in (413, 429):
+        return QUOTA, resp.status, body
+    if resp.status in (401, 403):
+        return AUTH, resp.status, body
+    return TRANSIENT, resp.status, body
+
+
+# The recorder
+
+class PerfRecorder:
+    """`perf record -F 99 -a -g --overwrite --switch-output=signal`: a ring buffer that costs a bounded amount of
+    memory and CPU and writes nothing until SIGUSR2, which dumps what it holds to `perf.data.<timestamp>`."""
+
+    def __init__(self, perf_bin, trace_dir, ncpu, max_disk_mb, proc_root="/proc"):
+        self.perf, self.dir, self.ncpu = perf_bin, Path(trace_dir), ncpu
+        self.max_disk_mb, self.proc_root = max_disk_mb, Path(proc_root)
+        self.proc = None
+        self.log_path = self.dir / "perf-record.log"
+        self.command = []
+        self.started_at = None
+        self.cpu_ticks = None  # (wall, ticks) at the last overhead reading
+
+    def mmap_pages(self):
+        """Pages per CPU of the ring: a quarter of the disk budget in total at most (a snapshot is about the ring's
+        size), a power of two as perf wants, and at least 64 and at most 16384 pages (64 MiB) per CPU."""
+        pages = (self.max_disk_mb * 1024 * 1024 // 4) // max(self.ncpu, 1) // 4096
+        n = 64
+        while n * 2 <= min(pages, 16384):
+            n *= 2
+        return n
+
+    def start(self):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.command = [self.perf, "record", "-F", "99", "-a", "-g", "--overwrite", "--switch-output=signal",
+                        "-m", str(self.mmap_pages()), "-o", str(self.dir / "perf.data")]
+        log_file = open(self.log_path, "wb")
+        try:
+            self.proc = subprocess.Popen(self.command, stdin=subprocess.DEVNULL, stdout=log_file, stderr=log_file,
+                                         start_new_session=True)
+        finally:
+            log_file.close()
+        deadline = time.monotonic() + RECORDER_START_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                raise OSError(f"perf record exited with {self.proc.returncode}: {self.tail()}")
+            time.sleep(min(0.1, RECORDER_START_GRACE_SECONDS))
+        self.started_at = time.monotonic()
+        self.cpu_ticks = None
+
+    def tail(self):
+        try:
+            return " ".join(self.log_path.read_text(errors="replace").split())[-300:]
+        except OSError:
+            return ""
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def snapshot(self):
+        """Dump the ring buffer now; the path of the new perf.data.<timestamp>."""
+        before = set(self.dir.glob("perf.data.[0-9]*"))
+        self.proc.send_signal(signal.SIGUSR2)
+        deadline = time.monotonic() + SNAPSHOT_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                raise OSError(f"perf record exited while dumping: {self.tail()}")
+            new = sorted(set(self.dir.glob("perf.data.[0-9]*")) - before)
+            # perf prints "[ perf record: Dump <file> ]" once the file is complete: the name as given to -o, so the full
+            # path when -o is absolute (as here) and the bare name when it is relative (checked on perf 5.14 to 6.8).
+            if new and f"Dump {new[-1]}" in self.tail_all():
+                return new[-1]
+            time.sleep(0.2)
+        raise OSError("perf record did not finish the dump in time")
+
+    def tail_all(self):
+        try:
+            return self.log_path.read_text(errors="replace")
+        except OSError:
+            return ""
+
+    def overhead_percent(self, now_wall):
+        """The recorder's own CPU as a share of the machine's CPU over the last reading's interval: utime+stime of the
+        perf process. A lower bound (the kernel's sampling interrupts are charged to whatever was running), so the
+        README also records an A/B measurement. None until two readings OVERHEAD_WINDOW_SECONDS apart exist."""
+        try:
+            text = (self.proc_root / str(self.proc.pid) / "stat").read_text()
+            rest = text[text.rfind(")") + 2:].split()
+            ticks = int(rest[11]) + int(rest[12])
+        except (OSError, ValueError, IndexError, AttributeError):
+            return None
+        clk = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+        if self.cpu_ticks is None:
+            self.cpu_ticks = (now_wall, ticks)
+            return None
+        wall0, ticks0 = self.cpu_ticks
+        if now_wall - wall0 < OVERHEAD_WINDOW_SECONDS:
+            return None
+        self.cpu_ticks = (now_wall, ticks)
+        return 100.0 * ((ticks - ticks0) / clk) / ((now_wall - wall0) * max(self.ncpu, 1))
+
+    def stop(self):
+        if self.proc is None:
+            return
+        if self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGINT)
+            try:
+                self.proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+        self.proc = None
+        # SIGINT makes perf dump the buffer once more: nobody asked for that one.
+        for leftover in self.dir.glob("perf.data.[0-9]*"):
+            leftover.unlink(missing_ok=True)
+        (self.dir / "perf.data").unlink(missing_ok=True)
+
+
+class TraceState:
+    """What the daemon holds between ticks while tracing: the recorder, the readers and the runners."""
+
+    def __init__(self):
+        self.validated = False
+        self.disabled = False
+        self.recorder = None
+        self.sampler = None
+        self.runners = []
+        self.recorder_retry_at = 0.0
+        self.error = None
+        self.overhead = None
+        self.warned_hang = False
+        self.perf_version = None
+
+
 class Agent:
-    def __init__(self, config, config_dir, state_dir, queue=None, uploader=upload_dump, clock=utcnow):
+    def __init__(self, config, config_dir, state_dir, queue=None, uploader=upload_dump, clock=utcnow,
+                 trace_uploader=upload_trace, perf_bin=None, proc_root="/proc"):
         self.cfg, self.config_dir, self.state_dir = config, Path(config_dir), Path(state_dir)
         self.queue = queue or Queue(self.state_dir / "queue.db", clock)
         self.uploader, self.clock = uploader, clock
+        self.trace_uploader, self.perf_bin, self.proc_root = trace_uploader, perf_bin, proc_root
+        self.trace_state = TraceState()
         self.stable = {}  # path -> (size, mtime_ns, first_seen_unchanged_monotonic)
         self.ignored = set()  # (path, size, mtime_ns) already sniffed as not-a-dump
         self.untrusted = set()  # (watched root, problem) already logged by candidates
@@ -670,6 +1206,8 @@ class Agent:
         return [root_path(r) for r in self.cfg["watchedPaths"]]
 
     def submit_one(self, r, key):
+        if r["kind"] == "trace":
+            return self.submit_trace(r, key)
         self.queue.update(r["id"], state=SUBMITTING)
         spool = None
         try:
@@ -693,6 +1231,10 @@ class Agent:
         finally:
             if spool:
                 spool.unlink(missing_ok=True)
+        return self.record_outcome(r, outcome, status, msg)
+
+    def record_outcome(self, r, outcome, status, msg):
+        """What an upload's outcome does to the row: submitted, failed, retried later, or the key paused."""
         if outcome == SUCCESS:
             log.info("submitted %s", r["file_path"])
             self.queue.set_meta("auth_refusals", "0")
@@ -771,18 +1313,330 @@ class Agent:
             log.warning("central copy of %s failed: %s", r["file_path"], e)
             self.queue.update(r["id"], central_copy_error=str(e))
 
-    def tick(self):
+    def tick(self, trace=False):
         settling = self.scan()
         self.resolve_asks()
+        if trace:
+            try:
+                self.trace_tick()
+            except Exception:  # a tracing fault must not stop dumps being submitted
+                log.exception("tracing failed this tick; dumps are unaffected")
         self.submit_due()
         return settling
 
-    def run(self, once=False, stop=lambda: False):
-        while not stop():
-            settling = self.tick()
-            if once and not settling:
+    # --- performance tracing -----------------------------------------------------------------------------------
+
+    def trace_dir(self):
+        return self.state_dir / "trace"
+
+    def host_token(self):
+        """A random per-install token for manifest.json's hostToken: stable, and not derived from the hostname (a hash of
+        a guessable hostname is reversible by dictionary)."""
+        token = self.queue.meta("host_token")
+        if token is None:
+            token = uuid.uuid4().hex[:16]
+            self.queue.set_meta("host_token", token)
+        return token
+
+    def _write_trace_status(self, **fields):
+        ts = self.trace_state
+        status = {"enabled": self.cfg["tracing"]["enabled"], "recorder": "running" if ts.recorder and ts.recorder.alive() else "stopped",
+                  "error": ts.error, "overheadPercent": None if ts.overhead is None else round(ts.overhead, 3),
+                  "updatedUtc": iso(self.clock()), **fields}
+        previous = {}
+        try:
+            previous = json.loads((self.trace_dir() / "status.json").read_text())
+        except (OSError, ValueError):
+            pass
+        for key in ("lastCaptureUtc", "lastManual"):
+            status.setdefault(key, previous.get(key))
+        try:
+            self.trace_dir().mkdir(parents=True, exist_ok=True)
+            tmp = self.trace_dir() / "status.json.tmp"
+            tmp.write_text(json.dumps(status, indent=1))
+            os.replace(tmp, self.trace_dir() / "status.json")
+        except OSError as e:
+            log.debug("cannot write trace status: %s", e)
+
+    def _trace_history(self):
+        try:
+            return [float(x) for x in json.loads(self.queue.meta("trace_captures") or "[]")]
+        except (ValueError, TypeError):
+            return []
+
+    def _trace_setup(self):
+        """Once per run: check the config, build the readers and runners. A bad config disables tracing (fail closed)."""
+        ts, tr = self.trace_state, self.cfg["tracing"]
+        ts.validated = True
+        problems = validate_tracing(tr)
+        if problems:
+            ts.disabled, ts.error = True, "; ".join(problems)
+            for problem in problems:
+                log.error("tracing is off: %s", problem)
+            return
+        ts.sampler = ProcSampler(self.proc_root, want_processes=any(
+            t["type"] == "process" or (t["type"] == "cpuPercent" and t.get("process")) for t in tr["triggers"]))
+        for trig in tr["triggers"]:
+            if trig["type"] == "hangEvent":
+                if not ts.warned_hang:
+                    log.warning("trigger %s (hangEvent) has no source on Linux; it never fires", trig["name"])
+                    ts.warned_hang = True
+            elif trig["type"] != "schedule":
+                ts.runners.append((trig, TriggerRunner(trig)))
+        if self.perf_bin is None:
+            self.perf_bin = shutil.which("perf")
+        if not self.perf_bin:
+            ts.disabled, ts.error = True, "perf is not installed (run linux/configure-tracing.sh)"
+            log.error("tracing is off: %s", ts.error)
+
+    def trace_tick(self):
+        tr = self.cfg["tracing"]
+        ts = self.trace_state
+        if not tr["enabled"]:
+            return
+        if not ts.validated:
+            self._trace_setup()
+        if ts.disabled:
+            return
+        now = self.clock()
+        t = now.timestamp()
+        limits = tr["limits"]
+        self.trace_housekeeping()
+        if ts.recorder is None:
+            ts.recorder = PerfRecorder(self.perf_bin, self.trace_dir(), self._ncpu(), limits["maxDiskMB"], self.proc_root)
+        if ts.recorder.proc is not None and not ts.recorder.alive():
+            # It started and then died (killed, out of memory, a perf error): wait before starting it again, so a recorder that
+            # dies every few seconds is not restarted, with the start grace each time, on every tick.
+            ts.error = f"the perf recorder exited ({ts.recorder.proc.returncode}): {ts.recorder.tail()}"
+            ts.recorder.proc = None
+            ts.recorder_retry_at = t + RECORDER_RETRY_SECONDS
+            log.error("%s; trying again in %d s", ts.error, RECORDER_RETRY_SECONDS)
+        if not ts.recorder.alive():
+            if t < ts.recorder_retry_at:
+                self._write_trace_status()
                 return
-            time.sleep(self.cfg["pollSeconds"] if not once else min(self.cfg["pollSeconds"], 2))
+            try:
+                ts.recorder.start()
+                ts.error = None
+                log.info("trace recorder started: %s", " ".join(ts.recorder.command))
+            except OSError as e:
+                ts.error = f"the perf recorder could not start: {e}"
+                ts.recorder_retry_at = t + RECORDER_RETRY_SECONDS
+                log.error("%s; trying again in %d s", ts.error, RECORDER_RETRY_SECONDS)
+                self._write_trace_status()
+                return
+        metrics = ts.sampler.read(t)
+        ts.recorder.ncpu = ts.sampler.ncpu
+        overhead = ts.recorder.overhead_percent(t)
+        if overhead is not None:
+            ts.overhead = overhead
+            if overhead > limits["maxOverheadPercent"]:
+                ts.error = f"the perf recorder used {overhead:.2f}% of the machine's CPU, over the {limits['maxOverheadPercent']}% limit"
+                log.error("%s; stopping it for %d minutes", ts.error, OVERHEAD_BACKOFF_SECONDS // 60)
+                ts.recorder.stop()
+                ts.recorder_retry_at = t + OVERHEAD_BACKOFF_SECONDS
+                self._write_trace_status()
+                return
+        met = []
+        for trig, runner in ts.runners:
+            value = trigger_value(trig, metrics)
+            if runner.feed(t, value):
+                met.append((trig, value))
+        for trig in tr["triggers"]:
+            if trig["type"] == "schedule":
+                last = self.queue.meta(f"trace_last_{trig['name']}")
+                last = float(last) if last else t  # the first baseline is one interval after the first run
+                if not self.queue.meta(f"trace_last_{trig['name']}"):
+                    self.queue.set_meta(f"trace_last_{trig['name']}", str(t))
+                elif t - last >= trig["intervalMin"] * 60:
+                    self.queue.set_meta(f"trace_last_{trig['name']}", str(t))
+                    met.append((trig, None))
+        request = self.trace_dir() / "capture.request"
+        if request.exists():
+            request.unlink(missing_ok=True)
+            met.append(({"name": "manual", "type": "manual"}, None))
+        for trig, observed in met:
+            outcome = capture_outcome(t, limits, self._trace_history())
+            if trig["type"] == "manual":
+                self._write_trace_status(lastManual=f"{iso(now)} {outcome}")
+            if outcome != "fire":
+                log.info("trigger %s met, no capture: %s", trig["name"], outcome)
+                continue
+            self.capture_trace(trig, observed, now)
+        self._write_trace_status()
+
+    def _ncpu(self):
+        return os.cpu_count() or 1
+
+    def _perf_version(self):
+        ts = self.trace_state
+        if ts.perf_version is None:
+            try:
+                out = subprocess.run([self.perf_bin, "--version"], capture_output=True, text=True, timeout=10).stdout
+                ts.perf_version = (out.split() or ["", "", "unknown"])[-1]
+            except (OSError, subprocess.SubprocessError):
+                ts.perf_version = "unknown"
+        return ts.perf_version
+
+    def capture_trace(self, trigger, observed, now):
+        """Dump the ring buffer, fold it on the host, write manifest.json and queue the result. The raw perf.data is
+        deleted as soon as it is folded: only text is kept, and only text leaves."""
+        tr, ts = self.cfg["tracing"], self.trace_state
+        limits = tr["limits"]
+        t = now.timestamp()
+        history = self._trace_history()
+        # Recorded first: a capture that fails or comes up empty still counts, so a broken recorder cannot be asked in a loop.
+        self.queue.set_meta("trace_captures", json.dumps([a for a in history if a > t - 2 * SECONDS_PER_DAY] + [t]))
+        try:
+            snapshot = ts.recorder.snapshot()
+        except OSError as e:
+            ts.error = f"capture for trigger {trigger['name']} failed: {e}"
+            log.error(ts.error)
+            return None
+        try:
+            if snapshot.stat().st_size > limits["maxDiskMB"] * 1024 * 1024:
+                ts.error = f"the perf snapshot is over the {limits['maxDiskMB']} MB disk limit and was discarded"
+                log.error(ts.error)
+                return None
+            folded = self.fold_snapshot(snapshot, limits["maxDurationSec"])
+        except (OSError, subprocess.SubprocessError) as e:
+            ts.error = f"capture for trigger {trigger['name']} failed: {e}"
+            log.error(ts.error)
+            return None
+        finally:
+            snapshot.unlink(missing_ok=True)
+        if folded.samples == 0:
+            log.warning("capture for trigger %s held no samples; nothing queued", trigger["name"])
+            return None
+        trace_id = hashlib.sha256(f"trace|{trigger['name']}|{t}|{uuid.uuid4().hex}".encode()).hexdigest()[:32]
+        self.trace_dir().mkdir(parents=True, exist_ok=True)
+        path = self.trace_dir() / f"{trace_id}-{trigger['name']}.folded"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(folded.text())
+        manifest = self.trace_manifest(trigger, observed, now, folded)
+        row = dict(id=trace_id, file_path=str(path), size_bytes=path.stat().st_size, dump_type=TRACE_TYPE, compression=None,
+                   state=DETECTED, detected_at_utc=iso(now), kind="trace", manifest=json.dumps(manifest))
+        policy = dict(self.cfg["policy"], mode=tr["submission"])
+        outcome = evaluate_policy(row, policy, now.astimezone())
+        if outcome == AUTO:
+            row["state"] = QUEUED
+        elif outcome == ASK:
+            row["state"] = PENDING
+            row["ask_deadline_utc"] = iso(now + timedelta(seconds=self.cfg["policy"]["askTimeoutSeconds"]))
+        elif outcome == MANUAL:
+            row["state"] = PENDING
+        else:
+            row["state"] = SKIPPED
+        self.queue.add(**row)
+        self._write_trace_status(lastCaptureUtc=iso(now))
+        log.info("captured trace %s for trigger %s (%d samples, %.0f s) -> %s [id %s]",
+                 path.name, trigger["name"], folded.samples, folded.span, row["state"], trace_id[:12])
+        if row["state"] == PENDING:
+            log.warning("trace %s awaits approval: run `dumptriage-agent approve %s` or `skip %s`", path.name, trace_id[:12], trace_id[:12])
+        return trace_id
+
+    def fold_snapshot(self, snapshot, window_sec):
+        """`perf script --header` over the snapshot, folded as it streams. perf runs as the agent's user, as root."""
+        # stderr goes to a file, not a pipe: nothing reads a pipe while stdout is being folded, and a chatty perf would fill it and block.
+        with tempfile.TemporaryFile() as errfile:
+            proc = subprocess.Popen([self.perf_bin, "script", "-f", "-i", str(snapshot), "--header"], stdout=subprocess.PIPE,
+                                    stderr=errfile, text=True, errors="replace")
+            timer = threading.Timer(SCRIPT_TIMEOUT_SECONDS, proc.kill)
+            timer.start()
+            try:
+                folded = fold_perf_script(proc.stdout, window_sec)
+                proc.wait()
+            finally:
+                timer.cancel()
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+            errfile.seek(0)
+            err = errfile.read(65536).decode("utf-8", "replace")
+        if proc.returncode != 0 and folded.samples == 0:
+            raise OSError(f"perf script exited with {proc.returncode}: {' '.join(err.split())[-300:]}")
+        return folded
+
+    def trace_manifest(self, trigger, observed, now, folded):
+        """manifest.json (schemas/trace-manifest.schema.json). The window is the folded samples' own span ending when
+        the trigger fired: the header's `sample duration` is 0 in a --switch-output dump, so it is not used."""
+        ts = self.trace_state
+        span = folded.span
+        trig = {"name": trigger["name"], "type": trigger["type"]}
+        if trigger.get("threshold") is not None:
+            trig["threshold"] = trigger["threshold"]
+        if isinstance(observed, (int, float)):
+            trig["observed"] = round(float(observed), 3)
+        if trigger.get("process"):
+            trig["process"] = trigger["process"]
+        return {
+            "schemaVersion": 1,
+            "traceType": TRACE_TYPE,
+            "trigger": trig,
+            "window": {"startUtc": iso(now - timedelta(seconds=span)), "stopUtc": iso(now), "lookbackSec": int(span)},
+            "tool": {"name": "perf", "version": self._perf_version(), "command": redact_home(" ".join(ts.recorder.command))},
+            "os": {"family": "linux", "build": platform.release()},
+            "hostToken": self.host_token(),
+            "agentVersion": AGENT_VERSION,
+        }
+
+    def submit_trace(self, r, key):
+        path = Path(r["file_path"])
+        if not path.exists():
+            return self.record_outcome(r, REJECTED, None, "the folded stacks file is gone")
+        self.queue.update(r["id"], state=SUBMITTING)
+        outcome, status, msg = self.trace_uploader(self.cfg["apiBaseUrl"], key, str(path), r["manifest"], self.hostname, path.name)
+        if outcome == AUTH and status == 403 and ("traces_disabled" in (msg or "") or "not enabled" in (msg or "")):
+            outcome = TRANSIENT  # the service has traces off: not the key's fault, try again later
+        result = self.record_outcome(r, outcome, status, msg)
+        if outcome == SUCCESS:
+            path.unlink(missing_ok=True)
+        return result
+
+    def trace_housekeeping(self):
+        """Delete what is no longer needed and keep the trace directory inside maxDiskMB: folded files of submitted or
+        skipped traces, leftover perf snapshots, then the oldest still-queued folded files (their rows fail)."""
+        d = self.trace_dir()
+        if not d.exists():
+            return
+        rows = {Path(r["file_path"]).name: r for r in self.queue.db.execute("SELECT * FROM dumps WHERE kind = 'trace'")}
+        now = time.time()
+        for f in d.iterdir():
+            if f.name.startswith("perf.data.") and now - f.stat().st_mtime > 300:
+                f.unlink(missing_ok=True)  # a dump nobody folded
+            elif f.suffix == ".folded":
+                row = rows.get(f.name)
+                if row is None or row["state"] in (SUBMITTED, SKIPPED):
+                    f.unlink(missing_ok=True)
+        budget = self.cfg["tracing"]["limits"]["maxDiskMB"] * 1024 * 1024
+        files = sorted((f for f in d.iterdir() if f.is_file()), key=lambda f: f.stat().st_mtime)
+        total = sum(f.stat().st_size for f in files)
+        for f in files:
+            if total <= budget:
+                break
+            if f.suffix == ".folded" or f.name.startswith("perf.data."):
+                total -= f.stat().st_size
+                f.unlink(missing_ok=True)
+                if f.name in rows and rows[f.name]["state"] not in (SUBMITTED, SKIPPED, FAILED):
+                    log.warning("dropped %s: the trace directory was over the %d MB limit", f.name, budget // (1024 * 1024))
+                    self.queue.update(rows[f.name]["id"], state=FAILED, last_error="dropped: over the maxDiskMB limit")
+
+    def stop_tracing(self):
+        if self.trace_state.recorder is not None:
+            self.trace_state.recorder.stop()
+
+    def run(self, once=False, stop=lambda: False):
+        if once and self.cfg["tracing"]["enabled"]:
+            log.warning("tracing needs the daemon (a recorder that stays running); `run --once` does not trace")
+        try:
+            while not stop():
+                settling = self.tick(trace=not once)
+                if once and not settling:
+                    return
+                time.sleep(self.cfg["pollSeconds"] if not once else min(self.cfg["pollSeconds"], 2))
+        finally:
+            self.stop_tracing()
 
 
 # --- CLI ---------------------------------------------------------------------
@@ -801,6 +1655,7 @@ def main(argv=None):
     for name in ("approve", "skip", "retry"):
         sub.add_parser(name, help=f"{name} a dump by id prefix (or 'all' for approve/skip of pending)").add_argument("id")
     sub.add_parser("set-api-key", help="read the API key from stdin and store it 0600")
+    sub.add_parser("trace-capture", help="ask the running daemon for a manual trace now (limits still apply)")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -821,6 +1676,14 @@ def main(argv=None):
         return 0
 
     cfg = load_config(config_dir / "config.json")
+    if args.cmd == "trace-capture":
+        if not cfg["tracing"]["enabled"]:
+            print("tracing is off in the config", file=sys.stderr)
+            return 1
+        (state_dir / "trace").mkdir(parents=True, exist_ok=True)
+        (state_dir / "trace" / "capture.request").write_text("")
+        print("requested; the daemon takes it on its next tick (see `status`)")
+        return 0
     agent = Agent(cfg, config_dir, state_dir)
     q = agent.queue
 
@@ -838,6 +1701,10 @@ def main(argv=None):
             for r in rows:
                 counts[r["state"]] = counts.get(r["state"], 0) + 1
             print(json.dumps(counts))
+            try:
+                print("tracing: " + json.dumps(json.loads((state_dir / "trace" / "status.json").read_text())))
+            except (OSError, ValueError):
+                pass
         for r in rows if args.cmd == "list" else []:
             print(f"{r['id'][:12]}  {r['state']:<15} {r['dump_type']:<13} {r['size_bytes']:>12}  {r['file_path']}"
                   + (f"  ({r['last_error']})" if r["last_error"] else ""))
