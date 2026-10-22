@@ -2,7 +2,11 @@
 # Installs the DumpTriage Linux agent as a background service.
 #
 #   installer/install.sh [--api-key-file FILE | --api-key-stdin] [--policy MODE]
-#                        [--api-url URL] [--watch PATH]... [--method METHOD] [--dry-run]
+#                        [--api-url URL] [--watch PATH]... [--method METHOD] [--with-perfetto] [--dry-run]
+#
+# --with-perfetto also installs `tracebox` (Perfetto's all-in-one recorder) beside the agent, for tracing.backend "perfetto":
+#   the release pinned in installer/perfetto.pin, downloaded over HTTPS and refused unless its SHA-256 is the one kept in that
+#   file. The default install needs only the distro's `perf` (see linux/configure-tracing.sh).
 #
 # Method (default auto):
 #   systemd-system  root, systemd present: system service (reads root-only dumps such as /var/crash)
@@ -15,7 +19,7 @@
 # Re-running upgrades the agent and keeps config.json, changing only the fields given as options.
 set -euo pipefail
 
-policy="" api_url="" method=auto key_file="" key_stdin=0 dry=0
+policy="" api_url="" method=auto key_file="" key_stdin=0 dry=0 with_perfetto=0
 watch=()
 here=$(cd "$(dirname "$0")" && pwd)
 agent_src=$here/../dumptriage_agent.py
@@ -31,6 +35,7 @@ while (($#)); do
     --api-url) api_url=${2:?}; shift 2 ;;
     --watch) watch+=("${2:?}"); shift 2 ;;
     --method) method=${2:?}; shift 2 ;;
+    --with-perfetto) with_perfetto=1; shift ;;
     --dry-run) dry=1; shift ;;
     -h | --help) sed -n '2,/^set -e/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown option $1" ;;
@@ -69,11 +74,50 @@ run mkdir -p "$lib" "$bin" "$cfg" "$state"
 run chmod 700 "$cfg" "$state"
 run install -m 0755 "$agent_src" "$agent"
 run ln -sf "$agent" "$cli"
+# The flight-recorder config the perfetto backend fills in; found next to the agent.
+if [[ -f $here/../perfetto/flight-recorder.pbtx ]]; then
+  run mkdir -p "$lib/perfetto"
+  run install -m 0644 "$here/../perfetto/flight-recorder.pbtx" "$lib/perfetto/flight-recorder.pbtx"
+fi
 # Wrapper so every invocation uses this install's config/state, whoever runs it.
 if ((!dry)); then
   printf '#!/bin/sh\nexec python3 %q --config-dir %q --state-dir %q "$@"\n' "$agent" "$cfg" "$state" >"$cli.tmp"
   chmod 0755 "$cli.tmp" && mv -f "$cli.tmp" "$cli"
 fi
+
+# tracebox, pinned and checksummed (--with-perfetto).
+install_tracebox() {
+  local pin=${DT_PERFETTO_PIN:-$here/perfetto.pin} arch url want got
+  [[ -f $pin ]] || die "cannot find $pin"
+  case $(uname -m) in
+    x86_64 | amd64) arch=amd64 ;;
+    aarch64 | arm64) arch=arm64 ;;
+    *) die "no pinned tracebox for $(uname -m) (amd64 and arm64 only)" ;;
+  esac
+  url=$(sed -n "s/^url_$arch=//p" "$pin")
+  want=$(sed -n "s/^sha256_$arch=//p" "$pin")
+  [[ -n $url && $want =~ ^[0-9a-f]{64}$ ]] || die "$pin has no usable url_$arch and sha256_$arch"
+  if ((dry)); then echo "+ download $url, require sha256 $want, install tracebox into $lib"; return; fi
+  tmp=$(mktemp -d)  # global, removed by the EXIT trap, which also covers die
+  trap '[[ -z ${tmp:-} ]] || rm -rf "$tmp"' EXIT
+  echo "Downloading tracebox ($(sed -n 's/^version=//p' "$pin"), $arch) ..."
+  if command -v curl >/dev/null; then curl -fsSL --max-time 300 -o "$tmp/perfetto.zip" "$url" || die "download of $url failed"
+  elif command -v wget >/dev/null; then wget -q -T 300 -O "$tmp/perfetto.zip" "$url" || die "download of $url failed"
+  else die "curl or wget is required for --with-perfetto"; fi
+  if command -v sha256sum >/dev/null; then got=$(sha256sum "$tmp/perfetto.zip" | cut -d' ' -f1); else got=$(shasum -a 256 "$tmp/perfetto.zip" | cut -d' ' -f1); fi
+  [[ $got == "$want" ]] || die "the download's SHA-256 is $got, not the pinned $want: not installing it"
+  python3 - "$tmp/perfetto.zip" "$tmp" <<'PY' || die "the archive has no tracebox"
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+name = next(n for n in z.namelist() if n.rsplit("/", 1)[-1] == "tracebox")
+open(sys.argv[2] + "/tracebox", "wb").write(z.read(name))
+PY
+  chmod 0755 "$tmp/tracebox"
+  "$tmp/tracebox" --version >/dev/null 2>&1 || die "the downloaded tracebox does not run on this host"
+  install -m 0755 "$tmp/tracebox" "$lib/tracebox"
+  echo "tracebox installed at $lib/tracebox: $("$lib/tracebox" --version 2>&1 | head -1)"
+}
+if ((with_perfetto)); then install_tracebox; fi
 
 # API key: file (then deleted) or stdin.
 if [[ -n $key_file ]]; then

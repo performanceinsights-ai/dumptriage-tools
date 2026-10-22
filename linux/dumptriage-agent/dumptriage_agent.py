@@ -26,6 +26,7 @@ import lzma
 import os
 import platform
 import re
+import resource
 import shutil
 import signal
 import socket
@@ -513,7 +514,16 @@ def open_by_other_process(path):
 # the agent decides when (triggers on /proc), keeps the recorder inside its limits, folds the snapshot to text on the
 # host and queues it like a dump. The shared trigger rules are tests/fixtures/tracing/triggers.json (#26).
 
-TRACE_TYPE = "folded"
+TRACE_TYPE = "folded"  # what the perf backend uploads; the perfetto backend uploads "perfetto"
+PERFETTO_TRACE_TYPE = "perfetto"
+PERFETTO_SUFFIX = ".perfetto-trace"
+PERFETTO_BUFFER_CAP_KB = 48 * 1024  # a trace is about its buffer's size, and the service takes at most 64 MiB (TRACE_MAX_BYTES)
+PERFETTO_BUFFER_START_KB = 32 * 1024
+PERFETTO_SIDE_BUFFER_KB = 2048  # buffers { size_kb: ... DISCARD } in perfetto/flight-recorder.pbtx: the process tree
+PERFETTO_STOP_DELAY_MS = 2000  # what a trigger keeps recording after it fires
+PERFETTO_SESSION_MS = 24 * 3600 * 1000  # a session nobody triggers ends after this and is started again
+PERFETTO_TRIGGER_WAIT_SECONDS = 30
+TRACE_SUFFIXES = (".folded", PERFETTO_SUFFIX)
 TRIGGER_TYPES = ("cpuPercent", "loadPerCpu", "psiSomeAvg10", "diskLatencyMs", "process", "hangEvent", "schedule")
 THRESHOLD_TYPES = ("cpuPercent", "loadPerCpu", "psiSomeAvg10", "diskLatencyMs", "process")
 SUBMISSION_MODES = ("AlwaysSubmit", "AskFirst", "NotifyOnly", "RuleBased")
@@ -521,6 +531,7 @@ SECONDS_PER_DAY = 86400
 PERF_MAX_STACK = 127
 FOLDED_MAX_BYTES = 8 * 1024 * 1024
 RECORDER_RETRY_SECONDS = 300
+BACKEND_RECHECK_SECONDS = 600
 RECORDER_START_GRACE_SECONDS = 3.0  # perf that dies this soon failed to start (no permission, no events)
 OVERHEAD_WINDOW_SECONDS = 60
 OVERHEAD_BACKOFF_SECONDS = 1800
@@ -533,8 +544,8 @@ def validate_tracing(tracing):
     backends would report them; an empty list means usable. Fail closed: the agent does not trace on a config it
     cannot read."""
     problems = []
-    if tracing.get("backend") != "perf":
-        problems.append(f"backend {tracing.get('backend')!r} is not available in this agent (perf is)")
+    if tracing.get("backend") not in ("perf", "perfetto"):
+        problems.append(f"backend {tracing.get('backend')!r} is not available in this agent (perf and perfetto are)")
     if tracing.get("submission") not in SUBMISSION_MODES:
         problems.append(f"submission {tracing.get('submission')!r} is not one of {', '.join(SUBMISSION_MODES)}")
     if not tracing.get("triggers"):
@@ -844,7 +855,7 @@ def fold_perf_script(lines, window_sec=None):
 
 # Upload
 
-def upload_trace(base_url, api_key, path, manifest_json, hostname, name="trace.folded", timeout=600):
+def upload_trace(base_url, api_key, path, manifest_json, hostname, name="trace.folded", timeout=600, content_type="text/plain"):
     """POST /api/v1/traces as multipart/form-data: the manifest.json text, the optional hostname and the folded
     stacks as `file`. Returns (outcome, status, message), like upload_dump."""
     u = urllib.parse.urlsplit(base_url)
@@ -855,7 +866,7 @@ def upload_trace(base_url, api_key, path, manifest_json, hostname, name="trace.f
             pre += f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"\r\n\r\n{value}\r\n'.encode()
     name = name.replace('"', "")
     pre += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
-            "Content-Type: text/plain\r\n\r\n").encode()
+            f"Content-Type: {content_type}\r\n\r\n").encode()
     post = f"\r\n--{boundary}--\r\n".encode()
     size = os.path.getsize(path)
     conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
@@ -890,7 +901,231 @@ def upload_trace(base_url, api_key, path, manifest_json, hostname, name="trace.f
 
 # The recorder
 
-class PerfRecorder:
+class Recorder:
+    """What both recorders (perf and perfetto) share with the agent: what they are called, what they upload, and that a session ending
+    by itself is a fault unless the recorder says it is not."""
+
+    kind = "perf"
+    trace_type = TRACE_TYPE
+    suffix = ".folded"
+
+    def ended_cleanly(self):
+        return False
+
+
+def trigger_name_for(name):
+    """The name a configured trigger has in the perfetto config and on `tracebox trigger_perfetto`: one place, so they cannot differ."""
+    return "pi_" + re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+
+
+def render_perfetto_config(template, buffer_kb, trigger_names, stop_delay_ms=PERFETTO_STOP_DELAY_MS, timeout_ms=PERFETTO_SESSION_MS):
+    """The flight-recorder config for these triggers: one `pi_<name>` trigger each, all of which stop the session."""
+    names = []
+    for name in trigger_names:
+        trigger = trigger_name_for(name)
+        if trigger not in names:
+            names.append(trigger)
+    block = "\n".join(f'  triggers {{ name: "{n}" stop_delay_ms: {stop_delay_ms} }}' for n in names)
+    return (template.replace("{{BUFFER_KB}}", str(int(buffer_kb))).replace("{{TRIGGER_TIMEOUT_MS}}", str(int(timeout_ms)))
+            .replace("{{TRIGGERS}}", block))
+
+
+def descendant_cpu_ticks(proc_root, pid):
+    """utime+stime of `pid` and every process below it: tracebox starts traced, traced_probes and traced_perf itself, and
+    the cost of the recorder is all of them."""
+    root = Path(proc_root)
+    children, ticks = {}, {}
+    try:
+        entries = [e for e in os.listdir(root) if e.isdigit()]
+    except OSError:
+        return None
+    for entry in entries:
+        try:
+            text = (root / entry / "stat").read_text()
+            rest = text[text.rfind(")") + 2:].split()
+            children.setdefault(rest[1], []).append(entry)
+            ticks[entry] = int(rest[11]) + int(rest[12])
+        except (OSError, ValueError, IndexError):
+            continue
+    if str(pid) not in ticks:
+        return None
+    total, stack = 0, [str(pid)]
+    while stack:
+        cur = stack.pop()
+        total += ticks.get(cur, 0)
+        stack.extend(children.get(cur, []))
+    return total
+
+
+def _raise_file_limit():
+    """The perf data source opens a few files per sampled process; the default 1024 runs out on a busy host
+    ("Too many open files" in proc_descriptors.cc, seen on the first real capture)."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    want = 65536 if hard == resource.RLIM_INFINITY else min(hard, 65536)
+    if soft == resource.RLIM_INFINITY or soft < want:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+
+
+class PerfettoRecorder(Recorder):
+    """`tracebox` in autostart mode with a STOP_TRACING flight-recorder config: a ring buffer that writes nothing until a
+    trigger. Unlike perf, a snapshot ends the session (the trace is written when it stops), so the recorder starts a new
+    one after every capture and has no history for the first seconds of it."""
+
+    kind = "perfetto"
+    trace_type = PERFETTO_TRACE_TYPE
+    suffix = PERFETTO_SUFFIX
+
+    def __init__(self, tracebox, template, trace_dir, ncpu, limits, trigger_names, proc_root="/proc", rate_bytes_per_sec=None):
+        self.tracebox, self.template, self.dir, self.ncpu = tracebox, template, Path(trace_dir), ncpu
+        self.limits, self.trigger_names, self.proc_root = limits, list(trigger_names), Path(proc_root)
+        self.rate = rate_bytes_per_sec
+        self.proc = None
+        self.log_path = self.dir / "perfetto.log"
+        self.config_path = self.dir / "flight-recorder.pbtx"
+        self.out_path = self.dir / "perfetto-recording.part"
+        self.sock_dir = None
+        self.command = []
+        self.started_wall = None
+        self.lookback = 0.0
+        self.cpu_ticks = None
+        self.session_buffer_kb = 0
+
+    def buffer_kb(self):
+        """The ring buffer: sized from the rate the last capture measured so it holds about maxDurationSec (with a quarter
+        to spare), within half the disk budget and the service's upload cap; the first session guesses 32 MiB."""
+        # The trace also holds the small process buffer (PERFETTO_SIDE_BUFFER_KB in the config), so the ring is the budget less that.
+        cap = max(min(self.limits["maxDiskMB"] * 1024 // 2, PERFETTO_BUFFER_CAP_KB) - PERFETTO_SIDE_BUFFER_KB, PERFETTO_SIDE_BUFFER_KB)
+        want = PERFETTO_BUFFER_START_KB
+        if self.rate:
+            want = int(self.rate * self.limits["maxDurationSec"] * 1.25 / 1024)
+        return max(min(want, cap), min(8192, cap))
+
+    def _env(self):
+        return dict(os.environ, PERFETTO_PRODUCER_SOCK_NAME=str(self.sock_dir / "p"), PERFETTO_CONSUMER_SOCK_NAME=str(self.sock_dir / "c"))
+
+    def start(self):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        # Sockets in their own 0700 directory with a short path (a unix socket path is limited to about 100 bytes): the sockets
+        # themselves are world-writable, so the directory is what keeps other users off the recorder.
+        parent = "/run" if os.geteuid() == 0 and os.path.isdir("/run") else (os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+        self.sock_dir = Path(tempfile.mkdtemp(prefix="dt-", dir=parent))
+        fd = os.open(self.config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            self.session_buffer_kb = self.buffer_kb()
+            f.write(render_perfetto_config(self.template, self.session_buffer_kb, self.trigger_names))
+        self.out_path.unlink(missing_ok=True)
+        self.command = [self.tracebox, "--txt", "-c", str(self.config_path), "-o", str(self.out_path)]
+        log_file = open(self.log_path, "wb")
+        try:
+            self.proc = subprocess.Popen(self.command, stdin=subprocess.DEVNULL, stdout=log_file, stderr=log_file, env=self._env(),
+                                         start_new_session=True, preexec_fn=_raise_file_limit)
+        except (OSError, subprocess.SubprocessError) as e:  # not executable here (wrong architecture, noexec), or the limit cannot be raised
+            self._cleanup()
+            raise OSError(f"tracebox could not be run: {e}") from e
+        finally:
+            log_file.close()
+        deadline = time.monotonic() + RECORDER_START_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                self._cleanup()
+                raise OSError(f"tracebox exited with {self.proc.returncode}: {self.tail()}")
+            time.sleep(min(0.1, RECORDER_START_GRACE_SECONDS))
+        self.started_wall = time.time()
+        self.cpu_ticks = None
+
+    def tail(self):
+        try:
+            return " ".join(self.log_path.read_text(errors="replace").split())[-300:]
+        except OSError:
+            return ""
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def ended_cleanly(self):
+        """The session ran out its trigger timeout with nobody asking: tracebox wrote the unwanted ring buffer and exited 0."""
+        return self.proc is not None and self.proc.poll() == 0
+
+    def _cleanup(self):
+        if self.sock_dir is not None:
+            shutil.rmtree(self.sock_dir, ignore_errors=True)
+            self.sock_dir = None
+
+    def discard_output(self):
+        self.out_path.unlink(missing_ok=True)
+        self._cleanup()
+
+    def snapshot(self, trigger_name):
+        """Fire the trigger, wait for the session to stop and write the file; its path. The session is over afterwards."""
+        if self.proc is None or self.sock_dir is None or not self.alive():
+            raise OSError("no recorder session is running (the last capture ended it); the next one starts on the next tick")
+        try:
+            fired = subprocess.run([self.tracebox, "trigger_perfetto", trigger_name_for(trigger_name)], env=self._env(), capture_output=True,
+                                   text=True, timeout=PERFETTO_TRIGGER_WAIT_SECONDS)
+        except subprocess.TimeoutExpired as e:
+            raise OSError("trigger_perfetto did not return") from e
+        if fired.returncode != 0:
+            raise OSError(f"trigger_perfetto exited with {fired.returncode}: {' '.join((fired.stderr or fired.stdout).split())[-200:]}")
+        try:
+            self.proc.wait(timeout=SNAPSHOT_WAIT_SECONDS * 2)
+        except subprocess.TimeoutExpired as e:
+            raise OSError("tracebox did not stop after the trigger") from e
+        code = self.proc.returncode
+        self.proc = None
+        self._cleanup()
+        if code != 0 or not self.out_path.exists() or self.out_path.stat().st_size == 0:
+            raise OSError(f"tracebox exited with {code} and wrote no trace: {self.tail()}")
+        age = max(time.time() - (self.started_wall or time.time()), 0.0)
+        size = self.out_path.stat().st_size
+        full = size >= 0.9 * self.session_buffer_kb * 1024  # a full ring has dropped its oldest data: size over age is then not the rate
+        if not full and age > 0:
+            self.rate = size / age  # the next ring buffer is sized from this
+        # The history the trace holds: the session's age while the ring has room, else what the ring holds at the known rate
+        # (at most maxDurationSec's worth if the rate is not known yet), never more than the age.
+        if not full:
+            self.lookback = age
+        elif self.rate:
+            self.lookback = min(size / self.rate, age)
+        else:
+            self.lookback = min(float(self.limits["maxDurationSec"]), age)
+        return self.out_path
+
+    def overhead_percent(self, now_wall):
+        """tracebox's CPU and that of the services it started, as a share of all CPUs since the last reading (60 s apart or more)."""
+        if self.proc is None or (self.cpu_ticks is not None and now_wall - self.cpu_ticks[0] < OVERHEAD_WINDOW_SECONDS):
+            return None  # not due: the scan reads every process on the host, so it is not done on every tick
+        ticks = descendant_cpu_ticks(self.proc_root, self.proc.pid)
+        if ticks is None:
+            return None
+        clk = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+        if self.cpu_ticks is None:
+            self.cpu_ticks = (now_wall, ticks)
+            return None
+        wall0, ticks0 = self.cpu_ticks
+        self.cpu_ticks = (now_wall, ticks)
+        return 100.0 * ((ticks - ticks0) / clk) / ((now_wall - wall0) * max(self.ncpu, 1))
+
+    def stop(self):
+        if self.proc is not None:
+            if self.proc.poll() is None:
+                # The whole process group: tracebox started traced, traced_probes and traced_perf, and killing only the leader would leave them sampling.
+                self._signal_group(signal.SIGTERM)
+                try:
+                    self.proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    self._signal_group(signal.SIGKILL)
+                    self.proc.wait()
+            self.proc = None
+        self.discard_output()
+
+    def _signal_group(self, sig):
+        try:
+            os.killpg(self.proc.pid, sig)  # start_new_session made tracebox the leader of its own group
+        except OSError:
+            self.proc.send_signal(sig)
+
+
+class PerfRecorder(Recorder):
     """`perf record -F 99 -a -g --overwrite --switch-output=signal`: a ring buffer that costs a bounded amount of
     memory and CPU and writes nothing until SIGUSR2, which dumps what it holds to `perf.data.<timestamp>`."""
 
@@ -939,7 +1174,7 @@ class PerfRecorder:
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
 
-    def snapshot(self):
+    def snapshot(self, trigger_name=None):
         """Dump the ring buffer now; the path of the new perf.data.<timestamp>."""
         before = set(self.dir.glob("perf.data.[0-9]*"))
         self.proc.send_signal(signal.SIGUSR2)
@@ -1011,16 +1246,23 @@ class TraceState:
         self.error = None
         self.overhead = None
         self.warned_hang = False
-        self.perf_version = None
+        self.tool_version = None
+        self.backend = "perf"
+        self.backend_note = None  # why the configured backend is not the one running
+        self.backend_check_at = 0.0
+        self.template = None
+        self.tracebox_version = None
+        self.perfetto_rate = None
 
 
 class Agent:
     def __init__(self, config, config_dir, state_dir, queue=None, uploader=upload_dump, clock=utcnow,
-                 trace_uploader=upload_trace, perf_bin=None, proc_root="/proc"):
+                 trace_uploader=upload_trace, perf_bin=None, proc_root="/proc", tracebox_bin=None, tracefs_dirs=None):
         self.cfg, self.config_dir, self.state_dir = config, Path(config_dir), Path(state_dir)
         self.queue = queue or Queue(self.state_dir / "queue.db", clock)
         self.uploader, self.clock = uploader, clock
         self.trace_uploader, self.perf_bin, self.proc_root = trace_uploader, perf_bin, proc_root
+        self.tracebox_bin, self.tracefs_dirs = tracebox_bin, tracefs_dirs or ("/sys/kernel/tracing", "/sys/kernel/debug/tracing")
         self.trace_state = TraceState()
         self.stable = {}  # path -> (size, mtime_ns, first_seen_unchanged_monotonic)
         self.ignored = set()  # (path, size, mtime_ns) already sniffed as not-a-dump
@@ -1240,7 +1482,7 @@ class Agent:
             self.queue.set_meta("auth_refusals", "0")
             self.queue.update(r["id"], state=SUBMITTED, submitted_at_utc=iso(self.clock()), last_error=None)
         elif outcome in (REJECTED, QUOTA):
-            log.warning("dump %s rejected (%s): %s", r["file_path"], status, msg)
+            log.warning("%s %s rejected (%s): %s", r["kind"], r["file_path"], status, msg)
             self.queue.update(r["id"], state=FAILED, last_error=f"{status}: {msg}")
         elif outcome == AUTH:
             # Not the dump's fault and no attempt used: the key is wrong, revoked or rotated.
@@ -1257,7 +1499,7 @@ class Agent:
         else:
             n = r["retry_count"] + 1
             if n >= self.cfg["maxRetries"]:
-                log.error("dump %s failed after %d attempts: %s", r["file_path"], n, msg)
+                log.error("%s %s failed after %d attempts: %s", r["kind"], r["file_path"], n, msg)
                 self.queue.update(r["id"], state=FAILED, retry_count=n, last_error=msg)
             else:
                 delay = min(30 * 2 ** n, 3600)
@@ -1340,7 +1582,8 @@ class Agent:
 
     def _write_trace_status(self, **fields):
         ts = self.trace_state
-        status = {"enabled": self.cfg["tracing"]["enabled"], "recorder": "running" if ts.recorder and ts.recorder.alive() else "stopped",
+        status = {"enabled": self.cfg["tracing"]["enabled"], "backend": ts.backend, "backendNote": ts.backend_note,
+                  "recorder": "running" if ts.recorder and ts.recorder.alive() else "stopped",
                   "error": ts.error, "overheadPercent": None if ts.overhead is None else round(ts.overhead, 3),
                   "updatedUtc": iso(self.clock()), **fields}
         previous = {}
@@ -1383,11 +1626,37 @@ class Agent:
                     ts.warned_hang = True
             elif trig["type"] != "schedule":
                 ts.runners.append((trig, TriggerRunner(trig)))
-        if self.perf_bin is None:
-            self.perf_bin = shutil.which("perf")
-        if not self.perf_bin:
-            ts.disabled, ts.error = True, "perf is not installed (run linux/configure-tracing.sh)"
-            log.error("tracing is off: %s", ts.error)
+        ts.backend = tr["backend"]
+        if ts.backend == "perfetto":
+            reason = self._perfetto_unavailable()
+            if reason:
+                log.warning("the perfetto backend is not available (%s); using perf", reason)
+                ts.backend, ts.backend_note = "perf", reason
+        if ts.backend == "perf":
+            if self.perf_bin is None:
+                self.perf_bin = shutil.which("perf")
+            if not self.perf_bin:
+                ts.disabled, ts.error = True, "perf is not installed (run linux/configure-tracing.sh)"
+                log.error("tracing is off: %s", ts.error)
+
+    def _perfetto_unavailable(self):
+        """Why the perfetto backend cannot run here (None if it can): tracebox, the flight-recorder config and tracefs."""
+        ts = self.trace_state
+        here = Path(__file__).resolve().parent
+        if self.tracebox_bin is None:
+            candidates = [os.environ.get("DUMPTRIAGE_TRACEBOX"), str(here / "tracebox"), "/usr/local/lib/dumptriage/tracebox",
+                          str(Path.home() / ".local/lib/dumptriage/tracebox"), shutil.which("tracebox")]
+            self.tracebox_bin = next((c for c in candidates if c and os.access(c, os.X_OK) and Path(c).is_file()), None)
+        if not self.tracebox_bin or not (Path(self.tracebox_bin).is_file() and os.access(self.tracebox_bin, os.X_OK)):
+            return "tracebox is not installed (installer/install.sh --with-perfetto)"
+        templates = [here / "perfetto" / "flight-recorder.pbtx", Path("/usr/local/lib/dumptriage/perfetto/flight-recorder.pbtx")]
+        template = next((t for t in templates if t.is_file()), None)
+        if template is None:
+            return "the flight-recorder config perfetto/flight-recorder.pbtx is missing"
+        ts.template = template.read_text()
+        if not any(os.access(os.path.join(d, "available_events"), os.R_OK) for d in self.tracefs_dirs):
+            return "tracefs is not readable here (not mounted, or not running as root)"
+        return None
 
     def trace_tick(self):
         tr = self.cfg["tracing"]
@@ -1402,12 +1671,30 @@ class Agent:
         t = now.timestamp()
         limits = tr["limits"]
         self.trace_housekeeping()
+        if ts.backend_note and tr["backend"] == "perfetto" and t >= ts.backend_check_at:
+            # Fell back to perf: look again now and then (tracefs mounted late, tracebox installed since, a config restored).
+            ts.backend_check_at = t + BACKEND_RECHECK_SECONDS
+            if self._perfetto_unavailable() is None:
+                log.info("the perfetto backend is available now; switching from perf")
+                if ts.recorder is not None:
+                    ts.recorder.stop()
+                    ts.recorder = None
+                ts.backend, ts.backend_note = "perfetto", None
         if ts.recorder is None:
-            ts.recorder = PerfRecorder(self.perf_bin, self.trace_dir(), self._ncpu(), limits["maxDiskMB"], self.proc_root)
+            if ts.backend == "perfetto":
+                names = [t["name"] for t in tr["triggers"] if t["type"] != "hangEvent"] + ["manual"]
+                ts.recorder = PerfettoRecorder(self.tracebox_bin, ts.template, self.trace_dir(), self._ncpu(), limits, names, self.proc_root,
+                                               float(self.queue.meta("perfetto_bytes_per_sec") or 0) or None)
+            else:
+                ts.recorder = PerfRecorder(self.perf_bin, self.trace_dir(), self._ncpu(), limits["maxDiskMB"], self.proc_root)
+        if ts.recorder.proc is not None and not ts.recorder.alive() and ts.recorder.ended_cleanly():
+            log.info("the perfetto session ran out its timeout with no trigger; starting a new one")
+            ts.recorder.discard_output()
+            ts.recorder.proc = None
         if ts.recorder.proc is not None and not ts.recorder.alive():
             # It started and then died (killed, out of memory, a perf error): wait before starting it again, so a recorder that
             # dies every few seconds is not restarted, with the start grace each time, on every tick.
-            ts.error = f"the perf recorder exited ({ts.recorder.proc.returncode}): {ts.recorder.tail()}"
+            ts.error = f"the {ts.recorder.kind} recorder exited ({ts.recorder.proc.returncode}): {ts.recorder.tail()}"
             ts.recorder.proc = None
             ts.recorder_retry_at = t + RECORDER_RETRY_SECONDS
             log.error("%s; trying again in %d s", ts.error, RECORDER_RETRY_SECONDS)
@@ -1419,8 +1706,8 @@ class Agent:
                 ts.recorder.start()
                 ts.error = None
                 log.info("trace recorder started: %s", " ".join(ts.recorder.command))
-            except OSError as e:
-                ts.error = f"the perf recorder could not start: {e}"
+            except (OSError, subprocess.SubprocessError) as e:
+                ts.error = f"the {ts.recorder.kind} recorder could not start: {e}"
                 ts.recorder_retry_at = t + RECORDER_RETRY_SECONDS
                 log.error("%s; trying again in %d s", ts.error, RECORDER_RETRY_SECONDS)
                 self._write_trace_status()
@@ -1431,7 +1718,7 @@ class Agent:
         if overhead is not None:
             ts.overhead = overhead
             if overhead > limits["maxOverheadPercent"]:
-                ts.error = f"the perf recorder used {overhead:.2f}% of the machine's CPU, over the {limits['maxOverheadPercent']}% limit"
+                ts.error = f"the {ts.recorder.kind} recorder used {overhead:.2f}% of the machine's CPU, over the {limits['maxOverheadPercent']}% limit"
                 log.error("%s; stopping it for %d minutes", ts.error, OVERHEAD_BACKOFF_SECONDS // 60)
                 ts.recorder.stop()
                 ts.recorder_retry_at = t + OVERHEAD_BACKOFF_SECONDS
@@ -1468,15 +1755,18 @@ class Agent:
     def _ncpu(self):
         return os.cpu_count() or 1
 
-    def _perf_version(self):
+    def _tool_version(self):
+        """`perf version 6.8.12` or `Perfetto v58.2-add693d8b (add693d...)`: the version word."""
         ts = self.trace_state
-        if ts.perf_version is None:
+        if ts.tool_version is None:
+            binary, index = (self.tracebox_bin, 1) if ts.backend == "perfetto" else (self.perf_bin, -1)
             try:
-                out = subprocess.run([self.perf_bin, "--version"], capture_output=True, text=True, timeout=10).stdout
-                ts.perf_version = (out.split() or ["", "", "unknown"])[-1]
+                out = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=10).stdout.splitlines()
+                words = (out[0].split() if out else []) or ["", "unknown"]
+                ts.tool_version = words[index] if len(words) > 1 else "unknown"
             except (OSError, subprocess.SubprocessError):
-                ts.perf_version = "unknown"
-        return ts.perf_version
+                ts.tool_version = "unknown"
+        return ts.tool_version
 
     def capture_trace(self, trigger, observed, now):
         """Dump the ring buffer, fold it on the host, write manifest.json and queue the result. The raw perf.data is
@@ -1484,38 +1774,53 @@ class Agent:
         tr, ts = self.cfg["tracing"], self.trace_state
         limits = tr["limits"]
         t = now.timestamp()
+        if not ts.recorder.alive():  # a perfetto capture ends its session: a second trigger in the same tick has nothing to stop
+            log.warning("trigger %s met while no recorder session is running; no capture", trigger["name"])
+            return None
         history = self._trace_history()
         # Recorded first: a capture that fails or comes up empty still counts, so a broken recorder cannot be asked in a loop.
         self.queue.set_meta("trace_captures", json.dumps([a for a in history if a > t - 2 * SECONDS_PER_DAY] + [t]))
+        recorder = ts.recorder
         try:
-            snapshot = ts.recorder.snapshot()
+            snapshot = recorder.snapshot(trigger["name"])
         except OSError as e:
             ts.error = f"capture for trigger {trigger['name']} failed: {e}"
             log.error(ts.error)
             return None
+        folded = None
         try:
             if snapshot.stat().st_size > limits["maxDiskMB"] * 1024 * 1024:
-                ts.error = f"the perf snapshot is over the {limits['maxDiskMB']} MB disk limit and was discarded"
+                ts.error = f"the {recorder.kind} snapshot is over the {limits['maxDiskMB']} MB disk limit and was discarded"
                 log.error(ts.error)
+                snapshot.unlink(missing_ok=True)
                 return None
-            folded = self.fold_snapshot(snapshot, limits["maxDurationSec"])
+            if recorder.kind == "perf":
+                folded = self.fold_snapshot(snapshot, limits["maxDurationSec"])
         except (OSError, subprocess.SubprocessError) as e:
             ts.error = f"capture for trigger {trigger['name']} failed: {e}"
             log.error(ts.error)
+            snapshot.unlink(missing_ok=True)
             return None
         finally:
-            snapshot.unlink(missing_ok=True)
-        if folded.samples == 0:
+            if recorder.kind == "perf":  # folded: the raw perf.data is not kept. A perfetto trace is the thing to send, adopted below.
+                snapshot.unlink(missing_ok=True)
+        if recorder.kind == "perf" and folded.samples == 0:
             log.warning("capture for trigger %s held no samples; nothing queued", trigger["name"])
             return None
         trace_id = hashlib.sha256(f"trace|{trigger['name']}|{t}|{uuid.uuid4().hex}".encode()).hexdigest()[:32]
         self.trace_dir().mkdir(parents=True, exist_ok=True)
-        path = self.trace_dir() / f"{trace_id}-{trigger['name']}.folded"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(folded.text())
+        path = self.trace_dir() / f"{trace_id}-{trigger['name']}{recorder.suffix}"
+        if recorder.kind == "perf":
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(folded.text())
+        else:
+            # The binary trace as tracebox wrote it, adopted under its own name. Never read on the host.
+            os.chmod(snapshot, 0o600)
+            os.replace(snapshot, path)
+            self.queue.set_meta("perfetto_bytes_per_sec", str(int(recorder.rate or 0)))
         manifest = self.trace_manifest(trigger, observed, now, folded)
-        row = dict(id=trace_id, file_path=str(path), size_bytes=path.stat().st_size, dump_type=TRACE_TYPE, compression=None,
+        row = dict(id=trace_id, file_path=str(path), size_bytes=path.stat().st_size, dump_type=recorder.trace_type, compression=None,
                    state=DETECTED, detected_at_utc=iso(now), kind="trace", manifest=json.dumps(manifest))
         policy = dict(self.cfg["policy"], mode=tr["submission"])
         outcome = evaluate_policy(row, policy, now.astimezone())
@@ -1530,8 +1835,8 @@ class Agent:
             row["state"] = SKIPPED
         self.queue.add(**row)
         self._write_trace_status(lastCaptureUtc=iso(now))
-        log.info("captured trace %s for trigger %s (%d samples, %.0f s) -> %s [id %s]",
-                 path.name, trigger["name"], folded.samples, folded.span, row["state"], trace_id[:12])
+        detail = f"{folded.samples} samples, {folded.span:.0f} s" if folded is not None else f"{row['size_bytes']} bytes, {recorder.lookback:.0f} s"
+        log.info("captured trace %s for trigger %s (%s) -> %s [id %s]", path.name, trigger["name"], detail, row["state"], trace_id[:12])
         if row["state"] == PENDING:
             log.warning("trace %s awaits approval: run `dumptriage-agent approve %s` or `skip %s`", path.name, trace_id[:12], trace_id[:12])
         return trace_id
@@ -1562,7 +1867,7 @@ class Agent:
         """manifest.json (schemas/trace-manifest.schema.json). The window is the folded samples' own span ending when
         the trigger fired: the header's `sample duration` is 0 in a --switch-output dump, so it is not used."""
         ts = self.trace_state
-        span = folded.span
+        span = folded.span if folded is not None else ts.recorder.lookback
         trig = {"name": trigger["name"], "type": trigger["type"]}
         if trigger.get("threshold") is not None:
             trig["threshold"] = trigger["threshold"]
@@ -1572,10 +1877,10 @@ class Agent:
             trig["process"] = trigger["process"]
         return {
             "schemaVersion": 1,
-            "traceType": TRACE_TYPE,
+            "traceType": ts.recorder.trace_type,
             "trigger": trig,
             "window": {"startUtc": iso(now - timedelta(seconds=span)), "stopUtc": iso(now), "lookbackSec": int(span)},
-            "tool": {"name": "perf", "version": self._perf_version(), "command": redact_home(" ".join(ts.recorder.command))},
+            "tool": {"name": ts.recorder.kind, "version": self._tool_version(), "command": redact_home(" ".join(ts.recorder.command))},
             "os": {"family": "linux", "build": platform.release()},
             "hostToken": self.host_token(),
             "agentVersion": AGENT_VERSION,
@@ -1586,7 +1891,9 @@ class Agent:
         if not path.exists():
             return self.record_outcome(r, REJECTED, None, "the folded stacks file is gone")
         self.queue.update(r["id"], state=SUBMITTING)
-        outcome, status, msg = self.trace_uploader(self.cfg["apiBaseUrl"], key, str(path), r["manifest"], self.hostname, path.name)
+        binary = r["dump_type"] == PERFETTO_TRACE_TYPE
+        outcome, status, msg = self.trace_uploader(self.cfg["apiBaseUrl"], key, str(path), r["manifest"], self.hostname, path.name,
+                                                   content_type="application/octet-stream" if binary else "text/plain")
         if outcome == AUTH and status == 403 and ("traces_disabled" in (msg or "") or "not enabled" in (msg or "")):
             outcome = TRANSIENT  # the service has traces off: not the key's fault, try again later
         result = self.record_outcome(r, outcome, status, msg)
@@ -1605,7 +1912,7 @@ class Agent:
         for f in d.iterdir():
             if f.name.startswith("perf.data.") and now - f.stat().st_mtime > 300:
                 f.unlink(missing_ok=True)  # a dump nobody folded
-            elif f.suffix == ".folded":
+            elif f.suffix in (".folded", PERFETTO_SUFFIX):
                 row = rows.get(f.name)
                 if row is None or row["state"] in (SUBMITTED, SKIPPED):
                     f.unlink(missing_ok=True)
@@ -1615,7 +1922,7 @@ class Agent:
         for f in files:
             if total <= budget:
                 break
-            if f.suffix == ".folded" or f.name.startswith("perf.data."):
+            if f.suffix in (".folded", PERFETTO_SUFFIX) or f.name.startswith("perf.data."):
                 total -= f.stat().st_size
                 f.unlink(missing_ok=True)
                 if f.name in rows and rows[f.name]["state"] not in (SUBMITTED, SKIPPED, FAILED):

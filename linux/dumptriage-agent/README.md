@@ -128,7 +128,7 @@ sudo linux/configure-tracing.sh                    # installs perf; see its head
 ```jsonc
 "tracing": {
   "enabled": true,
-  "backend": "perf",                  // the only backend in this agent
+  "backend": "perf",                  // perf (default: folded stacks) | perfetto (a binary trace, parsed on a worker; below)
   "submission": "AskFirst",           // AlwaysSubmit | AskFirst | NotifyOnly | RuleBased: held for approval by default
   "triggers": [
     { "name": "cpu-high",  "type": "cpuPercent",    "threshold": 90, "sustainSec": 30 },
@@ -189,6 +189,51 @@ from the hostname. The hostname field is sent as for dumps (`sendHostname`), and
 
 **Redaction on the host:** home directories become `<user>` in every frame name and in the command line. Command-line arguments of other
 processes are never read.
+
+### The perfetto backend (dumptriage-tools#28)
+
+`"backend": "perfetto"` runs [`tracebox`](https://perfetto.dev/docs/) (Perfetto's all-in-one recorder) instead of perf, for what an on-CPU
+profile cannot show: scheduling, wakeups, why a thread was off the CPU, run-queue latency, CPU frequency, interrupts and block I/O,
+beside CPU samples with kernel and DWARF-unwound user stacks. It is opt-in (perf stays the default) and needs more of the host.
+
+```sh
+sudo linux/dumptriage-agent/installer/install.sh --with-perfetto     # adds tracebox, pinned and checksummed (installer/perfetto.pin)
+```
+
+The installer downloads the release named in [`installer/perfetto.pin`](dumptriage-agent/installer/perfetto.pin) (Perfetto v58.2, amd64 and arm64) over HTTPS and
+refuses to install it unless its SHA-256 is the one kept in that file. The agent runs `tracebox --txt -c <config> -o <file>` with the shipped
+[`perfetto/flight-recorder.pbtx`](perfetto/flight-recorder.pbtx), filled in with the ring-buffer size and **one `pi_<name>` trigger per configured trigger
+name** (and `pi_manual`), all `STOP_TRACING`. The session records into the ring buffer and writes nothing until a trigger: the agent then runs
+`tracebox trigger_perfetto pi_<name>` (the ticket's draft said `--trigger`; the real applet is `trigger_perfetto`), waits for the file, writes
+`manifest.json` (`traceType` `perfetto`, `tool.name` `perfetto`) and queues the **binary** like any trace (held for approval by default, uploaded as
+`application/octet-stream`). It is never parsed on the host or in the backend, only on a worker.
+
+- **Limits.** `maxDiskMB`: the ring buffer is at most half of it and at most 48 MiB (the service takes 64 MiB); a trace over the budget is discarded.
+  `maxDurationSec`: the buffer is sized from the byte rate the last capture measured, to hold about that many seconds with a quarter to spare (the first
+  session guesses 32 MiB). `maxOverheadPercent`: the CPU of tracebox **and the services it starts** (`traced`, `traced_probes`, `traced_perf`), as for perf.
+  `cooldownMin`, `dailyCap`: as for perf.
+- **A capture ends the session** (the trace is written when it stops), so a new one starts at once and has no history for its first seconds. A session nobody
+  triggered ends after 24 hours; its ring buffer is thrown away and a new one starts.
+- **It falls back to perf, with a log line saying why,** if `tracebox` is not installed (looked for in `DUMPTRIAGE_TRACEBOX`, next to the agent,
+  `/usr/local/lib/dumptriage/`, `~/.local/lib/dumptriage/` and `PATH`), the config is missing, or tracefs (`/sys/kernel/tracing` or `/sys/kernel/debug/tracing`) is not readable.
+- **Privacy: a Perfetto trace holds every process's command line, arguments included.** `linux.process_stats` records them (954 process rows of the agent's real
+  trace had a command line, e.g. `--config.file=...` and `-H fd://`) and the host cannot redact a binary. That is why a trace is held for approval by default, and why the service drops arguments
+  when it parses one (website#2001). Do not set `AlwaysSubmit` on a host whose command lines carry secrets.
+
+**Measured on rob-dev (Ubuntu 24.04, kernel 6.8.0-147, 8 vCPU KVM guest, tracebox v58.2, 2026-10-22), one run each unless said:**
+
+| What | Result |
+|---|---|
+| A trigger-stopped session writes a valid trace | yes, with `ulimit -n` raised: `trace_processor_shell` reads it (352,230 `sched_slice` rows, 728,924 `thread_state`, 10,378 to 11,521 `perf_sample`, 873 processes, 2,895 threads) |
+| Trace size per minute on a busy host | 15.99 MB for 14.75 s and 18.01 MB for 15 s: **about 1.1 to 1.2 MB/s, 65 to 72 MB a minute** with the shipped config and the CI runners and containers of a busy host; a 48 MiB ring holds about 40 s here |
+| Recorder CPU, own processes only | 2.45 CPU-seconds in 28 s on 8 CPUs with six busy loops: **1.1% of the machine** (below the 2% target; this sees only tracebox and its children, not the kernel's cost of sampling, which is charged to whatever was running, so the target is not verified) |
+| `linux.perf` with all processes on a default `ulimit -n` (1024) | `proc_descriptors.cc: Failed to open /proc/<pid>/maps (errno: 24, Too many open files)` for most processes: the agent raises the limit for tracebox to 65536 |
+| Unix socket path | `traced` refuses a path longer than about 100 bytes (`errno 36, File name too long`), which is what a state-directory path usually is: the agent uses a `0700` directory with a short path (`/run/dt-XXXXXXXX`; the sockets themselves are world-writable, so the directory is what keeps other users off) |
+| Import warning | `perf_samples_skipped: 115` ("a process will be absent from the trace, no data loss for the rest") |
+| Privileges | run as root; `perf_event_paranoid` is 4 on this host and does not matter to root. Non-root, containers, Debian 12 and RHEL 9 were **not** run |
+
+Not verified: tracefs on Debian 12, RHEL 9, Ubuntu 22.04 and container hosts; the `perf_event_paranoid` value `linux.perf` needs for a non-root agent;
+the real ring-buffer overhead on a quiet host (the A/B on a shared VM is inside its noise, as for perf).
 
 **Checked on real perf** (a one-snapshot capture per tool, 2026-10-21, host kernel 6.8.0-147, containers `--privileged`): Ubuntu 22.04
 (perf 5.15.216), Ubuntu 24.04 (6.8.12), Debian 12 (6.1.190) and Rocky Linux 9, the RHEL 9 family (5.14.0-687.58.1.el9_8). On all four,

@@ -345,8 +345,10 @@ class AgentTracingTests(unittest.TestCase):
         cfg = da.merge(da.DEFAULT_CONFIG, {"sendHostname": False, "watchedPaths": [str(self.tmp / "watch")], "tracing": tr})
         (self.tmp / "watch").mkdir(exist_ok=True)
 
-        def uploader(base, key, path, manifest, hostname, name):
-            self.uploads.append({"path": path, "manifest": manifest, "name": name, "body": Path(path).read_text(), "key": key})
+        def uploader(base, key, path, manifest, hostname, name, content_type="text/plain"):
+            body = Path(path).read_bytes()
+            self.uploads.append({"path": path, "manifest": manifest, "name": name, "key": key, "content_type": content_type,
+                                 "bytes": body, "body": body.decode("utf-8", "replace")})
             return kw.pop("outcome", (da.SUCCESS, 201, None))
 
         a = da.Agent(cfg, self.config, self.state, clock=lambda: self.now, trace_uploader=uploader,
@@ -629,8 +631,8 @@ class AgentTracingTests(unittest.TestCase):
         self.advance(a, 5)
         orig = a.trace_state.recorder.snapshot
 
-        def big():
-            p = orig()
+        def big(*args):
+            p = orig(*args)
             with open(p, "ab") as f:
                 f.truncate(2 * 1024 * 1024)
             return p
@@ -667,7 +669,9 @@ class AgentTracingTests(unittest.TestCase):
         (self.config / "api-key").write_text("dts_key\n")
         a.queue.add(id="gone", file_path=str(self.state / "trace" / "gone.folded"), size_bytes=1, dump_type="folded",
                     state=da.QUEUED, detected_at_utc=da.iso(self.now), kind="trace", manifest="{}")
-        a.submit_due()
+        with self.assertLogs("dumptriage", "WARNING") as logs:
+            a.submit_due()
+        self.assertIn("trace " + str(self.state), "\n".join(logs.output))  # a trace says so, not "dump"
         self.assertEqual(a.queue.get("gone")["state"], da.FAILED)
         self.assertIn("gone", a.queue.get("gone")["last_error"])
 

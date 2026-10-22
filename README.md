@@ -69,6 +69,7 @@ dotnet test windows/dumptriage-agent/tests/DumpTriageAgent.Tests
 pwsh -NoProfile -File windows/dumptriage-agent/installer/tests/Test-Install.ps1
 bash macos/tests/test_collect.sh
 bash linux/tests/test_configure_tracing.sh
+bash linux/tests/test_install_perfetto.sh
 pwsh -NoProfile -File rmm/ninjaone/tests/Run-Tests.ps1
 ```
 
