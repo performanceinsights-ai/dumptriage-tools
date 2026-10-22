@@ -21,6 +21,7 @@ jobs:
       - run: python3 -m unittest discover -s linux/dumptriage-agent/tests
       - run: bash -n linux/configure-dumps.sh linux/configure-tracing.sh linux/dumptriage-agent/installer/*.sh
       - run: bash linux/tests/test_configure_tracing.sh
+      - run: bash linux/tests/test_install_perfetto.sh
 
   windows-agent-common:
     runs-on: ubuntu-latest

@@ -1,0 +1,45 @@
+# DumpTriage Perfetto flight recorder (website#1999, dumptriage-tools#28). The agent fills the three markers in double braces below and runs
+#   tracebox --txt -c <this, filled> -o <out>
+# The session records into a ring buffer and does nothing until a trigger (`tracebox trigger_perfetto pi_<name>`) stops it,
+# when the buffer is written to <out>. The trace is a binary: it is uploaded as is and parsed on a worker, never on the host.
+buffers { size_kb: {{BUFFER_KB}} fill_policy: RING_BUFFER }
+buffers { size_kb: 2048 fill_policy: DISCARD }
+
+# Process and thread names and pids. Note: process_stats records each process's command line, which can hold arguments;
+# the trace is held for approval by default and the service drops arguments when it parses it.
+data_sources { config { name: "linux.process_stats" target_buffer: 1
+  process_stats_config { scan_all_processes_on_start: true proc_stats_poll_ms: 5000 } } }
+
+# Scheduling, waking, frequency, idle, interrupts and block I/O: what an on-CPU profile cannot show (off-CPU time and why).
+data_sources { config { name: "linux.ftrace" target_buffer: 0
+  ftrace_config {
+    ftrace_events: "sched/sched_switch"
+    ftrace_events: "sched/sched_waking"
+    ftrace_events: "sched/sched_process_exit"
+    ftrace_events: "sched/sched_process_free"
+    ftrace_events: "task/task_newtask"
+    ftrace_events: "task/task_rename"
+    ftrace_events: "power/cpu_frequency"
+    ftrace_events: "power/cpu_idle"
+    ftrace_events: "irq/irq_handler_entry"
+    ftrace_events: "irq/irq_handler_exit"
+    ftrace_events: "irq/softirq_entry"
+    ftrace_events: "irq/softirq_exit"
+    ftrace_events: "block/block_rq_issue"
+    ftrace_events: "block/block_rq_complete"
+    compact_sched { enabled: true }
+  } } }
+
+# CPU samples with kernel and user call stacks, 99 Hz, every process (perf_event_open: root, or perf_event_paranoid <= 0).
+# User stacks are unwound with DWARF (.eh_frame), so a binary built without frame pointers still resolves.
+data_sources { config { name: "linux.perf" target_buffer: 0
+  perf_event_config {
+    timebase { frequency: 99 timestamp_clock: PERF_CLOCK_MONOTONIC }
+    callstack_sampling { scope { } kernel_frames: true }
+  } } }
+
+trigger_config {
+  trigger_mode: STOP_TRACING
+  trigger_timeout_ms: {{TRIGGER_TIMEOUT_MS}}
+{{TRIGGERS}}
+}
