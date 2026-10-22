@@ -112,6 +112,93 @@ user. The log names the link that was refused, or the real error if a watched pa
 Central copies are written under a temporary name and moved into place, so a failed copy leaves nothing
 behind.
 
+## Performance tracing (website#1999)
+
+Off by default. With the `tracing` section enabled, the daemon keeps a `perf` flight recorder running, watches `/proc` for a
+trigger, and when one fires it folds the recorder's snapshot to stacks **on the host**, queues the result like a dump and
+uploads it to `POST /api/v1/traces`. Only text leaves the host: folded stacks (`process;frame;...;frame count`, a kernel
+frame ending in `_[k]`, as `stackcollapse-perf.pl --kernel` writes them) and a `manifest.json`. The raw `perf.data` is
+deleted as soon as it is folded. The service must have traces on (`TRACES_ENABLED`); until then the upload is refused and
+retried.
+
+```sh
+sudo linux/configure-tracing.sh                    # installs perf; see its header for what else it can do
+```
+
+```jsonc
+"tracing": {
+  "enabled": true,
+  "backend": "perf",                  // the only backend in this agent
+  "submission": "AskFirst",           // AlwaysSubmit | AskFirst | NotifyOnly | RuleBased: held for approval by default
+  "triggers": [
+    { "name": "cpu-high",  "type": "cpuPercent",    "threshold": 90, "sustainSec": 30 },
+    { "name": "sql-busy",  "type": "process",       "process": "sqlservr", "threshold": 150, "sustainSec": 20 },
+    { "name": "io-slow",   "type": "diskLatencyMs", "threshold": 100, "sustainSec": 10 },
+    { "name": "pressure",  "type": "psiSomeAvg10",  "threshold": 20,  "sustainSec": 30 },
+    { "name": "load",      "type": "loadPerCpu",    "threshold": 2,   "sustainSec": 60 },
+    { "name": "baseline",  "type": "schedule",      "intervalMin": 1440 }
+  ],
+  "limits": { "maxDurationSec": 60, "maxDiskMB": 512, "maxOverheadPercent": 2, "cooldownMin": 60, "dailyCap": 4 }
+}
+```
+
+The keys are the shared contract ([`schemas/tracing-config.schema.json`](../../schemas/tracing-config.schema.json)); the agent checks
+the section and turns tracing off, saying why in the log, if it does not read.
+
+| Trigger | Reads | Value |
+|---|---|---|
+| `cpuPercent` | `/proc/stat` | percent of all CPUs busy (not idle, not iowait); with `process`, percent of **one** CPU used by processes of that name (`comm`, 15 characters) |
+| `process` | `/proc/<pid>/stat` | the same per-process percent (needs `process`) |
+| `loadPerCpu` | `/proc/loadavg` | the 1-minute load divided by the CPU count |
+| `psiSomeAvg10` | `/proc/pressure/{cpu,io,memory}` | the highest `some avg10` of the three |
+| `diskLatencyMs` | `/proc/diskstats` | the worst whole disk's average time per completed I/O over the interval |
+| `schedule` | the clock | a baseline every `intervalMin` (the first one an interval after the first run) |
+| `hangEvent` | nothing on Linux | never fires; the log says so |
+
+A trigger is met when its value stays at or above `threshold` for `sustainSec`; a dip, or no reading, restarts the clock. Then
+`cooldownMin` (no capture within it) and `dailyCap` (captures in the last 24 hours) decide whether it captures. These are the
+rules of the shared fixture [`tests/fixtures/tracing/triggers.json`](../../tests/fixtures/tracing/triggers.json), which this
+agent's tests run, as do the Windows and macOS suites.
+
+**Limits, enforced here and not by the service:**
+- `maxDurationSec`: only the last this-many seconds of the snapshot are folded and sent.
+- `maxDiskMB`: the recorder's ring buffer is a quarter of it in total (a snapshot is about the ring's size); a snapshot over it is
+  discarded; the trace folder is kept inside it (folded files of submitted or skipped traces and leftover snapshots go first, then
+  the oldest queued ones, which fail with `dropped: over the maxDiskMB limit`).
+- `maxOverheadPercent`: the recorder's own CPU, read from `/proc/<pid>/stat` over 60 s, as a share of all CPUs. Over it, the recorder is stopped for
+  30 minutes and `status` says why. This sees only the recorder process; `--overwrite` makes it write nothing until a snapshot, so it is
+  near zero, and the cost of sampling itself (kernel interrupts, charged to whatever was running) is not in it. **Measured on rob-dev
+  (8 vCPU KVM guest, 8 CPU-bound workers, `-F 99 -a -g`, 8 alternating rounds): the slowdown of the workload could not be told from
+  run-to-run noise** (baseline 2.16 to 2.69 s, median 2.38 s; with the recorder, median 2.23 s on the `cycles` event and 2.31 s on `cpu-clock`; an earlier six-round
+  run read +10% and was noise too). The 2% target is therefore **unverified**; it needs a quiet machine and many more rounds.
+- `cooldownMin`, `dailyCap`: above.
+
+It needs `perf` and, to sample the whole system, root (the system install): `kernel.perf_event_paranoid` is 4 on Ubuntu 24.04.
+`run --once` (the cron fallback) does not trace: a recorder has to stay running. A trace is a row of `kind` `trace` in the same queue, so
+`list`, `approve`, `skip` and `retry` work on it, and a held trace is logged with the exact command.
+
+```sh
+dumptriage-agent trace-capture        # ask the running daemon for a manual capture now (cooldown and cap still apply)
+dumptriage-agent status               # queue counts, then the recorder's state, last error and measured overhead
+```
+
+**What the manifest says:** the trigger and the value that fired it; the capture window (it ends when the trigger fired, and
+starts where the folded samples start: the header's `sample duration` is 0 in a `--switch-output` dump); the exact recorder command with home
+directories replaced; perf's version; the kernel; an agent version; and a random per-install `hostToken`, kept in the queue, not derived
+from the hostname. The hostname field is sent as for dumps (`sendHostname`), and the service keeps only a keyed hash.
+
+**Redaction on the host:** home directories become `<user>` in every frame name and in the command line. Command-line arguments of other
+processes are never read.
+
+**Checked on real perf** (a one-snapshot capture per tool, 2026-10-21, host kernel 6.8.0-147, containers `--privileged`): Ubuntu 22.04
+(perf 5.15.216), Ubuntu 24.04 (6.8.12), Debian 12 (6.1.190) and Rocky Linux 9, the RHEL 9 family (5.14.0-687.58.1.el9_8). On all four,
+`perf record -F 99 -a -g --overwrite --switch-output=signal` writes `<-o>.<timestamp>` on each `SIGUSR2` and once more on exit, and
+`perf script -f --header` reads it. Differences the code handles: the event is `cycles` on 5.15 and 6.1 and `cycles:P` on 5.14 (EL9)
+and 6.8; the "Dump" line names the file as it was given to `-o` (a full path when absolute); the header's `sample duration` and
+`time of first/last sample` are 0 in every one; a snapshot holds what was recorded since the previous one. Ubuntu's `perf`
+wrapper refuses to run when the package is for another kernel (`perf not found for kernel ...`): its real binary is under
+`/usr/lib/linux-tools-<version>/`. Folding is pinned to the three distros' real output in `tests/fixtures/`.
+
 ## Differences from the Windows agent
 
 - No tray popup: approval is the CLI above. A desktop notification is a follow-up.
@@ -122,5 +209,8 @@ behind.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s linux/dumptriage-agent/tests     # sniffing, policy, queue, upload (mock server)
+python3 -m unittest discover -s linux/dumptriage-agent/tests     # sniffing, policy, queue, upload (mock server), tracing
+bash linux/tests/test_configure_tracing.sh                       # configure-tracing.sh with a fake perf
 ```
+
+The tracing tests use a fake `perf` (`tests/fake_perf.py`), a fake `/proc` and a fake clock; the schema checks need `pip install jsonschema` and are skipped without it.

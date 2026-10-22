@@ -14,6 +14,7 @@ leaves a dump you can open in WinDbg, gdb or crash.
 | [`windows/Set-WerLocalDumps.ps1`](windows/Set-WerLocalDumps.ps1) | Windows Error Reporting LocalDumps: full user-mode dumps of crashing processes to a folder you choose |
 | [`windows/Set-WerLiveKernelReports.ps1`](windows/Set-WerLiveKernelReports.ps1) | Live kernel reports: kernel dumps Windows takes while it keeps running (for example after a driver timeout), and how often it may take them |
 | [`linux/configure-dumps.sh`](linux/configure-dumps.sh) | Raw ELF process cores, unlimited core size, retention, and optionally kdump for kernel crashes |
+| [`linux/configure-tracing.sh`](linux/configure-tracing.sh) | Performance traces: installs `perf`, checks tracefs and frame pointers, and `--capture SECONDS` takes one manual capture with the upload command (no agent needed) |
 
 ## Collection scripts
 
@@ -39,7 +40,7 @@ An agent needs an API key from [DumpTriage](https://performanceinsights.ai/); th
 
 Every [release](https://github.com/performanceinsights-ai/dumptriage-tools/releases/latest) carries each script
 on its own, the Windows agent built (`dumptriage-agent-windows-x64.zip`: agent, tray app and installer), the Linux
-agent with `configure-dumps.sh` (`dumptriage-agent-linux.tar.gz`), and `SHA256SUMS`. The newest of each is always at
+agent with `configure-dumps.sh` and `configure-tracing.sh` (`dumptriage-agent-linux.tar.gz`), and `SHA256SUMS`. The newest of each is always at
 `https://github.com/performanceinsights-ai/dumptriage-tools/releases/latest/download/<file>`, and listed on
 [performanceinsights.ai/downloads](https://performanceinsights.ai/downloads/). A `v*` tag publishes a release
 (`.github/workflows/release.yml`).
@@ -67,6 +68,7 @@ dotnet test windows/dumptriage-agent/tests/DumpTriage.Common.Tests
 dotnet test windows/dumptriage-agent/tests/DumpTriageAgent.Tests
 pwsh -NoProfile -File windows/dumptriage-agent/installer/tests/Test-Install.ps1
 bash macos/tests/test_collect.sh
+bash linux/tests/test_configure_tracing.sh
 pwsh -NoProfile -File rmm/ninjaone/tests/Run-Tests.ps1
 ```
 

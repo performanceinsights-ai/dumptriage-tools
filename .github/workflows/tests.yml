@@ -19,7 +19,8 @@ jobs:
           python-version: "3.12"
       - run: pip install jsonschema  # the tracing schema tests (#26); the agent itself needs only the standard library
       - run: python3 -m unittest discover -s linux/dumptriage-agent/tests
-      - run: bash -n linux/configure-dumps.sh linux/dumptriage-agent/installer/*.sh
+      - run: bash -n linux/configure-dumps.sh linux/configure-tracing.sh linux/dumptriage-agent/installer/*.sh
+      - run: bash linux/tests/test_configure_tracing.sh
 
   windows-agent-common:
     runs-on: ubuntu-latest
