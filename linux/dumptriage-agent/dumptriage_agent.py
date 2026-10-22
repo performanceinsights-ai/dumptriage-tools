@@ -1482,7 +1482,7 @@ class Agent:
             self.queue.set_meta("auth_refusals", "0")
             self.queue.update(r["id"], state=SUBMITTED, submitted_at_utc=iso(self.clock()), last_error=None)
         elif outcome in (REJECTED, QUOTA):
-            log.warning("dump %s rejected (%s): %s", r["file_path"], status, msg)
+            log.warning("%s %s rejected (%s): %s", r["kind"], r["file_path"], status, msg)
             self.queue.update(r["id"], state=FAILED, last_error=f"{status}: {msg}")
         elif outcome == AUTH:
             # Not the dump's fault and no attempt used: the key is wrong, revoked or rotated.
@@ -1499,7 +1499,7 @@ class Agent:
         else:
             n = r["retry_count"] + 1
             if n >= self.cfg["maxRetries"]:
-                log.error("dump %s failed after %d attempts: %s", r["file_path"], n, msg)
+                log.error("%s %s failed after %d attempts: %s", r["kind"], r["file_path"], n, msg)
                 self.queue.update(r["id"], state=FAILED, retry_count=n, last_error=msg)
             else:
                 delay = min(30 * 2 ** n, 3600)

@@ -669,7 +669,9 @@ class AgentTracingTests(unittest.TestCase):
         (self.config / "api-key").write_text("dts_key\n")
         a.queue.add(id="gone", file_path=str(self.state / "trace" / "gone.folded"), size_bytes=1, dump_type="folded",
                     state=da.QUEUED, detected_at_utc=da.iso(self.now), kind="trace", manifest="{}")
-        a.submit_due()
+        with self.assertLogs("dumptriage", "WARNING") as logs:
+            a.submit_due()
+        self.assertIn("trace " + str(self.state), "\n".join(logs.output))  # a trace says so, not "dump"
         self.assertEqual(a.queue.get("gone")["state"], da.FAILED)
         self.assertIn("gone", a.queue.get("gone")["last_error"])
 
