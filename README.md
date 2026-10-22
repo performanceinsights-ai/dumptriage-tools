@@ -14,6 +14,7 @@ leaves a dump you can open in WinDbg, gdb or crash.
 | [`windows/Set-WerLocalDumps.ps1`](windows/Set-WerLocalDumps.ps1) | Windows Error Reporting LocalDumps: full user-mode dumps of crashing processes to a folder you choose |
 | [`windows/Set-WerLiveKernelReports.ps1`](windows/Set-WerLiveKernelReports.ps1) | Live kernel reports: kernel dumps Windows takes while it keeps running (for example after a driver timeout), and how often it may take them |
 | [`linux/configure-dumps.sh`](linux/configure-dumps.sh) | Raw ELF process cores, unlimited core size, retention, and optionally kdump for kernel crashes |
+| [`windows/Start-PerfTrace.ps1`](windows/Start-PerfTrace.ps1) | Performance traces: one WPR capture with [`PerfInsights.wprp`](windows/PerfInsights.wprp) while you reproduce the problem, zipped with its manifest, and `-Upload` to send it (no agent needed) |
 | [`linux/configure-tracing.sh`](linux/configure-tracing.sh) | Performance traces: installs `perf`, checks tracefs and frame pointers, and `--capture SECONDS` takes one manual capture with the upload command (no agent needed) |
 
 ## Collection scripts

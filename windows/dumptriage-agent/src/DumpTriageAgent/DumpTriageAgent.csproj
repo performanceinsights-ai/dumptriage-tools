@@ -30,10 +30,17 @@
     <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
     <PackageReference Include="Serilog.Sinks.EventLog" Version="4.0.0" />
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.12" />
+    <!-- Tracing triggers (dumptriage-tools#29): disk latency and processor queue length counters, Application Hang events. -->
+    <PackageReference Include="System.Diagnostics.PerformanceCounter" Version="10.0.12" />
+    <PackageReference Include="System.Diagnostics.EventLog" Version="10.0.12" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\DumpTriage.Common\DumpTriage.Common.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The WPR profile the tracing service runs, next to the executable (dumptriage-tools#29). -->
+    <None Include="..\..\..\PerfInsights.wprp" Link="PerfInsights.wprp" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

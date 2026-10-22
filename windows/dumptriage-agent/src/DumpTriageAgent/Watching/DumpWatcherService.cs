@@ -326,6 +326,7 @@ public sealed class DumpWatcherService : BackgroundService
                 .ToList();
             foreach (var record in unfinished)
             {
+                if (record.DumpType == DumpType.Trace) continue; // the tracing service resumes its own (TracingService)
                 if (!File.Exists(record.FilePath))
                 {
                     await MoveAsync(record, DumpQueueState.Skipped, stoppingToken);

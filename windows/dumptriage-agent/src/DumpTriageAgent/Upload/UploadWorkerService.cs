@@ -214,7 +214,9 @@ public sealed class UploadWorkerService : BackgroundService
             _openSlotDumpIds = queued.Select(r => r.Id).ToHashSet();
         }
         var now = DateTimeOffset.UtcNow;
-        var due = queued.Where(r => r.NextAttemptAtUtc is null || r.NextAttemptAtUtc <= now).ToList();
+        // Dumps first: a trace the server refuses (traces off there, 403) ends the pass like any transient failure, and
+        // must not hold back the dumps queued after it.
+        var due = queued.Where(r => r.NextAttemptAtUtc is null || r.NextAttemptAtUtc <= now).OrderBy(r => r.DumpType == DumpType.Trace).ToList();
         _logger.LogDebug("Queued dumps: {Count}, due now: {Due}", queued.Count, due.Count);
         foreach (var record in due)
         {
@@ -317,8 +319,11 @@ public sealed class UploadWorkerService : BackgroundService
         try
         {
             var hostnameHash = _config.SendHostname ? Environment.MachineName : null;
-            result = await _apiClient.UploadDumpAsync(
-                record.FilePath, apiKey, hostnameHash, record.Sha256 ?? record.Id, stoppingToken);
+            result = record.DumpType == DumpType.Trace
+                ? await _apiClient.UploadTraceAsync(
+                    record.FilePath, record.Manifest ?? "{}", apiKey, hostnameHash, record.Sha256 ?? record.Id, stoppingToken)
+                : await _apiClient.UploadDumpAsync(
+                    record.FilePath, apiKey, hostnameHash, record.Sha256 ?? record.Id, stoppingToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -394,7 +399,16 @@ public sealed class UploadWorkerService : BackgroundService
                 record.LastError = null;
                 record.NextAttemptAtUtc = null;
                 record.FirstFailedAtUtc = null;
-                _logger.LogInformation("Submitted dump {Path}", record.FilePath);
+                _logger.LogInformation("Submitted {Kind} {Path}", record.DumpType == DumpType.Trace ? "trace" : "dump", record.FilePath);
+                if (record.DumpType == DumpType.Trace)
+                {
+                    // The agent made this file; once the service has it, nothing keeps it here (website#1999).
+                    try { File.Delete(record.FilePath); }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        _logger.LogWarning(ex, "Could not delete the sent trace {Path}", record.FilePath);
+                    }
+                }
                 break;
 
             case UploadOutcome.FileChanged:
@@ -487,6 +501,7 @@ public sealed class UploadWorkerService : BackgroundService
 
     private async Task MaybeCopyToCentralLocationAsync(DumpRecord record, CancellationToken stoppingToken)
     {
+        if (record.DumpType == DumpType.Trace) return; // the archival copy is for dumps; a trace is deleted once it is sent
         if (record.CentralCopiedAtUtc is not null) return; // already archived on a prior attempt
 
         bool success;

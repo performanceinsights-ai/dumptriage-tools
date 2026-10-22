@@ -68,12 +68,36 @@ public sealed class DumpTriageApiClient
     /// <summary>Longest to wait for the server's answer once the whole body is sent.</summary>
     public TimeSpan ResponseTimeout { get; init; } = TimeSpan.FromMinutes(30);
 
-    public async Task<UploadResult> UploadDumpAsync(
+    public Task<UploadResult> UploadDumpAsync(
         string filePath,
         string apiKey,
         string? hostnameHash,
         string? expectedSha256 = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        UploadAsync("/api/v1/dumps", filePath, apiKey, hostnameHash, expectedSha256, manifest: null, "application/octet-stream", cancellationToken);
+
+    /// <summary>
+    /// A captured performance trace (website#1999): POST /api/v1/traces with the zip as "file" and its manifest.json as
+    /// the "manifest" field. Same streaming, hash header, stall watchdog and outcome mapping as a dump.
+    /// </summary>
+    public Task<UploadResult> UploadTraceAsync(
+        string filePath,
+        string manifestJson,
+        string apiKey,
+        string? hostnameHash,
+        string? expectedSha256 = null,
+        CancellationToken cancellationToken = default) =>
+        UploadAsync("/api/v1/traces", filePath, apiKey, hostnameHash, expectedSha256, manifestJson, "application/zip", cancellationToken);
+
+    private async Task<UploadResult> UploadAsync(
+        string route,
+        string filePath,
+        string apiKey,
+        string? hostnameHash,
+        string? expectedSha256,
+        string? manifest,
+        string contentType,
+        CancellationToken cancellationToken)
     {
         FileStream fileStream;
         try
@@ -96,7 +120,11 @@ public sealed class DumpTriageApiClient
 
         using var content = new MultipartFormDataContent();
         var streamContent = new StreamContent(body);
-        streamContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        streamContent.Headers.ContentType = new MediaTypeHeaderValue(contentType);
+        if (manifest is not null)
+        {
+            content.Add(new StringContent(manifest), "manifest");
+        }
         content.Add(streamContent, "file", Path.GetFileName(filePath));
 
         if (!string.IsNullOrEmpty(hostnameHash))
@@ -104,7 +132,7 @@ public sealed class DumpTriageApiClient
             content.Add(new StringContent(hostnameHash), "hostname");
         }
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, "/api/v1/dumps")
+        using var request = new HttpRequestMessage(HttpMethod.Post, route)
         {
             Content = content,
         };
@@ -198,6 +226,8 @@ public sealed class DumpTriageApiClient
         HttpStatusCode.Unauthorized => UploadOutcome.CredentialsRejected,
         HttpStatusCode.Forbidden when body.Contains("terms_not_accepted", StringComparison.Ordinal) => UploadOutcome.AwaitingTerms,
         HttpStatusCode.Forbidden when body.Contains("account has been closed", StringComparison.Ordinal) => UploadOutcome.AccountClosed,
+        // The service has traces off (website routers/traces.py TRACES_DISABLED): not the key's fault, try again later.
+        HttpStatusCode.Forbidden when body.Contains("traces_disabled", StringComparison.Ordinal) => UploadOutcome.TransientFailure,
         HttpStatusCode.Forbidden => UploadOutcome.CredentialsRejected,
         _ => UploadOutcome.TransientFailure, // 5xx (503 scanner unavailable), proxies, anything unexpected
     };

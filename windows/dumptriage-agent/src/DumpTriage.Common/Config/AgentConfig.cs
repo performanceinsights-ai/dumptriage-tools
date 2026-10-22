@@ -42,6 +42,9 @@ public sealed class AgentConfig
     public AgentPolicyConfig Policy { get; init; } = new();
 
     public CentralCopyConfig CentralCopy { get; init; } = new();
+
+    /// <summary>Performance traces with WPR (website#1999, dumptriage-tools#29). Off by default.</summary>
+    public Tracing.TracingConfig Tracing { get; init; } = new();
 }
 
 /// <summary>

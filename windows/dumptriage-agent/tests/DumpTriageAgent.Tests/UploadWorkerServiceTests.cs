@@ -543,4 +543,28 @@ public class UploadWorkerServiceTests
         Assert.Single(h.Server.Requests);
         Assert.Equal(DumpQueueState.Submitted, (await h.ReloadAsync(record)).State);
     }
+
+    [Fact]
+    public async Task ATraceTheServerRefuses_DoesNotHoldBackTheDumps()
+    {
+        // Review of #39: a trace refused with 403 traces_disabled ended the pass, so dumps queued after it waited.
+        await using var h = await WorkerHarness.CreateAsync();
+        var added = await h.AddDumpAsync("trace.zip");
+        var trace = new DumpRecord
+        {
+            Id = added.Id, FilePath = added.FilePath, SizeBytes = added.SizeBytes, FileLastWriteUtc = added.FileLastWriteUtc, Sha256 = added.Sha256,
+            DumpType = DumpType.Trace, State = DumpQueueState.Queued, Manifest = "{\"schemaVersion\":1,\"traceType\":\"etl\"}",
+            DetectedAtUtc = DateTimeOffset.UtcNow - TimeSpan.FromHours(1), // queued first
+        };
+        await h.Store.UpsertAsync(trace);
+        var dump = await h.AddDumpAsync("a.dmp");
+        h.Server.Respond = request => Task.FromResult(request.RequestUri!.AbsolutePath.EndsWith("/traces", StringComparison.Ordinal)
+            ? new HttpResponseMessage(HttpStatusCode.Forbidden) { Content = new StringContent("{\"detail\":\"traces_disabled\"}") }
+            : new HttpResponseMessage(HttpStatusCode.Created) { Content = new StringContent("{\"id\":\"d1\"}") });
+
+        await h.Worker.TickAsync(CancellationToken.None);
+
+        Assert.Equal(DumpQueueState.Submitted, (await h.ReloadAsync(dump)).State);
+        Assert.Equal(DumpQueueState.Queued, (await h.ReloadAsync(trace)).State);
+    }
 }

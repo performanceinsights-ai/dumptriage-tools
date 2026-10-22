@@ -166,6 +166,87 @@ failure is only logged (`CentralCopyError` on the queue record), not retried
 automatically. The copy is written under a `.tmp` name and renamed when
 complete, so an interrupted copy never sits at the final name.
 
+## Performance traces (website#1999, dumptriage-tools#29)
+
+Off by default. With the `tracing` section enabled, the service keeps a WPR flight recorder running (memory mode: a ring of
+buffers, nothing written to disk until a capture), watches the triggers, and when one fires it stops the recorder into an
+`.etl`, zips it (`trace.etl` first, with its `.etl.NGENPDB` folder when WPR writes one), writes a `manifest.json`, queues the
+pair like a dump and starts the recorder again. The upload sends it to `POST /api/v1/traces`; the zip is deleted once it is
+sent and never goes to `centralCopy`. The `.etl` is not read on this machine: the service parses it on one of its Windows
+workers. The service must accept WPR traces (`TRACE_ETL_ENABLED`); until it does, the upload is refused and retried.
+
+```jsonc
+"tracing": {
+  "enabled": true,
+  "backend": "wpr",                   // the only backend on Windows
+  "submission": "AskFirst",           // AlwaysSubmit | AskFirst | NotifyOnly | RuleBased: held for approval by default
+  "triggers": [
+    { "name": "cpu-high",  "type": "cpuPercent",    "threshold": 90, "sustainSec": 30 },
+    { "name": "sql-busy",  "type": "process",       "process": "sqlservr", "threshold": 150, "sustainSec": 20 },
+    { "name": "io-slow",   "type": "diskLatencyMs", "threshold": 100, "sustainSec": 10 },
+    { "name": "queue",     "type": "loadPerCpu",    "threshold": 2,   "sustainSec": 60 },
+    { "name": "hang",      "type": "hangEvent" },
+    { "name": "baseline",  "type": "schedule",      "intervalMin": 1440 }
+  ],
+  "limits": { "maxDurationSec": 60, "maxDiskMB": 512, "maxOverheadPercent": 2, "cooldownMin": 60, "dailyCap": 4 }
+}
+```
+
+The keys are the shared contract ([`schemas/tracing-config.schema.json`](../../schemas/tracing-config.schema.json)); a section
+that does not read turns tracing off, and the log says why. `RuleBased` uses only the `policy.rules` that name traces
+(`"dumpType": "Trace"`), then `defaultRuleAction`: a dump rule never sends a trace. With tracing off, traces still waiting
+for a decision are skipped and their zips removed; queued ones still upload, after the dumps.
+
+| Trigger | Reads | Value |
+|---|---|---|
+| `cpuPercent` | `GetSystemTimes` | percent of all CPUs busy; with `process`, percent of **one** CPU used by processes of that name (with or without `.exe`) |
+| `process` | each process's `TotalProcessorTime` | the same per-process percent (needs `process`) |
+| `loadPerCpu` | `\System\Processor Queue Length` | threads waiting for a CPU, per CPU |
+| `diskLatencyMs` | `\PhysicalDisk(_Total)\Avg. Disk sec/Transfer` | average time per I/O, in ms |
+| `hangEvent` | the Application log | an Application Hang event (ID 1002) since the last reading |
+| `schedule` | the clock | a baseline every `intervalMin` (the first one an interval after the first run) |
+
+A trigger is met when its value stays at or above `threshold` for `sustainSec`; then `cooldownMin` and `dailyCap` decide
+whether it captures, by the rules of the shared fixture [`tests/fixtures/tracing/triggers.json`](../../tests/fixtures/tracing/triggers.json).
+For a capture now, create an empty `capture.request` in `%ProgramData%\DumpTriage\traces` (cooldown and cap still apply).
+`%ProgramData%\DumpTriage\traces\status.json` says whether the recorder runs, the last error and the last capture.
+
+**What it records** ([`windows/PerfInsights.wprp`](../PerfInsights.wprp)): CPU samples every 4 ms with stacks (`wpr -setprofint
+40000`, set once the recorder has the kernel logger and put back to WPR's 1 ms default when the service stops), context switches with stacks (how
+long the working threads waited, and on what), ready-thread events, disk I/O and its issuing thread, DPC and ISR time, hard
+faults, process, thread and image loads, and the .NET runtime's loader and JIT events with its rundown when the trace is
+saved. Without those last ones most frames of a managed process have no name: 85% of a PowerShell workload's busy samples on
+the lab VM, 1% with them.
+
+**Limits, enforced here and not by the service:**
+- `maxDiskMB`: the kernel ring is a quarter of it (16 to 256 buffers of 1 MB; the trace WPR writes is about the ring's size), a
+  zip over it is discarded, and the trace folder is kept inside it.
+- `maxDurationSec`: in memory mode the ring holds whatever fits, so the window is what the ring held when the trigger fired;
+  the manifest says what it is.
+- `maxOverheadPercent`: **cannot be measured per process on Windows**: the kernel logger's cost is charged to whatever was
+  running, not to the service. The profile is made light enough instead, and status.json says so. **Measured on the lab VM
+  (Server 2022, 4 vCPU GCE e2-standard-4, a fixed SHA-256 workload with and without the recorder, alternating):** 16 rounds,
+  mean +1.7%, median +1.6%, slower in 11 of 16; the rounds vary by about 5% on their own. The first draft of the profile
+  (ReadyThread stacks, file I/O, 1 ms sampling) cost about 4%.
+- `cooldownMin`, `dailyCap`: above.
+
+It needs `wpr.exe` (Windows 10, Server 2016 and later ship it) and runs as LocalSystem, which the kernel logger requires.
+**It never takes the kernel logger from another tool:** when `wpr -start` fails (Procmon, xperf, an EDR or another WPR
+session holds it), the service leaves that session alone, says why in status.json and tries again 5 minutes later.
+
+**What the manifest says:** the trigger and the value that fired it, the window, the exact wpr command, WPR's version, the
+Windows build, an agent version and a random per-install `hostToken` kept in the queue, not derived from the hostname. The
+`.etl` itself holds process names, file paths and call stacks of everything that ran; command lines and event payloads of
+other providers are not recorded by the profile.
+
+**Without the agent:** [`windows/Start-PerfTrace.ps1`](../Start-PerfTrace.ps1) (with `PerfInsights.wprp` next to it, both in
+the release) takes one capture in file mode while you reproduce the problem, writes the zip and its manifest, and with
+`-Upload` sends them using the key in `$env:DUMPTRIAGE_API_KEY`:
+
+```powershell
+.\Start-PerfTrace.ps1 -Seconds 60 -OutDir C:\Traces             # then run it again with -Upload, or use the curl line it prints
+```
+
 ## Uploads, retries and holds
 
 - **Detection.** A dump is recorded once it has stopped changing and can be
