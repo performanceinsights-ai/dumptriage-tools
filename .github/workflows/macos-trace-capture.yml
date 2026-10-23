@@ -102,6 +102,7 @@ jobs:
 
       - name: xctrace Time Profiler, all processes
         continue-on-error: true
+        timeout-minutes: 15  # xctrace on the macos-26 image sometimes never returns; a hang costs this step, not the job (#47)
         run: |
           # Unprivileged first, as a customer would run it; sudo only if that fails, and say which one worked (#31).
           # The unprivileged exit code and log stay in the artifact, so a failure that was not about privilege shows.
@@ -180,6 +181,7 @@ jobs:
 
       - name: xctrace symbolicate experiment (Xcode 15.4 on macOS 14 exported 98% of frames as addresses)
         continue-on-error: true
+        timeout-minutes: 10
         run: |
           # How many of an export's frames are named, raw and after `xctrace symbolicate` (website#2206).
           count() {
@@ -208,6 +210,7 @@ jobs:
       - name: xctrace with the newest Xcode of each major version (Xcode 15.4 on macOS 14 names 2% of frames, #46)
         if: matrix.os == 'macos-14'
         continue-on-error: true
+        timeout-minutes: 25
         run: |
           # The image ships several Xcodes; record and export with the newest release of each major version and count
           # how many frames come back named, and whether the burner's own function is among them. Counts end in
@@ -257,6 +260,7 @@ jobs:
       - name: dumptriage-collect.sh --xctrace with the newest Xcode (macOS 14, #46)
         if: matrix.os == 'macos-14'
         continue-on-error: true
+        timeout-minutes: 10
         run: |
           app=$(tail -1 "$OUT/xcodes/releases.txt")
           [ -n "$app" ] || { echo "no Xcode release found"; exit 1; }
