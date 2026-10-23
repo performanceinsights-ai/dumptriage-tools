@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Runs dumptriage-collect.sh in watch-once mode every minute (website#1999, dumptriage-tools#31). A LaunchDaemon,
+     so as root: spindump and xctrace need it, and nothing is sent from here, only held for send-held mode.
+     __SCRIPT__ and __HOME__ are filled in by the install command in README.md. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.performanceinsights.dumptriage-trace</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__SCRIPT__</string>
+        <string>--watch-once</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin:/Applications/Xcode.app/Contents/Developer/usr/bin</string>
+        <key>DUMPTRIAGE_TRACING_CONFIG</key>
+        <string>__HOME__/.config/dumptriage/tracing.json</string>
+        <key>DUMPTRIAGE_STATE_DIR</key>
+        <string>__HOME__/.config/dumptriage/tracing-state</string>
+    </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>/var/log/dumptriage-trace.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/dumptriage-trace.log</string>
+</dict>
+</plist>
