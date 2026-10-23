@@ -119,6 +119,39 @@ jobs:
             --output "$OUT/xctrace-time-profile.xml"
           test -s "$OUT/xctrace-time-profile.xml"
 
+      - name: dSYM lookup by UUID (website#2156)
+        continue-on-error: true
+        run: |
+          # The report page tells a developer to find a missing dSYM with `mdfind "com_apple_xcode_dsym_uuids == <UUID>"`
+          # (Apple's TN2151). Build one with a known UUID and try that exactly, with and without a Spotlight index.
+          mkdir -p "$WORK/dsym"
+          cd "$WORK/dsym"
+          clang -g -O0 -o dtburn-dsym "$GITHUB_WORKSPACE/macos/tests/burn.c"
+          dsymutil dtburn-dsym -o dtburn-dsym.dSYM
+          uuid=$(dwarfdump --uuid dtburn-dsym | awk 'NR==1{print $2}')
+          {
+            echo "== dwarfdump --uuid (binary, then dSYM)"
+            dwarfdump --uuid dtburn-dsym dtburn-dsym.dSYM
+            echo "== mdutil -s /"
+            mdutil -s / 2>&1
+            echo "== mdfind, this folder only"
+            mdfind -onlyin "$PWD" "com_apple_xcode_dsym_uuids == $uuid"
+            echo "== mdfind, everywhere"
+            mdfind "com_apple_xcode_dsym_uuids == $uuid"
+            echo "== mdls of the dSYM"
+            mdls -name com_apple_xcode_dsym_uuids dtburn-dsym.dSYM
+            echo "== mdimport the dSYM, wait, mdfind again"
+            mdimport "$PWD/dtburn-dsym.dSYM" 2>&1
+            sleep 10
+            mdfind -onlyin "$PWD" "com_apple_xcode_dsym_uuids == $uuid"
+            mdfind "com_apple_xcode_dsym_uuids == $uuid"
+            echo "== mdls again"
+            mdls -name com_apple_xcode_dsym_uuids dtburn-dsym.dSYM
+            echo "== the same query in lower case"
+            mdfind "com_apple_xcode_dsym_uuids == $(echo "$uuid" | tr 'A-F' 'a-f')"
+          } > "$OUT/dsym-lookup.txt" 2>&1
+          cat "$OUT/dsym-lookup.txt"
+
       - name: powermetrics snapshot
         continue-on-error: true
         run: sudo powermetrics -n 1 -i 1000 > "$OUT/powermetrics.txt" 2>&1
