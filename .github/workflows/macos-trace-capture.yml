@@ -180,6 +180,20 @@ jobs:
             echo "== indexing state of this folder and of every volume"
             mdutil -s "$PWD" 2>&1
             mdutil -a -s 2>&1
+            echo "== register Xcode's uuid.mdimporter (it supplies com_apple_xcode_dsym_uuids), re-import, wait, mdfind"
+            importer="$(xcode-select -p)/../Library/Spotlight/uuid.mdimporter"
+            ls -d "$importer" 2>&1
+            mdimport -r "$importer" 2>&1
+            sleep 5
+            mdimport -L 2>&1 | grep -i uuid || echo "(still not listed)"
+            mdimport -t -d1 "$PWD/dtburn-dsym.dSYM" 2>&1 | head -5
+            mdimport "$PWD/dtburn-dsym.dSYM" 2>&1
+            sleep 20
+            echo "-- mdls"
+            mdls -name com_apple_xcode_dsym_uuids dtburn-dsym.dSYM
+            echo "-- mdfind, this folder only, then everywhere (UUID $uuid)"
+            mdfind -onlyin "$PWD" "com_apple_xcode_dsym_uuids == $uuid"
+            mdfind "com_apple_xcode_dsym_uuids == $uuid"
             echo "== xcode-select and DebugSymbols"
             xcode-select -p
             ls /Applications/Xcode*.app/Contents/Library/Spotlight 2>&1 | head
