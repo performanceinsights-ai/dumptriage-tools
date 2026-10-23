@@ -17,7 +17,8 @@
 #   - reports whether tracefs is available (software-event profiling does not need it; sched tracepoints do).
 #   - --check-frame-pointers samples the whole system for 3 s and warns about processes whose stacks are mostly
 #     [unknown]: a binary built without frame pointers gives truncated stacks under `perf record -g`.
-#   - --capture SECONDS: `perf record -F 99 -a -g` for that long, `perf script --header` with home directories and
+#   - --capture SECONDS (30 to 600): `perf record -F 99 -a -g` for that long (at 99 Hz, 30 s is about 3,000 samples
+#     per busy core; the service needs 2,000 to judge a profile, website#2208), `perf script --header` with home directories and
 #     the host name replaced, a manifest.json, and the curl command that uploads both to POST /api/v1/traces.
 # Test hooks (environment): DT_OS_RELEASE, DT_SYSCTL_D, DT_PROC_SYS, DT_TRACEFS.
 set -euo pipefail
@@ -36,7 +37,7 @@ while (($#)); do
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
-[[ -z $capture || $capture =~ ^[0-9]+$ && $capture -ge 1 && $capture -le 600 ]] || { echo "--capture takes 1 to 600 seconds" >&2; exit 2; }
+[[ -z $capture || $capture =~ ^[0-9]+$ && $capture -ge 30 && $capture -le 600 ]] || { echo "--capture takes 30 to 600 seconds (shorter is too thin to judge)" >&2; exit 2; }
 [[ $agent_user =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "--agent-user: not a user name" >&2; exit 2; }
 
 tmp=""  # a scratch directory, removed on any exit

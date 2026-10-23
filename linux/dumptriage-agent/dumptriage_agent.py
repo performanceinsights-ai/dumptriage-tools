@@ -539,6 +539,10 @@ SNAPSHOT_WAIT_SECONDS = 60
 SCRIPT_TIMEOUT_SECONDS = 300
 
 
+# The shortest capture worth sending at perf's 99 Hz (website#2208): about 3,000 samples per busy core.
+MIN_PROFILE_SEC = 30
+
+
 def validate_tracing(tracing):
     """Problems with a `tracing` config section, as the schema (schemas/tracing-config.schema.json) and this agent's
     backends would report them; an empty list means usable. Fail closed: the agent does not trace on a config it
@@ -1617,6 +1621,11 @@ class Agent:
             for problem in problems:
                 log.error("tracing is off: %s", problem)
             return
+        if tr["limits"]["maxDurationSec"] < MIN_PROFILE_SEC:
+            # Kept, not raised: the limit is the customer's. But at perf's 99 Hz a capture under 30 s holds under about
+            # 3,000 samples per busy core, and the service needs 2,000 on-CPU samples to judge one (website#2208, #48).
+            log.warning("limits.maxDurationSec is %s; captures under %d s are often too thin for the service to judge",
+                        tr["limits"]["maxDurationSec"], MIN_PROFILE_SEC)
         ts.sampler = ProcSampler(self.proc_root, want_processes=any(
             t["type"] == "process" or (t["type"] == "cpuPercent" and t.get("process")) for t in tr["triggers"]))
         for trig in tr["triggers"]:
