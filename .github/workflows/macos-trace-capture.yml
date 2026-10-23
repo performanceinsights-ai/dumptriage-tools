@@ -27,7 +27,7 @@ jobs:
     env:
       SECONDS_TO_CAPTURE: ${{ inputs.seconds || '10' }}
       OUT: ${{ github.workspace }}/capture
-      WORK: ${{ runner.temp }}/capture-work
+      WORK: ${{ github.workspace }}/../capture-work
     steps:
       - uses: actions/checkout@v4
 
