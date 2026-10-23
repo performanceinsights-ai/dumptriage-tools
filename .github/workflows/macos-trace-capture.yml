@@ -1,0 +1,144 @@
+name: macOS trace capture
+
+# Captures real spindump, sample and xctrace output on GitHub's macOS runners, for the website's macOS trace parsers
+# and the open questions in #31 (#41). Run it by hand; it also runs on a PR that changes it.
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Capture length in seconds (5 to 120)
+        type: number
+        default: 10
+  pull_request:
+    paths:
+      - .github/workflows/macos-trace-capture.yml
+      - macos/tests/burn.c
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30  # four captures of at most 120 s each, one after another, plus setup
+    defaults:
+      run:
+        shell: bash  # with pipefail, so a capture piped into tee still fails when the tool does
+    env:
+      SECONDS_TO_CAPTURE: ${{ inputs.seconds || '10' }}
+      OUT: ${{ github.workspace }}/capture
+      WORK: ${{ github.workspace }}/../capture-work
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Environment
+        run: |
+          case "$SECONDS_TO_CAPTURE" in
+            ''|*[!0-9]*) echo "seconds must be a whole number, got '$SECONDS_TO_CAPTURE'"; exit 1 ;;
+          esac
+          if [ "$SECONDS_TO_CAPTURE" -lt 5 ] || [ "$SECONDS_TO_CAPTURE" -gt 120 ]; then
+            echo "seconds must be 5 to 120, got $SECONDS_TO_CAPTURE"; exit 1
+          fi
+          mkdir -p "$OUT" "$WORK"
+          {
+            sw_vers
+            uname -a
+            sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+            echo "xcode-select: $(xcode-select -p)"
+            xcodebuild -version || true
+            echo "xctrace: $(xcrun --find xctrace 2>&1)"
+            # Whether xctrace ships with the Command Line Tools alone or needs full Xcode (#31).
+            if [ -d /Library/Developer/CommandLineTools ]; then
+              echo "xctrace under CommandLineTools: $(DEVELOPER_DIR=/Library/Developer/CommandLineTools xcrun --find xctrace 2>&1)"
+            fi
+            xcrun xctrace version || true
+          } > "$OUT/environment.txt" 2>&1
+          cat "$OUT/environment.txt"
+          # The tools' own usage text, to pin the flags each macOS version takes.
+          spindump -h > "$OUT/spindump-help.txt" 2>&1 || true
+          sample > "$OUT/sample-help.txt" 2>&1 || true
+          xcrun xctrace help > "$OUT/xctrace-help.txt" 2>&1 || true
+          xcrun xctrace help record > "$OUT/xctrace-help-record.txt" 2>&1 || true
+          xcrun xctrace help symbolicate > "$OUT/xctrace-help-symbolicate.txt" 2>&1 || true
+          xcrun xctrace help export > "$OUT/xctrace-help-export.txt" 2>&1 || true
+
+      - name: Start the burner
+        run: |
+          clang -g -O0 -o "$WORK/dtburn" macos/tests/burn.c
+          # Long enough for every capture below; stopped at the end either way.
+          "$WORK/dtburn" $(( SECONDS_TO_CAPTURE * 4 + 300 )) > /dev/null &
+          echo "BURN_PID=$!" >> "$GITHUB_ENV"
+          echo "burner pid $!"
+
+      - name: spindump, system-wide
+        continue-on-error: true
+        run: |
+          # -notarget: a bare number would be read as a pid, not a duration.
+          sudo spindump -notarget "$SECONDS_TO_CAPTURE" 10 -file "$OUT/spindump.txt" 2>&1 | tee "$OUT/spindump-log.txt"
+          sudo chown "$USER" "$OUT/spindump.txt"
+          test -s "$OUT/spindump.txt"
+
+      - name: spindump, the burner only
+        continue-on-error: true
+        run: |
+          # As dumptriage-collect.sh --spindump runs it: one target, default interval.
+          sudo spindump "$BURN_PID" "$SECONDS_TO_CAPTURE" -file "$OUT/spindump-target.txt" 2>&1 | tee "$OUT/spindump-target-log.txt"
+          sudo chown "$USER" "$OUT/spindump-target.txt"
+          test -s "$OUT/spindump-target.txt"
+
+      - name: sample, the burner
+        continue-on-error: true
+        run: |
+          sample "$BURN_PID" "$SECONDS_TO_CAPTURE" 1 -file "$OUT/sample.txt" 2>&1 | tee "$OUT/sample-log.txt"
+          test -s "$OUT/sample.txt"
+
+      - name: xctrace Time Profiler, all processes
+        continue-on-error: true
+        run: |
+          # Unprivileged first, as a customer would run it; sudo only if that fails, and say which one worked (#31).
+          # The unprivileged exit code and log stay in the artifact, so a failure that was not about privilege shows.
+          if xcrun xctrace record --template 'Time Profiler' --all-processes --time-limit "${SECONDS_TO_CAPTURE}s" \
+               --no-prompt --output "$WORK/cap.trace" > "$OUT/xctrace-record-log.txt" 2>&1; then
+            echo "unprivileged" > "$OUT/xctrace-record-mode.txt"
+          else
+            echo "unprivileged attempt failed with exit $?; retried with sudo" > "$OUT/xctrace-record-mode.txt"
+            rm -rf "$WORK/cap.trace"
+            sudo xcrun xctrace record --template 'Time Profiler' --all-processes --time-limit "${SECONDS_TO_CAPTURE}s" \
+              --no-prompt --output "$WORK/cap.trace" >> "$OUT/xctrace-record-log.txt" 2>&1
+            sudo chown -R "$USER" "$WORK/cap.trace"
+            echo "sudo" >> "$OUT/xctrace-record-mode.txt"
+          fi
+          cat "$OUT/xctrace-record-log.txt" "$OUT/xctrace-record-mode.txt"
+          xcrun xctrace export --input "$WORK/cap.trace" --toc --output "$OUT/xctrace-toc.xml"
+          xcrun xctrace export --input "$WORK/cap.trace" \
+            --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' \
+            --output "$OUT/xctrace-time-profile.xml"
+          test -s "$OUT/xctrace-time-profile.xml"
+
+      - name: powermetrics snapshot
+        continue-on-error: true
+        run: sudo powermetrics -n 1 -i 1000 > "$OUT/powermetrics.txt" 2>&1
+
+      - name: Stop the burner
+        if: always()
+        run: kill "$BURN_PID" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-trace-capture-${{ matrix.os }}
+          path: capture/
+          retention-days: 30
+
+      - name: Every capture produced output
+        run: |
+          ls -l "$OUT"
+          missing=0
+          for f in spindump.txt spindump-target.txt sample.txt xctrace-time-profile.xml; do
+            if [ ! -s "$OUT/$f" ]; then echo "missing or empty: $f"; missing=1; fi
+          done
+          exit $missing

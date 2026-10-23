@@ -74,6 +74,11 @@ bash linux/tests/test_install_perfetto.sh
 pwsh -NoProfile -File rmm/ninjaone/tests/Run-Tests.ps1
 ```
 
+`.github/workflows/macos-trace-capture.yml` (run by hand from the Actions tab, and on a PR that changes it or
+`macos/tests/burn.c`) captures real `spindump`, `sample` and
+`xctrace` output on GitHub's macOS 14, 15 and 26 runners and keeps it as a build artifact for 30 days, for testing the
+service's macOS trace parsers on current macOS output (#41).
+
 ## Security
 
 Report vulnerabilities to hello@performanceinsights.ai (subject "Security"), not in a public issue.
