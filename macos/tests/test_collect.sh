@@ -97,17 +97,50 @@ printf 'sudo %s\n' "\$*" >> "$LOG"
 EOF
     cat > "$T/bin/spindump" <<EOF
 #!/bin/bash
-# fake spindump TARGET SECONDS -file OUT
+# fake spindump ... -file OUT
 printf 'spindump %s\n' "\$*" >> "$LOG"
-cp "$FIXTURES/spindump-catalina-slack.txt" "\$4"
+while [ \$# -gt 0 ]; do [ "\$1" = -file ] && out=\$2; shift; done
+cp "$FIXTURES/spindump-catalina-slack.txt" "\$out"
 EOF
+    cat > "$T/bin/sample" <<EOF
+#!/bin/bash
+# fake sample TARGET SECONDS INTERVAL -file OUT
+printf 'sample %s\n' "\$*" >> "$LOG"
+while [ \$# -gt 0 ]; do [ "\$1" = -file ] && out=\$2; shift; done
+cp "$FIXTURES/sample-macos26.txt" "\$out"
+EOF
+    cat > "$T/bin/sw_vers" <<EOF
+#!/bin/bash
+case "\$1" in -buildVersion) echo 25G83 ;; -productVersion) echo 26.6.2 ;; esac
+EOF
+    # fake xcrun: --find xctrace (fails when \$FAKE_NO_XCODE is set), xctrace version, record (makes the .trace folder,
+    # fails unprivileged when \$FAKE_RECORD_NEEDS_SUDO is set), export (a real export, \$FAKE_EXPORT, as the XML)
+    cat > "$T/bin/xcrun" <<EOF
+#!/bin/bash
+printf 'xcrun %s\n' "\$*" >> "$LOG"
+if [ "\$1" = --find ]; then [ -z "\${FAKE_NO_XCODE:-}" ] && echo /Applications/Xcode.app/Contents/Developer/usr/bin/xctrace; exit \$([ -z "\${FAKE_NO_XCODE:-}" ] && echo 0 || echo 1); fi
+[ "\$1" = xctrace ] || exit 1
+shift
+case "\$1" in
+    version) echo "xctrace version 16.0 (17F113)" ;;
+    record)
+        if [ -n "\${FAKE_RECORD_NEEDS_SUDO:-}" ] && [ -z "\${SUDO_FAKE:-}" ]; then echo "not permitted" >&2; exit 1; fi
+        while [ \$# -gt 0 ]; do [ "\$1" = --output ] && out=\$2; shift; done
+        mkdir -p "\$out" && echo bundle > "\$out/data" ;;
+    export)
+        while [ \$# -gt 0 ]; do [ "\$1" = --output ] && out=\$2; shift; done
+        cp "\${FAKE_EXPORT:-$FIXTURES/xctrace-time-profile-macos26.xml}" "\$out" ;;
+esac
+EOF
+    # sudo marks its children so the fake xcrun can tell a privileged run
+    sed -i.bak 's/^"\$@"$/SUDO_FAKE=1 "\$@"/' "$T/bin/sudo" && rm -f "$T/bin/sudo.bak"
     chmod +x "$T/bin/"*
 }
 
 run() {  # stdin, then the script's arguments
     input=$1
     shift
-    OUT=$(printf '%s' "$input" | PATH="$T/bin:$PATH" TMPDIR="$T" "$SCRIPT" "$@" 2>&1)
+    OUT=$(printf '%s' "$input" | PATH="$T/bin:$PATH" TMPDIR="$T" HOME="$T/home" "$SCRIPT" "$@" 2>&1)
     CODE=$?
 }
 
@@ -311,6 +344,149 @@ run "" --days soon
 assert_eq "$CODE" 2
 run "" --frobnicate
 assert_eq "$CODE" 2
+done_test
+
+# --- performance profiles (#31) -------------------------------------------------------------------------------
+
+# The fold, pinned to real xctrace exports (macos/tests/fixtures/xctrace-time-profile-macos*.xml, first rows of the
+# 2026-10-23 runner captures) and checked against an independent XML reader that resolves id/ref: Xcode 26 (macOS 26)
+# wraps the stack in <tagged-backtrace>, Xcode 15 and 16 (macOS 14, 15) put <backtrace> in the row; macOS 14 left the
+# unstripped burner's own frames as addresses.
+fold() {
+    ( eval "$(sed -n '/^fold_xctrace_export() {/,/^}/p' "$SCRIPT")"; fold_xctrace_export "$1" )
+}
+
+setup the_fold_reads_the_tagged_backtrace_of_xcode_26
+FOLDED=$(fold "$FIXTURES/xctrace-time-profile-macos26.xml")
+assert_contains "$FOLDED" "dtburn;start;main;dt_burn_outer;dt_burn_inner 202"
+assert_eq "$(printf '%s\n' "$FOLDED" | wc -l | tr -d ' ')" 110
+assert_eq "$(printf '%s\n' "$FOLDED" | awk '{s+=$NF} END{print s}')" 338
+assert_not_contains "$FOLDED" "&amp;"   # entities are unescaped (a C++ reference is a real "&")
+assert_not_contains "$FOLDED" "&lt;"
+done_test
+
+setup the_fold_reads_the_plain_backtrace_of_xcode_16
+FOLDED=$(fold "$FIXTURES/xctrace-time-profile-macos15.xml")
+assert_contains "$FOLDED" "dtburn;start;main;dt_burn_outer;dt_burn_inner 149"
+assert_eq "$(printf '%s\n' "$FOLDED" | awk '{s+=$NF} END{print s}')" 350
+done_test
+
+setup the_fold_keeps_the_addresses_xcode_15_left_unnamed
+FOLDED=$(fold "$FIXTURES/xctrace-time-profile-macos14.xml")
+assert_contains "$FOLDED" "dtburn;start;0x100ed3e8b;0x100ed3eb7;0x100ed3ef4 14"
+assert_eq "$(printf '%s\n' "$FOLDED" | awk '{s+=$NF} END{print s}')" 264
+done_test
+
+setup profile_seconds_are_checked_and_trace_options_stand_alone
+run "" --profile 3
+assert_eq "$CODE" 2
+assert_contains "$OUT" "seconds must be 5 to 120, not 3"
+run "" --profile 500 --dry-run
+assert_eq "$CODE" 2
+run "" --sample
+assert_eq "$CODE" 2
+run "" --spindump 123 --profile
+assert_eq "$CODE" 2
+assert_contains "$OUT" "run it apart from"
+done_test
+
+setup a_dry_run_profile_captures_and_sends_nothing
+run "" --dry-run --profile 15 --sample 4242 20 --xctrace
+assert_eq "$CODE" 0
+assert_contains "$OUT" "Would sample every process for 20 s with spindump (sudo)"   # the last number given is the length
+assert_contains "$OUT" "Would sample 4242 for 20 s with sample"
+assert_contains "$OUT" "Would record every process for 20 s with xctrace"
+assert_contains "$OUT" "Dry run: nothing captured, nothing sent."
+assert_eq "$(cat "$LOG")" ""
+done_test
+
+setup a_profile_is_captured_with_sudo_confirmed_and_uploaded_as_a_trace_with_its_manifest
+run "y
+" --profile 12
+assert_eq "$CODE" 0
+calls=$(cat "$LOG")
+assert_contains "$calls" "sudo spindump -notarget 12 10 -file "
+assert_contains "$OUT" "spindump_text"
+assert_contains "$OUT" "sent spindump_text (trace 11111111-2222-3333-4444-555555555555)"
+assert_contains "$calls" "[https://triage.example.com/api/v1/traces]"
+assert_contains "$calls" 'config: header = "Authorization: Bearer dt_test_key_123"'
+assert_contains "$calls" '"traceType":"spindump_text"'
+assert_contains "$calls" '"trigger":{"name":"manual","type":"manual"}'
+assert_contains "$calls" '"tool":{"name":"spindump","version":"macOS 26.6.2","command":"spindump -notarget 12 10 -file <file>"}'
+assert_contains "$calls" '"os":{"family":"macos","build":"25G83"}'
+assert_contains "$calls" '"agentVersion":"0.1.0"'
+assert_not_contains "$(grep -o 'manifest=[^]]*' "$LOG")" "$T"   # no folder of ours, so no user name, in the manifest
+assert_eq "$(grep -c '^curl' "$LOG")" 1
+# The work folder is gone, and the host token is made once and kept.
+assert_eq "$(ls "$T" | grep -c '^dumptriage-trace')" 0
+TOKEN=$(cat "$T/home/.config/dumptriage/host-token")
+assert_eq "${#TOKEN}" 16
+run "y
+" --profile 12
+assert_eq "$(cat "$T/home/.config/dumptriage/host-token")" "$TOKEN"
+assert_contains "$(cat "$LOG")" "\"hostToken\":\"$TOKEN\""
+done_test
+
+setup answering_no_to_a_profile_sends_nothing_and_cleans_up
+run "n
+" --profile
+assert_contains "$OUT" "Not sent."
+assert_eq "$(grep -c '^curl' "$LOG")" 0
+assert_eq "$(ls "$T" | grep -c '^dumptriage-trace')" 0
+done_test
+
+setup sample_takes_a_process_and_seconds
+run "y
+" --sample 4242 20
+assert_eq "$CODE" 0
+calls=$(cat "$LOG")
+assert_contains "$calls" "sample 4242 20 1 -file "
+assert_not_contains "$calls" "sudo"   # no privilege for a process of your own
+assert_contains "$calls" '"traceType":"sample_text"'
+assert_contains "$calls" '"command":"sample <process> 20 1 -file <file>"'  # the process is not named in the manifest
+done_test
+
+setup xctrace_folds_on_the_mac_and_only_the_stacks_leave
+run "y
+" --xctrace 9
+assert_eq "$CODE" 0
+calls=$(cat "$LOG")
+assert_contains "$calls" "xcrun xctrace record --template Time Profiler --all-processes --time-limit 9s --no-prompt --output "
+assert_not_contains "$calls" "sudo"   # unprivileged first, as a customer would run it
+assert_contains "$calls" "--xpath /trace-toc/run[@number=\"1\"]/data/table[@schema=\"time-profile\"]"
+assert_contains "$OUT" "xctrace_export"
+assert_contains "$calls" '"traceType":"xctrace_export"'
+assert_contains "$calls" '"tool":{"name":"xctrace","version":"xctrace version 16.0 (17F113)"'
+uploaded=$(grep -o 'file=@[^]]*' "$LOG" | head -1)
+assert_contains "$uploaded" "xctrace.folded"
+assert_not_contains "$calls" "cap.trace]"   # the .trace bundle is never the upload
+assert_eq "$(ls "$T" | grep -c '^dumptriage-trace')" 0
+done_test
+
+setup xctrace_retries_with_sudo_when_the_unprivileged_record_is_refused
+FAKE_RECORD_NEEDS_SUDO=1 run "y
+" --xctrace 9
+assert_eq "$CODE" 0
+assert_contains "$OUT" "trying again with sudo"
+assert_contains "$(cat "$LOG")" "sudo xcrun xctrace record"
+done_test
+
+setup xctrace_needs_xcode
+FAKE_NO_XCODE=1 run "" --xctrace
+assert_eq "$CODE" 1
+assert_contains "$OUT" "xctrace is part of Xcode; the Command Line Tools alone do not have it"
+assert_eq "$(grep -c '^curl' "$LOG")" 0
+done_test
+
+setup a_service_without_traces_says_so_and_a_refused_key_stops
+FAKE_STATUS=403 run "y
+" --profile
+assert_eq "$CODE" 1
+assert_contains "$OUT" "NOT sent: HTTP 403"
+FAKE_STATUS=401 run "y
+" --profile
+assert_eq "$CODE" 1
+assert_contains "$OUT" "The service refused the API key (HTTP 401)"
 done_test
 
 # The shared tracing fixture (#26): this suite only checks it loads and is well formed; the
