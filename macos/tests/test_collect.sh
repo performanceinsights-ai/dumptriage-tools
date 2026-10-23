@@ -489,6 +489,253 @@ assert_eq "$CODE" 1
 assert_contains "$OUT" "The service refused the API key (HTTP 401)"
 done_test
 
+# --- watching (#31 part 2) -------------------------------------------------------------------------------------
+
+# A tracing.json in the shared schema, a metrics file standing in for top and sysctl, and a clock (DUMPTRIAGE_NOW).
+watch_env() {  # config JSON on stdin
+    cat > "$T/tracing.json"
+    export DUMPTRIAGE_TRACING_CONFIG="$T/tracing.json" DUMPTRIAGE_STATE_DIR="$T/state" DUMPTRIAGE_METRICS="$T/metrics"
+    : > "$T/metrics"
+}
+watch() {  # NOW, args
+    now=$1
+    shift
+    DUMPTRIAGE_NOW=$now run "" --watch-once "$@"
+}
+unwatch() { unset DUMPTRIAGE_TRACING_CONFIG DUMPTRIAGE_STATE_DIR DUMPTRIAGE_METRICS DUMPTRIAGE_NOW; }
+BASE=1800000000
+
+flat() {
+    ( eval "$(sed -n '/^json_flat() {/,/^}/p' "$SCRIPT")"; json_flat "$1" )
+}
+
+setup the_config_is_read_into_path_value_lines
+cat > "$T/c.json" <<'EOF'
+{ "schemaVersion": 1, "enabled": true, "backend": "spindump", "submission": "AskFirst",
+  "triggers": [ {"name": "cpu-high", "type": "cpuPercent", "threshold": 90.5, "sustainSec": 30},
+                {"name": "slack", "type": "cpuPercent", "process": "Slack Helper", "threshold": 80},
+                {"name": "hang", "type": "hangEvent"} ],
+  "limits": { "maxDurationSec": 20, "cooldownMin": 0, "dailyCap": 2 } }
+EOF
+FLAT=$(flat "$T/c.json")
+assert_contains "$FLAT" "enabled=true"
+assert_contains "$FLAT" "backend=spindump"
+assert_contains "$FLAT" "triggers.0.name=cpu-high"
+assert_contains "$FLAT" "triggers.0.threshold=90.5"
+assert_contains "$FLAT" "triggers.1.process=Slack Helper"
+assert_contains "$FLAT" "triggers.2.type=hangEvent"
+assert_contains "$FLAT" "limits.cooldownMin=0"
+assert_eq "$(printf '%s\n' "$FLAT" | wc -l | tr -d ' ')" 17
+done_test
+
+# The shared trigger fixture (#26), replayed through --watch-once: every sample is one call with the clock at that
+# moment; the first call that is not `no_fire` is the outcome the fixture names, at the time it names.
+fixture_tsv() {
+    TRIGGERS="$HERE/../../tests/fixtures/tracing/triggers.json"
+    if command -v jq > /dev/null 2>&1; then
+        jq -r '.cases[] | [.name, .trigger.type, .trigger.threshold, (.trigger.sustainSec // 0), .limits.cooldownMin, .limits.dailyCap,
+            (if (.history | length) == 0 then "-" else ([.history[].atSec] | map(tostring) | join(",")) end),
+            ([.series[] | "\(.tSec):\(.value)"] | join(",")), .expect.outcome, (.expect.atSec // "-")] | @tsv' "$TRIGGERS"
+    else
+        python3 -c 'import json,sys
+for c in json.load(open(sys.argv[1]))["cases"]:
+    t=c["trigger"]
+    print("\t".join(str(x) for x in [c["name"],t["type"],t["threshold"],t.get("sustainSec",0),c["limits"]["cooldownMin"],c["limits"]["dailyCap"],
+        ",".join(str(h["atSec"]) for h in c["history"]) or "-",",".join("%s:%s"%(p["tSec"],p["value"]) for p in c["series"]),
+        c["expect"]["outcome"],c["expect"].get("atSec","-")]))' "$TRIGGERS"
+    fi
+}
+
+setup the_shared_trigger_fixture_gives_the_same_outcomes_here
+CASES=0
+while IFS="$(printf '\t')" read -r cname ctype cthr csustain ccool ccap chist cseries cexpect cat_sec; do
+    CASES=$((CASES + 1))
+    rm -rf "$T/state"
+    watch_env <<EOF
+{"enabled": true, "backend": "spindump",
+ "triggers": [{"name": "t", "type": "$ctype", "threshold": $cthr, "sustainSec": $csustain}],
+ "limits": {"cooldownMin": $ccool, "dailyCap": $ccap}}
+EOF
+    mkdir -p "$T/state"
+    [ "$chist" = - ] || for h in $(printf '%s' "$chist" | tr ',' ' '); do printf '%s earlier\n' $((BASE + h)) >> "$T/state/captures.log"; done
+    got=no_fire
+    got_at=""
+    for point in $(printf '%s' "$cseries" | tr ',' ' '); do
+        printf '%s %s\n' "$ctype" "${point#*:}" > "$T/metrics"
+        watch $((BASE + ${point%%:*})) --dry-run
+        line=$(printf '%s\n' "$OUT" | grep '^trigger t: ' | grep -v 'no_fire' | head -n 1)
+        if [ -n "$line" ]; then
+            got=$(printf '%s' "$line" | sed 's/^trigger t: \([a-z_]*\).*/\1/')
+            got_at=$(( $(printf '%s' "$line" | sed 's/.* at \([0-9]*\) .*/\1/') - BASE ))
+            break
+        fi
+    done
+    [ "$got" = "$cexpect" ] || fail "$cname: expected $cexpect, got $got"
+    [ "$got" = no_fire ] || [ "$got_at" = "$cat_sec" ] || fail "$cname: expected it at $cat_sec s, got $got_at s"
+done <<EOF
+$(fixture_tsv)
+EOF
+assert_eq "$CASES" 12
+unwatch
+done_test
+
+setup watching_is_off_without_a_config_or_when_disabled
+unwatch
+DUMPTRIAGE_TRACING_CONFIG="$T/none.json" DUMPTRIAGE_STATE_DIR="$T/state" run "" --watch-once
+assert_eq "$CODE" 0
+assert_contains "$OUT" "nothing to watch"
+watch_env <<'EOF'
+{"enabled": false, "triggers": [{"name": "t", "type": "cpuPercent", "threshold": 1}]}
+EOF
+printf 'cpuPercent 99\n' > "$T/metrics"
+watch "$BASE"
+assert_contains "$OUT" "Tracing is off"
+assert_eq "$(grep -c . "$LOG")" 0
+unwatch
+done_test
+
+setup a_met_trigger_takes_a_capture_holds_it_and_the_next_call_is_in_cooldown
+watch_env <<'EOF'
+{"enabled": true, "backend": "spindump",
+ "triggers": [{"name": "cpu-high", "type": "cpuPercent", "threshold": 90, "sustainSec": 0}],
+ "limits": {"maxDurationSec": 20, "cooldownMin": 60, "dailyCap": 4}}
+EOF
+printf 'cpuPercent 97.5\n' > "$T/metrics"
+watch "$BASE"
+assert_eq "$CODE" 0
+assert_contains "$OUT" "trigger cpu-high: fire at $BASE (observed 97.5)"
+assert_contains "$OUT" "held cpu-high (spindump_text"
+assert_contains "$(cat "$LOG")" "sudo spindump -notarget 20 10 -file "
+HELD_DIR=$(ls -d "$T/state/spool/"*cpu-high)
+assert_eq "$(cat "$HELD_DIR/type")" spindump_text
+M=$(cat "$HELD_DIR/manifest.json")
+assert_contains "$M" '"trigger":{"name":"cpu-high","type":"cpuPercent","threshold":90,"observed":97.5}'
+assert_contains "$M" '"tool":{"name":"spindump"'
+assert_eq "$(cat "$T/state/captures.log")" "$BASE cpu-high"
+assert_eq "$(grep -c '^curl' "$LOG")" 0   # nothing is sent by watching
+assert_eq "$(ls "$T" | grep -c '^dumptriage-trace')" 0
+watch $((BASE + 60))
+assert_contains "$OUT" "trigger cpu-high: cooldown"
+assert_eq "$(ls "$T/state/spool" | wc -l | tr -d ' ')" 1
+unwatch
+done_test
+
+setup a_capture_over_the_disk_limit_is_not_kept
+watch_env <<'EOF'
+{"enabled": true, "backend": "spindump", "triggers": [{"name": "t", "type": "loadPerCpu", "threshold": 1}], "limits": {"maxDiskMB": 1}}
+EOF
+head -c 2000000 /dev/zero | tr '\0' 'x' > "$T/big"
+cat > "$T/bin/spindump" <<EOF
+#!/bin/bash
+while [ \$# -gt 0 ]; do [ "\$1" = -file ] && out=\$2; shift; done
+cp "$T/big" "\$out"
+EOF
+printf 'loadPerCpu 2\n' > "$T/metrics"
+watch "$BASE"
+assert_eq "$CODE" 1
+assert_contains "$OUT" "over limits.maxDiskMB (1)"
+assert_eq "$(ls "$T/state/spool" 2>/dev/null | wc -l | tr -d ' ')" 0
+unwatch
+done_test
+
+setup a_process_scoped_trigger_reads_that_processes_cpu_and_the_backend_can_be_xctrace
+watch_env <<'EOF'
+{"enabled": true, "backend": "xctrace",
+ "triggers": [{"name": "slack-busy", "type": "cpuPercent", "process": "Slack Helper", "threshold": 80}]}
+EOF
+printf 'cpuPercent 5\nproc:Slack Helper 91\n' > "$T/metrics"
+watch "$BASE"
+assert_contains "$OUT" "trigger slack-busy: fire at $BASE (observed 91)"
+HELD_DIR=$(ls -d "$T/state/spool/"*slack-busy)
+assert_eq "$(cat "$HELD_DIR/type")" xctrace_export
+assert_contains "$(cat "$HELD_DIR/manifest.json")" '"process":"Slack Helper"'
+assert_contains "$(cat "$HELD_DIR/trace")" "dtburn;start;main;dt_burn_outer;dt_burn_inner"
+unwatch
+done_test
+
+setup a_trigger_for_a_reading_this_mac_has_not_does_not_fire
+watch_env <<'EOF'
+{"enabled": true, "triggers": [{"name": "psi", "type": "psiSomeAvg10", "threshold": 10}]}
+EOF
+watch "$BASE" --dry-run
+assert_contains "$OUT" "trigger psi: no_fire (this Mac has no psiSomeAvg10 reading)"
+unwatch
+done_test
+
+setup a_new_hang_report_fires_a_hang_trigger_and_the_first_look_only_marks_the_time
+watch_env <<'EOF'
+{"enabled": true, "triggers": [{"name": "hang", "type": "hangEvent"}], "limits": {"cooldownMin": 0, "dailyCap": 4}}
+EOF
+mkdir "$T/hangs"
+watch "$BASE" --dry-run --dir "$T/hangs"
+assert_contains "$OUT" "trigger hang: no_fire"
+sleep 1
+cp "$FIXTURES/spindump-catalina-slack.txt" "$T/hangs/new_2026-10-23-111111.hang"
+watch "$((BASE + 5))" --dry-run --dir "$T/hangs"
+assert_contains "$OUT" "trigger hang: fire at $((BASE + 5)) (observed 1)"
+watch "$((BASE + 10))" --dry-run --dir "$T/hangs"
+assert_contains "$OUT" "trigger hang: no_fire"   # seen
+unwatch
+done_test
+
+setup a_schedule_trigger_is_due_once_its_interval_has_passed
+watch_env <<'EOF'
+{"enabled": true, "triggers": [{"name": "baseline", "type": "schedule", "intervalMin": 30}], "limits": {"cooldownMin": 0, "dailyCap": 4}}
+EOF
+watch "$BASE" --dry-run
+assert_contains "$OUT" "trigger baseline: no_fire"
+watch "$((BASE + 1799))" --dry-run
+assert_contains "$OUT" "trigger baseline: no_fire"
+watch "$((BASE + 1800))" --dry-run
+assert_contains "$OUT" "trigger baseline: fire at $((BASE + 1800))"
+watch "$((BASE + 1801))" --dry-run
+assert_contains "$OUT" "trigger baseline: no_fire"   # the interval starts again
+unwatch
+done_test
+
+setup held_captures_are_listed_sent_with_their_manifest_and_removed
+watch_env <<'EOF'
+{"enabled": true, "backend": "spindump", "triggers": [{"name": "cpu-high", "type": "cpuPercent", "threshold": 90}], "limits": {"cooldownMin": 0, "dailyCap": 4}}
+EOF
+printf 'cpuPercent 97\n' > "$T/metrics"
+watch "$BASE"
+watch "$((BASE + 1))"
+assert_eq "$(ls "$T/state/spool" | wc -l | tr -d ' ')" 2
+run "" --send-held --dry-run
+assert_contains "$OUT" "Held captures:"
+assert_contains "$OUT" "spindump_text"
+assert_contains "$OUT" "Dry run: nothing sent."
+run "n
+" --send-held
+assert_contains "$OUT" "Not sent."
+assert_eq "$(ls "$T/state/spool" | wc -l | tr -d ' ')" 2
+run "y
+" --send-held
+assert_eq "$CODE" 0
+assert_contains "$OUT" "sent spindump_text (trace 11111111-2222-3333-4444-555555555555)"
+assert_eq "$(grep -c '^curl' "$LOG")" 2
+assert_contains "$(cat "$LOG")" '"trigger":{"name":"cpu-high","type":"cpuPercent","threshold":90,"observed":97}'
+assert_eq "$(ls "$T/state/spool" | wc -l | tr -d ' ')" 0
+run "" --send-held
+assert_contains "$OUT" "Nothing is held"
+unwatch
+done_test
+
+setup the_launchd_plist_is_well_formed_and_runs_watch_once
+PLIST="$HERE/../com.performanceinsights.dumptriage-trace.plist"
+if command -v plutil > /dev/null 2>&1; then
+    plutil -lint "$PLIST" > /dev/null || fail "plutil rejects the plist"
+elif command -v xmllint > /dev/null 2>&1; then
+    xmllint --noout "$PLIST" || fail "xmllint rejects the plist"
+fi
+P=$(cat "$PLIST")
+assert_contains "$P" "<string>--watch-once</string>"
+assert_contains "$P" "<key>StartInterval</key>"
+assert_contains "$P" "<string>__SCRIPT__</string>"
+assert_contains "$P" "<string>__HOME__/.config/dumptriage/tracing.json</string>"
+assert_not_contains "$P" "/Users/"   # nothing machine-specific: the install command fills __HOME__ in
+done_test
+
 # The shared tracing fixture (#26): this suite only checks it loads and is well formed; the
 # trigger loop that uses it lands with the macOS capture (#31). jq on Linux CI, python3 on a Mac.
 setup tracing_fixture_is_well_formed

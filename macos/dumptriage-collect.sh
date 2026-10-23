@@ -29,6 +29,14 @@
 #   --xctrace [S]  Instruments' Time Profiler over every process, exported and folded to stacks on this Mac: only the
 #                  stacks are sent, never the .trace. Needs Xcode (the Command Line Tools do not have xctrace).
 #
+# Watching (website#1999): off until ~/.config/dumptriage/tracing.json says `"enabled": true` (the shared tracing
+# config; see macos/README.md). Run from launchd every minute or so; nothing is sent without you.
+#
+#   --watch-once   check the config's triggers once (CPU, load, a named process's CPU, a new .hang or .spin report, a
+#                  schedule). When one is met, outside the cooldown and under the daily cap, take a capture with the
+#                  configured backend (spindump or xctrace) and keep it in the spool folder, held.
+#   --send-held    list what is held, show the files, ask, send, and remove what was sent
+#
 # Environment:
 #   DUMPTRIAGE_API_URL     the service, e.g. https://dumptriage.example.com (required to send)
 #   DUMPTRIAGE_API_KEY     your API key; if unset, read from the login keychain:
@@ -50,6 +58,13 @@ SAMPLE_TARGET=""
 XCTRACE=0
 TRACE_SECONDS=10
 TRACE_DIR=""
+WATCH_ONCE=0
+SEND_HELD=0
+TRIGGER_NAME=manual
+TRIGGER_TYPE=manual
+TRIGGER_THRESHOLD=""
+TRIGGER_OBSERVED=""
+TRIGGER_PROCESS=""
 
 usage() {
     sed -n '2,/^$/s/^# \{0,1\}//p' "$0"
@@ -83,6 +98,8 @@ while [ $# -gt 0 ]; do
         --spindump)
             [ $# -ge 2 ] || die "--spindump needs a process id or name" 2
             SPINDUMP_TARGET=$2; shift 2 ;;
+        --watch-once) WATCH_ONCE=1; shift ;;
+        --send-held) SEND_HELD=1; shift ;;
         --profile) PROFILE=1; shift; if seconds_next "${1:-}"; then shift; fi ;;
         --xctrace) XCTRACE=1; shift; if seconds_next "${1:-}"; then shift; fi ;;
         --sample)
@@ -187,10 +204,19 @@ host_token() {
     printf '%s' "$token"
 }
 
+# The manifest's trigger object: manual unless a watched trigger fired (TRIGGER_*), with what it observed.
+trigger_json() {
+    out=$(printf '{"name":"%s","type":"%s"' "$(json_str "$TRIGGER_NAME")" "$TRIGGER_TYPE")
+    [ -z "$TRIGGER_THRESHOLD" ] || out="$out,\"threshold\":$TRIGGER_THRESHOLD"
+    [ -z "$TRIGGER_OBSERVED" ] || out="$out,\"observed\":$TRIGGER_OBSERVED"
+    [ -z "$TRIGGER_PROCESS" ] || out="$out,\"process\":\"$(json_str "$TRIGGER_PROCESS")\""
+    printf '%s}' "$out"
+}
+
 # manifest.json for one capture: TYPE TOOL VERSION COMMAND START STOP. The command has its file names replaced by
 # <file>, so no home directory or user name is in it.
 trace_manifest() {
-    printf '{"schemaVersion":1,"traceType":"%s","trigger":{"name":"manual","type":"manual"},' "$1"
+    printf '{"schemaVersion":1,"traceType":"%s","trigger":%s,' "$1" "$(trigger_json)"
     printf '"window":{"startUtc":"%s","stopUtc":"%s"},' "$5" "$6"
     printf '"tool":{"name":"%s","version":"%s","command":"%s"},' "$2" "$(json_str "$3")" "$(json_str "$4")"
     printf '"os":{"family":"macos","build":"%s"},"hostToken":"%s","agentVersion":"%s"}' \
@@ -420,6 +446,295 @@ run_traces() {
 }
 
 
+# --- watching: --watch-once and --send-held (website#1999, #31) -------------------------------------------------
+
+TRACING_CONFIG=${DUMPTRIAGE_TRACING_CONFIG:-$HOME/.config/dumptriage/tracing.json}
+STATE_DIR=${DUMPTRIAGE_STATE_DIR:-$HOME/.config/dumptriage/tracing-state}
+SPOOL_DIR=$STATE_DIR/spool
+
+# The config's JSON as `path=value` lines (`triggers.0.name=cpu-high`): macOS has no jq or python3 to rely on. Strings
+# are read with their backslash escapes dropped, which is enough for the names and numbers the schema allows.
+json_flat() {
+    awk '
+    BEGIN { RS = "\001" }
+    function skip() { while (i <= n && substr(s, i, 1) ~ /[ \t\r\n]/) i++ }
+    function string(   out, c) {
+        i++
+        out = ""
+        while (i <= n) {
+            c = substr(s, i, 1)
+            if (c == "\\") { out = out substr(s, i + 1, 1); i += 2 }
+            else if (c == "\"") { i++; return out }
+            else { out = out c; i++ }
+        }
+        return out
+    }
+    function value(prefix,   c, key, idx, tok) {
+        skip(); c = substr(s, i, 1)
+        if (c == "{") {
+            i++; skip()
+            if (substr(s, i, 1) == "}") { i++; return }
+            while (i <= n) {
+                skip(); key = string(); skip(); i++
+                value(prefix == "" ? key : prefix "." key)
+                skip(); c = substr(s, i, 1); i++
+                if (c == "}") return
+            }
+        } else if (c == "[") {
+            i++; skip()
+            if (substr(s, i, 1) == "]") { i++; return }
+            idx = 0
+            while (i <= n) {
+                value(prefix "." idx); idx++
+                skip(); c = substr(s, i, 1); i++
+                if (c == "]") return
+            }
+        } else if (c == "\"") { print prefix "=" string() }
+        else {
+            tok = ""
+            while (i <= n && substr(s, i, 1) !~ /[,}\] \t\r\n]/) { tok = tok substr(s, i, 1); i++ }
+            print prefix "=" tok
+        }
+    }
+    { s = $0; n = length(s); i = 1; value("") }
+    ' "$1"
+}
+
+CFG=""
+cfg() {  # key, default
+    found=$(printf '%s\n' "$CFG" | sed -n "s/^$1=//p" | head -n 1)
+    printf '%s' "${found:-$2}"
+}
+
+now_epoch() {
+    printf '%s' "${DUMPTRIAGE_NOW:-$(date +%s)}"
+}
+
+# A number at or above another (awk compares them as numbers, which `[ -ge ]` cannot with a decimal).
+at_least() {
+    awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 >= b + 0) }'
+}
+
+# One metric: CPU percent of the whole Mac (`top`), of one process, the one-minute load per CPU, or nothing when this
+# Mac has no source (psiSomeAvg10, diskLatencyMs). DUMPTRIAGE_METRICS names a file of `<type> <value>` and
+# `proc:<name> <value>` lines instead, for tests and for replaying a series.
+metric() {  # type, process
+    if [ -n "${DUMPTRIAGE_METRICS:-}" ]; then
+        key=$1
+        [ -z "$2" ] || key="proc:$2"
+        sed -n "s/^$key //p" "$DUMPTRIAGE_METRICS" | head -n 1
+        return 0
+    fi
+    case "$1" in
+        cpuPercent)
+            if [ -n "$2" ]; then
+                top -l 2 -s 1 -o cpu -n 40 -stats command,cpu 2>/dev/null | awk -v want="$2" '
+                    /^COMMAND/ { block++; next }
+                    block == 2 && NF >= 2 { cpu = $NF; $NF = ""; sub(/ +$/, "", $0); if (index(want, $0) == 1 || index($0, substr(want, 1, 15)) == 1) sum += cpu }
+                    END { if (block >= 2) printf "%.1f", sum }'
+            else
+                top -l 2 -n 0 -s 1 2>/dev/null | awk '/^CPU usage:/ { line = $0 }
+                    END { if (match(line, /[0-9.]+% idle/)) { v = substr(line, RSTART, RLENGTH - 6); printf "%.1f", 100 - v } }'
+            fi ;;
+        process)
+            metric cpuPercent "$2" ;;
+        loadPerCpu)
+            load=$(sysctl -n vm.loadavg 2>/dev/null | awk '{ print $2 }')
+            cpus=$(sysctl -n hw.ncpu 2>/dev/null)
+            [ -n "$load" ] && [ -n "$cpus" ] && awk -v l="$load" -v c="$cpus" 'BEGIN { printf "%.2f", l / c }' ;;
+    esac
+}
+
+# Captures taken so far, host-wide (the limits are the host's): one `epoch trigger` line each.
+capture_times() {
+    [ -f "$STATE_DIR/captures.log" ] && awk '{ print $1 }' "$STATE_DIR/captures.log"
+}
+
+# What a met trigger does at time $1: cooldown (a capture within cooldownMin), capped (dailyCap captures in the day
+# before), or fire. The shared rule (tests/fixtures/tracing/triggers.json); the cooldown is reported before the cap.
+gate() {
+    t=$1
+    cooldown=$(cfg limits.cooldownMin 60)
+    cap=$(cfg limits.dailyCap 4)
+    capture_times | awk -v t="$t" -v cool="$cooldown" -v cap="$cap" '
+        $1 > t - cool * 60 { recent = 1 }
+        $1 > t - 86400 { day++ }
+        END { if (recent) print "cooldown"; else if (day + 0 >= cap + 0) print "capped"; else print "fire" }'
+}
+
+# New hang or spin reports since the last look (the first look only marks the time).
+new_hang_reports() {
+    marker="$STATE_DIR/hang-seen"
+    if [ ! -f "$marker" ]; then
+        : > "$marker"
+        return 0
+    fi
+    count=0
+    for dir in "${DIRS[@]}"; do
+        [ -d "$dir" ] || continue
+        n=$(find "$dir" -maxdepth 1 -type f \( -name '*.hang' -o -name '*.spin' \) -newer "$marker" 2>/dev/null | wc -l | tr -d ' ')
+        count=$((count + n))
+    done
+    [ "$count" -gt 0 ] && touch "$marker"
+    printf '%s' "$count"
+}
+
+# Checks each trigger once. Prints `trigger NAME: fire|cooldown|capped|no_fire ...` and, for the first to fire,
+# sets FIRED_* for the capture. A run above the threshold is remembered between calls (run.NAME holds when it
+# began): the trigger is met once it has lasted sustainSec, as in the shared rule.
+FIRED=0
+check_triggers() {
+    now=$(now_epoch)
+    FIRED=0
+    i=0
+    while :; do
+        name=$(cfg "triggers.$i.name" "")
+        [ -n "$name" ] || break
+        type=$(cfg "triggers.$i.type" "")
+        threshold=$(cfg "triggers.$i.threshold" "")
+        proc=$(cfg "triggers.$i.process" "")
+        sustain=$(cfg "triggers.$i.sustainSec" 0)
+        i=$((i + 1))
+        met=0
+        observed=""
+        run="$STATE_DIR/run.$name"
+        case "$type" in
+            hangEvent)
+                observed=$(new_hang_reports)
+                [ "${observed:-0}" -gt 0 ] && met=1 ;;
+            schedule)
+                marker="$STATE_DIR/schedule.$name"
+                if [ ! -f "$marker" ]; then
+                    printf '%s\n' "$now" > "$marker"
+                else
+                    last=$(cat "$marker")
+                    [ $((now - last)) -ge $(( $(cfg "triggers.$((i - 1)).intervalMin" 60) * 60 )) ] && met=1
+                fi ;;
+            cpuPercent|loadPerCpu|psiSomeAvg10|diskLatencyMs|process)
+                observed=$(metric "$type" "$proc")
+                if [ -z "$observed" ]; then
+                    rm -f "$run"
+                    printf 'trigger %s: no_fire (this Mac has no %s reading)\n' "$name" "$type"
+                    continue
+                fi
+                if at_least "$observed" "$threshold"; then
+                    [ -f "$run" ] || printf '%s\n' "$now" > "$run"
+                    started=$(cat "$run")
+                    [ $((now - started)) -ge "$sustain" ] && met=1
+                else
+                    rm -f "$run"
+                fi ;;
+            *) printf 'trigger %s: ignored (unknown type %s)\n' "$name" "$type"; continue ;;
+        esac
+        if [ "$met" -eq 0 ]; then
+            printf 'trigger %s: no_fire\n' "$name"
+            continue
+        fi
+        outcome=$(gate "$now")
+        printf 'trigger %s: %s at %s (observed %s)\n' "$name" "$outcome" "$now" "${observed:-n/a}"
+        if [ "$outcome" = fire ] && [ "$FIRED" -eq 0 ]; then
+            FIRED=1
+            TRIGGER_NAME=$name
+            TRIGGER_TYPE=$type
+            TRIGGER_THRESHOLD=$threshold
+            TRIGGER_OBSERVED=$observed
+            TRIGGER_PROCESS=$proc
+            [ "$type" != schedule ] || printf '%s\n' "$now" > "$STATE_DIR/schedule.$name"
+            [ "$DRY_RUN" -eq 1 ] || printf '%s %s\n' "$now" "$name" >> "$STATE_DIR/captures.log"
+        fi
+    done
+}
+
+# A triggered capture into the spool, held: a folder per capture with the trace, its manifest and its type.
+spool_capture() {
+    backend=$(cfg backend spindump)
+    max_sec=$(cfg limits.maxDurationSec 60)
+    max_mb=$(cfg limits.maxDiskMB 512)
+    TRACE_SECONDS=$max_sec
+    [ "$TRACE_SECONDS" -le 30 ] || TRACE_SECONDS=30   # a system-wide spindump of 30 s is tens of megabytes
+    [ "$TRACE_SECONDS" -ge 5 ] || TRACE_SECONDS=5
+    trace_workdir
+    case "$backend" in
+        spindump) capture_profile ;;
+        xctrace) capture_xctrace ;;
+        *) die "the tracing config's backend '$backend' is not one this Mac has (spindump or xctrace)" ;;
+    esac
+    size=$(file_size "$TRACE_FILE")
+    if [ "$size" -gt $((max_mb * 1024 * 1024)) ]; then
+        die "the capture is $size bytes, over limits.maxDiskMB ($max_mb); not kept"
+    fi
+    entry="$SPOOL_DIR/$(now_epoch)-$TRIGGER_NAME"
+    mkdir -p "$entry"
+    mv "$TRACE_FILE" "$entry/trace"
+    trace_manifest "$TRACE_TYPE" "$TRACE_TOOL" "$TRACE_TOOL_VERSION" "$TRACE_COMMAND" "$TRACE_START" "$TRACE_STOP" > "$entry/manifest.json"
+    printf '%s\n' "$TRACE_TYPE" > "$entry/type"
+    # A root daemon writes this for the user who will send it.
+    if [ "$(id -u)" -eq 0 ] && [ -d "$HOME" ]; then
+        chown -R "$(stat -f %u "$HOME" 2>/dev/null || stat -c %u "$HOME")" "$STATE_DIR" 2>/dev/null
+    fi
+    printf 'held %s (%s, %s bytes) in %s\n' "$TRIGGER_NAME" "$TRACE_TYPE" "$size" "$entry"
+}
+
+watch_once() {
+    mkdir -p "$STATE_DIR"
+    if [ ! -f "$TRACING_CONFIG" ]; then
+        echo "No tracing config at $TRACING_CONFIG: nothing to watch."
+        exit 0
+    fi
+    CFG=$(json_flat "$TRACING_CONFIG")
+    if [ "$(cfg enabled false)" != true ]; then
+        echo "Tracing is off in $TRACING_CONFIG."
+        exit 0
+    fi
+    check_triggers
+    if [ "$FIRED" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+        spool_capture
+    fi
+    exit 0
+}
+
+# Lists what the spool holds, asks, sends it as performance traces and removes what was sent.
+send_held() {
+    HELD=()
+    for entry in "$SPOOL_DIR"/*; do
+        [ -f "$entry/manifest.json" ] && [ -f "$entry/trace" ] || continue
+        HELD[${#HELD[@]}]=$entry
+    done
+    if [ ${#HELD[@]} -eq 0 ]; then
+        echo "Nothing is held in $SPOOL_DIR."
+        exit 0
+    fi
+    echo "Held captures:"
+    i=0
+    while [ $i -lt ${#HELD[@]} ]; do
+        printf '  %2d) %-14s %s (%s bytes)\n' $((i + 1)) "$(cat "${HELD[$i]}/type")" "$(basename "${HELD[$i]}")" "$(file_size "${HELD[$i]}/trace")"
+        i=$((i + 1))
+    done
+    echo "They name the processes that were running, their paths and versions, and can include your user name; Dump Triage redacts user names before analysis."
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "Dry run: nothing sent."
+        exit 0
+    fi
+    printf 'Send %d capture(s) to %s? [y/N] ' ${#HELD[@]} "$API_URL"
+    read -r answer || answer=""
+    case "$answer" in
+        y|Y|yes|YES) ;;
+        *) echo "Not sent."; exit 0 ;;
+    esac
+    failed=0
+    for entry in "${HELD[@]}"; do
+        TRACE_TYPE=$(cat "$entry/type")
+        upload_trace "$entry/trace" "$(cat "$entry/manifest.json")"
+        case $? in
+            0) rm -rf "$entry" ;;
+            2) failed=1; break ;;
+            *) failed=1 ;;
+        esac
+    done
+    exit $failed
+}
+
+
 SELECTED=()
 SELECTED_KINDS=()
 select_files() {
@@ -549,7 +864,7 @@ upload() {
 
 # Where to send, and the key, before anything else: a customer with no key
 # learns it before picking reports or typing a sudo password for a spindump.
-if [ "$DRY_RUN" -eq 0 ]; then
+if [ "$DRY_RUN" -eq 0 ] && [ "$WATCH_ONCE" -eq 0 ]; then  # watching only captures and holds: nothing is sent
     API_URL=${DUMPTRIAGE_API_URL:-}
     [ -n "$API_URL" ] || die "set DUMPTRIAGE_API_URL to the service's address, e.g. https://dumptriage.example.com" 2
     PORTAL_URL=${DUMPTRIAGE_PORTAL_URL:-$API_URL}
@@ -557,6 +872,12 @@ if [ "$DRY_RUN" -eq 0 ]; then
     api_key || no_key
 fi
 
+if [ "$WATCH_ONCE" -eq 1 ]; then
+    watch_once
+fi
+if [ "$SEND_HELD" -eq 1 ]; then
+    send_held
+fi
 if [ "$PROFILE" -eq 1 ] || [ -n "$SAMPLE_TARGET" ] || [ "$XCTRACE" -eq 1 ]; then
     run_traces
 fi

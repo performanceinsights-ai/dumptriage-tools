@@ -142,6 +142,40 @@ jobs:
           done
           exit $status
 
+      - name: watch mode with the real top and sysctl (the tracing config, --watch-once, --send-held)
+        run: |
+          # The readings come from this Mac (top, sysctl), not from the test hook. The burner holds a core, so a
+          # per-process trigger on `dtburn` at 50% must fire; a threshold of 0 on the whole Mac and on the load must too.
+          export HOME="$WORK/watchhome" DUMPTRIAGE_NOW=
+          unset DUMPTRIAGE_NOW
+          mkdir -p "$HOME/.config/dumptriage" "$OUT/watch"
+          cat > "$HOME/.config/dumptriage/tracing.json" <<'JSON'
+          {"schemaVersion": 1, "enabled": true, "backend": "spindump",
+           "triggers": [
+             {"name": "any-cpu", "type": "cpuPercent", "threshold": 0},
+             {"name": "burner", "type": "cpuPercent", "process": "dtburn", "threshold": 50},
+             {"name": "any-load", "type": "loadPerCpu", "threshold": 0},
+             {"name": "never", "type": "cpuPercent", "process": "dtburn", "threshold": 100000},
+             {"name": "no-psi", "type": "psiSomeAvg10", "threshold": 1}],
+           "limits": {"maxDurationSec": 5, "cooldownMin": 0, "dailyCap": 10}}
+          JSON
+          sed -i.bak 's/^          //' "$HOME/.config/dumptriage/tracing.json" && rm -f "$HOME/.config/dumptriage/tracing.json.bak"
+          status=0
+          echo "=== decisions with the real readings (dry run)" | tee "$OUT/watch/log.txt"
+          /bin/bash macos/dumptriage-collect.sh --watch-once --dry-run 2>&1 | tee -a "$OUT/watch/log.txt"
+          for want in "trigger any-cpu: fire" "trigger burner: fire" "trigger any-load: fire" "trigger never: no_fire" "trigger no-psi: no_fire"; do
+            grep -q "$want" "$OUT/watch/log.txt" || { echo "missing: $want"; status=1; }
+          done
+          echo "=== a real capture, held (root: the runner's sudo)" | tee -a "$OUT/watch/log.txt"
+          sudo -E /bin/bash macos/dumptriage-collect.sh --watch-once 2>&1 | tee -a "$OUT/watch/log.txt"
+          sudo chown -R "$USER" "$HOME/.config/dumptriage"
+          find "$HOME/.config/dumptriage/tracing-state/spool" -type f | tee -a "$OUT/watch/log.txt"
+          for f in manifest.json type trace; do
+            find "$HOME/.config/dumptriage/tracing-state/spool" -name "$f" -size +0 | grep -q . || { echo "no $f held"; status=1; }
+          done
+          cp "$HOME/.config/dumptriage/tracing-state/spool"/*/manifest.json "$OUT/watch/" 2>/dev/null || true
+          exit $status
+
       - name: xctrace symbolicate experiment (Xcode 15.4 on macOS 14 exported 98% of frames as addresses)
         continue-on-error: true
         run: |
