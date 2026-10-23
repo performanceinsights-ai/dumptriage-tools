@@ -122,7 +122,10 @@ if [ "\$1" = --find ]; then [ -z "\${FAKE_NO_XCODE:-}" ] && echo /Applications/X
 [ "\$1" = xctrace ] || exit 1
 shift
 case "\$1" in
-    version) echo "xctrace version 16.0 (17F113)" ;;
+    version) case "\${DEVELOPER_DIR:-}" in
+                 *Xcode_16*) echo "xctrace version 16.0 (16C5032a)" ;;
+                 *) echo "\${FAKE_XCTRACE_VERSION:-xctrace version 16.0 (17F113)}" ;;
+             esac ;;
     record)
         if [ -n "\${FAKE_RECORD_NEEDS_SUDO:-}" ] && [ -z "\${SUDO_FAKE:-}" ]; then echo "not permitted" >&2; exit 1; fi
         while [ \$# -gt 0 ]; do [ "\$1" = --output ] && out=\$2; shift; done
@@ -494,6 +497,32 @@ DEVELOPER_DIR=/Applications/Xcode_16.2.app/Contents/Developer FAKE_RECORD_NEEDS_
 " --xctrace 31
 assert_eq "$CODE" 0
 assert_contains "$(cat "$LOG")" "sudo DEVELOPER_DIR=/Applications/Xcode_16.2.app/Contents/Developer xcrun xctrace record"
+done_test
+
+setup xctrace_from_xcode_15_switches_to_a_newer_xcode_beside_it
+mkdir -p "$T/apps/Xcode_15.4.app/Contents/Developer" "$T/apps/Xcode_16.2.app/Contents/Developer"
+DUMPTRIAGE_XCODE_APPS="$T/apps" FAKE_XCTRACE_VERSION="xctrace version 15.3 (15F31d)" run "y
+" --xctrace 31
+assert_eq "$CODE" 0
+assert_contains "$OUT" "Using Xcode_16.2.app: the selected Xcode's xctrace (15) leaves most frames unnamed."
+assert_contains "$(cat "$LOG")" '"tool":{"name":"xctrace","version":"xctrace version 16.0 (16C5032a)"'
+done_test
+
+setup xctrace_from_xcode_15_alone_is_refused
+mkdir -p "$T/apps/Xcode_15.4.app/Contents/Developer"
+DUMPTRIAGE_XCODE_APPS="$T/apps" FAKE_XCTRACE_VERSION="xctrace version 15.3 (15F31d)" run "" --xctrace 31
+assert_eq "$CODE" 1
+assert_contains "$OUT" "this Xcode's xctrace (version 15) leaves almost every frame unnamed: install Xcode 16 or later, or use --profile"
+assert_eq "$(grep -c '^curl' "$LOG")" 0
+done_test
+
+setup xctrace_window_is_the_recording_not_the_save
+DUMPTRIAGE_XCODE_APPS="$T/apps" run "y
+" --xctrace 31
+manifest=$(grep -o '"window":{[^}]*}' "$LOG" | head -1)
+start=$(printf '%s' "$manifest" | sed 's/.*"startUtc":"\([^"]*\)".*/\1/')
+stop=$(printf '%s' "$manifest" | sed 's/.*"stopUtc":"\([^"]*\)".*/\1/')
+assert_eq "$(( $(date -u -d "$stop" +%s) - $(date -u -d "$start" +%s) ))" 31
 done_test
 
 setup xctrace_needs_xcode
