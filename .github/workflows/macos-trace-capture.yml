@@ -13,6 +13,8 @@ on:
     paths:
       - .github/workflows/macos-trace-capture.yml
       - macos/tests/burn.c
+      - macos/tests/fake_trace_service.py
+      - macos/dumptriage-collect.sh
 
 permissions:
   contents: read
@@ -118,6 +120,27 @@ jobs:
             --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' \
             --output "$OUT/xctrace-time-profile.xml"
           test -s "$OUT/xctrace-time-profile.xml"
+
+      - name: dumptriage-collect.sh with its real tools, against a stand-in service
+        run: |
+          # /bin/bash is bash 3.2 here, the one a customer has. --profile and --xctrace use sudo and Xcode as on a Mac.
+          mkdir -p "$OUT/service"
+          python3 macos/tests/fake_trace_service.py "$OUT/service" 8765 &
+          SERVICE_PID=$!
+          sleep 2
+          export DUMPTRIAGE_API_URL=http://127.0.0.1:8765 DUMPTRIAGE_API_KEY=dt_ci_key HOME="$WORK/home"
+          mkdir -p "$HOME"
+          status=0
+          for args in "--profile 5" "--sample $BURN_PID 5" "--xctrace 5"; do
+            echo "=== dumptriage-collect.sh $args" | tee -a "$OUT/collector-log.txt"
+            echo y | /bin/bash macos/dumptriage-collect.sh $args 2>&1 | tee -a "$OUT/collector-log.txt" || status=1
+          done
+          kill "$SERVICE_PID" 2>/dev/null || true
+          ls -l "$OUT/service"
+          for t in spindump_text sample_text xctrace_export; do
+            grep -l "\"traceType\":\"$t\"" "$OUT"/service/*.manifest > /dev/null || { echo "no $t upload reached the service"; status=1; }
+          done
+          exit $status
 
       - name: dSYM lookup by UUID (website#2156)
         continue-on-error: true
