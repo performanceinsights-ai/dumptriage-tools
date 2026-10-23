@@ -93,7 +93,7 @@ EOF
     cat > "$T/bin/sudo" <<EOF
 #!/bin/bash
 printf 'sudo %s\n' "\$*" >> "$LOG"
-"\$@"
+env "\$@"   # as sudo does, a leading VAR=value sets it for the command
 EOF
     cat > "$T/bin/spindump" <<EOF
 #!/bin/bash
@@ -133,7 +133,7 @@ case "\$1" in
 esac
 EOF
     # sudo marks its children so the fake xcrun can tell a privileged run
-    sed -i.bak 's/^"\$@"$/SUDO_FAKE=1 "\$@"/' "$T/bin/sudo" && rm -f "$T/bin/sudo.bak"
+    sed -i.bak 's/^env "\$@"/SUDO_FAKE=1 env "\$@"/' "$T/bin/sudo" && rm -f "$T/bin/sudo.bak"
     chmod +x "$T/bin/"*
 }
 
@@ -380,8 +380,24 @@ done_test
 setup profile_seconds_are_checked_and_trace_options_stand_alone
 run "" --profile 3
 assert_eq "$CODE" 2
-assert_contains "$OUT" "seconds must be 30 to 120, not 3 (shorter profiles are too thin to judge)"
-run "" --profile 29 --dry-run   # website#2208: under 30 s a profile is too thin to judge
+assert_contains "$OUT" "seconds must be 15 to 120 (30 to 120 for --profile), not 3"
+# website#2208: spindump's 10 ms needs 30 s for the service's 2,000 samples; sample and xctrace (1 ms) need 15.
+run "" --profile 29 --dry-run
+assert_eq "$CODE" 2
+assert_contains "$OUT" "--profile needs 30 to 120 seconds, not 29"
+run "" --profile 121 --dry-run
+assert_eq "$CODE" 2
+run "" --profile 30 --dry-run
+assert_eq "$CODE" 0
+assert_contains "$OUT" "Would sample every process for 30 s with spindump"
+run "" --profile 120 --dry-run
+assert_eq "$CODE" 0
+run "" --profile --dry-run
+assert_contains "$OUT" "Would sample every process for 30 s with spindump"   # the default
+run "" --sample 4242 15 --dry-run
+assert_eq "$CODE" 0
+assert_contains "$OUT" "Would sample 4242 for 15 s with sample"
+run "" --xctrace 14 --dry-run
 assert_eq "$CODE" 2
 run "" --profile 500 --dry-run
 assert_eq "$CODE" 2
@@ -471,6 +487,13 @@ FAKE_RECORD_NEEDS_SUDO=1 run "y
 assert_eq "$CODE" 0
 assert_contains "$OUT" "trying again with sudo"
 assert_contains "$(cat "$LOG")" "sudo xcrun xctrace record"
+done_test
+
+setup xctrace_keeps_a_chosen_xcode_through_sudo
+DEVELOPER_DIR=/Applications/Xcode_16.2.app/Contents/Developer FAKE_RECORD_NEEDS_SUDO=1 run "y
+" --xctrace 31
+assert_eq "$CODE" 0
+assert_contains "$(cat "$LOG")" "sudo DEVELOPER_DIR=/Applications/Xcode_16.2.app/Contents/Developer xcrun xctrace record"
 done_test
 
 setup xctrace_needs_xcode
@@ -608,6 +631,7 @@ assert_eq "$CODE" 0
 assert_contains "$OUT" "trigger cpu-high: fire at $BASE (observed 97.5)"
 assert_contains "$OUT" "held cpu-high (spindump_text"
 assert_contains "$(cat "$LOG")" "sudo spindump -notarget 30 10 -file "   # 30 s although maxDurationSec is 20 (website#2208)
+assert_contains "$OUT" "maxDurationSec 20 is under the 30 s a macOS profile needs; capturing 30 s"
 HELD_DIR=$(ls -d "$T/state/spool/"*cpu-high)
 assert_eq "$(cat "$HELD_DIR/type")" spindump_text
 M=$(cat "$HELD_DIR/manifest.json")

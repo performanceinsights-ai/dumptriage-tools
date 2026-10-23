@@ -183,22 +183,24 @@ jobs:
         run: |
           # How many of an export's frames are named, raw and after `xctrace symbolicate` (website#2206).
           count() {
-            xcrun xctrace export --input "$1" --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' --output "$WORK/count.xml" > /dev/null 2>&1
-            total=$(grep -o '<frame id="[0-9]*" name="[^"]*"' "$WORK/count.xml" | wc -l | tr -d ' ')
-            raw=$(grep -o '<frame id="[0-9]*" name="0x[0-9a-fA-F]*"' "$WORK/count.xml" | wc -l | tr -d ' ')
+            rm -f "$WORK/count.xml"
+            xcrun xctrace export --input "$1" --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' --output "$WORK/count.xml" > /dev/null 2>&1 || { echo "$2: export failed"; return 0; }
+            # `|| true` here and on the symbolicate calls: under bash -e and pipefail a refused symbolicate ("No dSYMs
+            # were found") or a grep that matches nothing ended the block before the --dsym try ever ran (#47 review).
+            total=$({ grep -o '<frame id="[0-9]*" name="[^"]*"' "$WORK/count.xml" || true; } | wc -l | tr -d ' ')
+            raw=$({ grep -o '<frame id="[0-9]*" name="0x[0-9a-fA-F]*"' "$WORK/count.xml" || true; } | wc -l | tr -d ' ')
             echo "$2: $total frames defined, $raw named as addresses"
           }
           # The dSYM of the burner that is running, so --dsym has something to name.
           dsymutil "$WORK/dtburn" -o "$WORK/dtburn.dSYM" > /dev/null 2>&1
           {
-            xcrun xctrace record --template 'Time Profiler' --all-processes --time-limit 5s --no-prompt --output "$WORK/sym.trace" 2>&1 | tail -2
+            xcrun xctrace record --template 'Time Profiler' --all-processes --time-limit 5s --no-prompt --output "$WORK/sym.trace" 2>&1 | tail -2 || true
             count "$WORK/sym.trace" "raw export"
             echo "== xctrace symbolicate, no --dsym"
-            xcrun xctrace symbolicate --input "$WORK/sym.trace" --output "$WORK/sym-a.trace" 2>&1 | tail -3
-            # `if`, not `&&`: under bash -e a false test ended the block here before the --dsym try (#46).
+            xcrun xctrace symbolicate --input "$WORK/sym.trace" --output "$WORK/sym-a.trace" 2>&1 | tail -3 || true
             if [ -e "$WORK/sym-a.trace" ]; then count "$WORK/sym-a.trace" "after symbolicate (no dsym)"; fi
             echo "== xctrace symbolicate --dsym the burner's dSYM"
-            xcrun xctrace symbolicate --input "$WORK/sym.trace" --output "$WORK/sym-b.trace" --dsym "$WORK/dtburn.dSYM" 2>&1 | tail -3
+            xcrun xctrace symbolicate --input "$WORK/sym.trace" --output "$WORK/sym-b.trace" --dsym "$WORK/dtburn.dSYM" 2>&1 | tail -3 || true
             if [ -e "$WORK/sym-b.trace" ]; then count "$WORK/sym-b.trace" "after symbolicate --dsym"; fi
           } > "$OUT/xctrace-symbolicate.txt" 2>&1
           cat "$OUT/xctrace-symbolicate.txt"
@@ -207,25 +209,47 @@ jobs:
         if: matrix.os == 'macos-14'
         continue-on-error: true
         run: |
-          # The image ships several Xcodes; record and export with the newest of each major version and count how many
-          # frames come back named, and whether the burner's own function is among them.
+          # The image ships several Xcodes; record and export with the newest release of each major version and count
+          # how many frames come back named, and whether the burner's own function is among them. Counts end in
+          # `|| true`: under bash -e and pipefail a grep that matches nothing would end the step (#47 review).
           mkdir -p "$OUT/xcodes"
+          frames() { { grep -o "$1" "$2" 2>/dev/null || true; } | wc -l | tr -d ' '; }
+          releases() {  # Xcode_<version>.app only: no Xcode.app symlink, no beta or release candidate
+            for app in /Applications/Xcode_[0-9]*.app; do
+              [ -d "$app" ] || continue
+              case "$app" in *[Bb]eta*|*_RC*|*Release_Candidate*) continue ;; esac
+              echo "$app"
+            done | sort -V
+          }
+          releases > "$OUT/xcodes/releases.txt"
+          cat "$OUT/xcodes/releases.txt"
           for major in 15 16 26; do
-            app=$(ls -d /Applications/Xcode_${major}*.app 2>/dev/null | sort -V | tail -1)
-            [ -n "$app" ] || { echo "Xcode $major: not installed" | tee -a "$OUT/xcodes/summary.txt"; continue; }
+            app=$({ grep "/Xcode_${major}[.]" "$OUT/xcodes/releases.txt" || true; } | tail -1)
+            if [ -z "$app" ]; then echo "Xcode $major: not installed" | tee -a "$OUT/xcodes/summary.txt"; continue; fi
             dev="$app/Contents/Developer"
             name=$(basename "$app" .app)
             trace="$WORK/$name.trace"
+            mode=unprivileged
             if ! DEVELOPER_DIR="$dev" xcrun xctrace record --template 'Time Profiler' --all-processes \
                  --time-limit "${SECONDS_TO_CAPTURE}s" --no-prompt --output "$trace" > "$OUT/xcodes/$name-record.txt" 2>&1; then
-              echo "$name: record failed" | tee -a "$OUT/xcodes/summary.txt"; continue
+              rm -rf "$trace"
+              mode=sudo
+              if ! sudo DEVELOPER_DIR="$dev" xcrun xctrace record --template 'Time Profiler' --all-processes \
+                   --time-limit "${SECONDS_TO_CAPTURE}s" --no-prompt --output "$trace" >> "$OUT/xcodes/$name-record.txt" 2>&1; then
+                echo "$name: record failed, unprivileged and with sudo" | tee -a "$OUT/xcodes/summary.txt"; continue
+              fi
+              sudo chown -R "$USER" "$trace"
             fi
-            DEVELOPER_DIR="$dev" xcrun xctrace export --input "$trace" \
-              --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' --output "$OUT/xcodes/$name.xml"
-            total=$(grep -o '<frame id="[0-9]*" name="[^"]*"' "$OUT/xcodes/$name.xml" | wc -l | tr -d ' ')
-            raw=$(grep -o '<frame id="[0-9]*" name="0x[0-9a-fA-F]*"' "$OUT/xcodes/$name.xml" | wc -l | tr -d ' ')
-            burner=$(grep -c 'name="dt_burn_inner"' "$OUT/xcodes/$name.xml" || true)
-            echo "$name ($(DEVELOPER_DIR="$dev" xcrun xctrace version 2>&1)): $total frames defined, $raw named as addresses, dt_burn_inner named: $burner" \
+            if ! DEVELOPER_DIR="$dev" xcrun xctrace export --input "$trace" \
+                 --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' --output "$OUT/xcodes/$name.xml" \
+                 >> "$OUT/xcodes/$name-record.txt" 2>&1; then
+              echo "$name: export failed" | tee -a "$OUT/xcodes/summary.txt"; continue
+            fi
+            total=$(frames '<frame id="[0-9]*" name="[^"]*"' "$OUT/xcodes/$name.xml")
+            raw=$(frames '<frame id="[0-9]*" name="0x[0-9a-fA-F]*"' "$OUT/xcodes/$name.xml")
+            burner=$(frames 'name="dt_burn_inner"' "$OUT/xcodes/$name.xml")
+            version=$(DEVELOPER_DIR="$dev" xcrun xctrace version 2>&1 | head -n 1)
+            echo "$name ($version, $mode): $total frames defined, $raw named as addresses, dt_burn_inner named: $burner" \
               | tee -a "$OUT/xcodes/summary.txt"
             gzip -f "$OUT/xcodes/$name.xml"
           done
@@ -234,7 +258,8 @@ jobs:
         if: matrix.os == 'macos-14'
         continue-on-error: true
         run: |
-          app=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          app=$(tail -1 "$OUT/xcodes/releases.txt")
+          [ -n "$app" ] || { echo "no Xcode release found"; exit 1; }
           export DEVELOPER_DIR="$app/Contents/Developer"
           echo "DEVELOPER_DIR=$DEVELOPER_DIR"
           mkdir -p "$OUT/service-newest-xcode"
@@ -243,9 +268,13 @@ jobs:
           sleep 2
           export DUMPTRIAGE_API_URL=http://127.0.0.1:8766 DUMPTRIAGE_API_KEY=dt_ci_key HOME="$WORK/home-newest-xcode"
           mkdir -p "$HOME"
-          echo y | /bin/bash macos/dumptriage-collect.sh --xctrace "$SECONDS_TO_CAPTURE" 2>&1 | tee "$OUT/service-newest-xcode/log.txt"
+          status=0
+          echo y | /bin/bash macos/dumptriage-collect.sh --xctrace "$SECONDS_TO_CAPTURE" 2>&1 | tee "$OUT/service-newest-xcode/log.txt" || status=1
           kill "$SERVICE_PID" 2>/dev/null || true
           ls -l "$OUT/service-newest-xcode"
+          grep -l '"traceType":"xctrace_export"' "$OUT"/service-newest-xcode/*.manifest > /dev/null \
+            || { echo "no xctrace_export upload reached the service"; status=1; }
+          exit $status
 
       - name: dSYM lookup by UUID (website#2156)
         continue-on-error: true

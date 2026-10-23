@@ -22,9 +22,10 @@
 #   --dir DIR      look in DIR instead of the two DiagnosticReports folders (repeatable)
 #
 # Performance profiles (website#1999): a timed capture of a slow Mac, sent as a performance trace rather than
-# a report. Each takes 30 to 120 seconds (default 30), asks before sending, and sends nothing else with it.
-# 30 s, not less: the service needs about 2,000 on-CPU samples to judge a profile, and spindump's 10 ms gives
-# about 100 a second for each busy core (website#2208).
+# a report. Each takes up to 120 seconds (default 30), asks before sending, and sends nothing else with it.
+# The service needs about 2,000 on-CPU samples and 10 s to judge a profile (website#2208): spindump samples every
+# 10 ms, about 100 a second for each busy core, so --profile takes at least 30 s; sample and xctrace sample every
+# 1 ms, so --sample and --xctrace take at least 15.
 #
 #   --profile [S]  system-wide spindump (built in; sudo asks for your password)
 #   --sample X [S] `sample` of one process, pid or name (built in)
@@ -83,8 +84,8 @@ seconds_next() {
     case "${1:-}" in
         ''|*[!0-9]*) return 1 ;;
     esac
-    if [ "$1" -lt 30 ] || [ "$1" -gt 120 ]; then
-        die "seconds must be 30 to 120, not $1 (shorter profiles are too thin to judge)" 2
+    if [ "$1" -lt 15 ] || [ "$1" -gt 120 ]; then
+        die "seconds must be 15 to 120 (30 to 120 for --profile), not $1" 2
     fi
     TRACE_SECONDS=$1
 }
@@ -117,6 +118,9 @@ done
 
 if [ ${#DIRS[@]} -eq 0 ]; then
     DIRS=("$HOME/Library/Logs/DiagnosticReports" "/Library/Logs/DiagnosticReports")
+fi
+if [ "$PROFILE" -eq 1 ] && [ "$TRACE_SECONDS" -lt 30 ]; then
+    die "--profile needs 30 to 120 seconds, not $TRACE_SECONDS: spindump samples every 10 ms, and a shorter profile is too thin to judge" 2
 fi
 
 # What a report is, from its name and, for an .ips, its first line's bug_type
@@ -348,7 +352,8 @@ capture_xctrace() {
             --output "$trace" > "$TRACE_DIR/record.log" 2>&1; then
         printf 'That needed administrator rights here; trying again with sudo...\n'
         rm -rf "$trace"
-        sudo xcrun xctrace record --template 'Time Profiler' --all-processes --time-limit "${TRACE_SECONDS}s" --no-prompt \
+        # sudo resets the environment: carry a DEVELOPER_DIR that picked a particular Xcode.
+        sudo ${DEVELOPER_DIR:+DEVELOPER_DIR="$DEVELOPER_DIR"} xcrun xctrace record --template 'Time Profiler' --all-processes --time-limit "${TRACE_SECONDS}s" --no-prompt \
             --output "$trace" > "$TRACE_DIR/record.log" 2>&1 || die "xctrace record failed: $(tail -n 3 "$TRACE_DIR/record.log" | tr '\n' ' ')"
         sudo chown -R "$(id -un)" "$trace"
     fi
@@ -651,9 +656,14 @@ check_triggers() {
 spool_capture() {
     backend=$(cfg backend spindump)
     max_mb=$(cfg limits.maxDiskMB 512)
+    max_sec=$(cfg limits.maxDurationSec 60)
     # 30 s whatever maxDurationSec says: shorter is too thin for the service to judge (website#2208), and a
-    # system-wide spindump of 30 s is already tens of megabytes.
+    # system-wide spindump of 30 s is already tens of megabytes. A lower limit is said, not silently overridden.
     TRACE_SECONDS=30
+    case "$max_sec" in
+        ''|*[!0-9]*) ;;
+        *) [ "$max_sec" -ge 30 ] || printf 'maxDurationSec %s is under the 30 s a macOS profile needs; capturing 30 s\n' "$max_sec" ;;
+    esac
     trace_workdir
     case "$backend" in
         spindump) capture_profile ;;
