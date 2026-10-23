@@ -425,11 +425,12 @@ class PerfettoAgentTests(unittest.TestCase):
         a.stop_tracing()
         import time
 
+        # tracebox's child is not ours, so waitpid on it raises ChildProcessError at once: only its being gone
+        # (ProcessLookupError) ends the wait, or the assertion below raced the kill (#50).
         for _ in range(50):
             try:
                 os.kill(child, 0)
-                os.waitpid(child, os.WNOHANG)
-            except (ProcessLookupError, ChildProcessError):
+            except ProcessLookupError:
                 break
             time.sleep(0.1)
         with self.assertRaises(ProcessLookupError):
