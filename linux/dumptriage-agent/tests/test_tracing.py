@@ -618,6 +618,14 @@ class AgentTracingTests(unittest.TestCase):
             self.hot(b, 5)
         self.assertIn("held no samples", "\n".join(logs.output))
 
+    def test_a_max_duration_under_30_s_is_kept_and_warned_about(self):
+        limits = {"maxDurationSec": 10, "maxDiskMB": 512, "maxOverheadPercent": 2, "cooldownMin": 60, "dailyCap": 4}
+        a = self.agent({"limits": limits})
+        with self.assertLogs("dumptriage", "WARNING") as logs:
+            a._trace_setup()
+        self.assertIn("limits.maxDurationSec is 10; captures under 30 s are often too thin", "\n".join(logs.output))
+        self.assertFalse(a.trace_state.disabled)
+
     def test_a_perf_script_that_writes_a_lot_to_stderr_does_not_block_the_fold(self):
         os.environ["FAKE_PERF_STDERR_KB"] = "300"
         self.addCleanup(os.environ.pop, "FAKE_PERF_STDERR_KB", None)

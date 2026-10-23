@@ -130,7 +130,7 @@ done_test
 
 setup capture_writes_redacted_text_a_manifest_and_the_upload_command
 echo 0 >"$T/sys/kernel/perf_event_paranoid"
-run --capture 5 --output-dir "$T/out"
+run --capture 30 --output-dir "$T/out"
 assert_eq "$CODE" 0
 text=$(ls "$T/out"/perf-script-*.txt); manifest=$(ls "$T/out"/manifest-*.json)
 assert_contains "$(cat "$text")" "# hostname : <host>"
@@ -151,7 +151,7 @@ setup a_failed_capture_leaves_no_scratch_directory_and_the_files_are_owner_only
 echo 0 >"$T/sys/kernel/perf_event_paranoid"
 printf '#!/bin/sh\ncase "$1" in --version) echo "perf version 6.8.12" ;; record) echo "no permission" >&2; exit 1 ;; esac\n' >"$T/bin/perf"
 mkdir -p "$T/tmp"
-OUT=$(TMPDIR="$T/tmp" PATH="$T/bin:$PATH" DT_PROC_SYS="$T/sys" bash "$SCRIPT" --capture 5 --output-dir "$T/out" 2>&1); CODE=$?
+OUT=$(TMPDIR="$T/tmp" PATH="$T/bin:$PATH" DT_PROC_SYS="$T/sys" bash "$SCRIPT" --capture 30 --output-dir "$T/out" 2>&1); CODE=$?
 assert_eq "$CODE" 1
 assert_contains "$OUT" "perf record failed: no permission"
 assert_eq "$(ls "$T/tmp" | wc -l | tr -d ' ')" 0
@@ -159,12 +159,12 @@ done_test
 
 setup capture_files_are_owner_only
 echo 0 >"$T/sys/kernel/perf_event_paranoid"
-run --capture 5 --output-dir "$T/out"
+run --capture 30 --output-dir "$T/out"
 for f in "$T"/out/*; do assert_eq "$(stat -c %a "$f")" 600; done
 done_test
 
 setup capture_needs_root_when_perf_is_locked_down
-run --capture 5 --output-dir "$T/out"
+run --capture 30 --output-dir "$T/out"
 if [ "$(id -u)" -ne 0 ]; then
   assert_eq "$CODE" 1
   assert_contains "$OUT" "kernel.perf_event_paranoid is 4: run with sudo"
@@ -174,6 +174,7 @@ done_test
 setup bad_options_are_usage_errors
 run --capture soon; assert_eq "$CODE" 2
 run --capture 601; assert_eq "$CODE" 2
+run --capture 29; assert_eq "$CODE" 2; assert_contains "$OUT" "--capture takes 30 to 600 seconds"
 run --agent-user "Not A User"; assert_eq "$CODE" 2
 run --frobnicate; assert_eq "$CODE" 2
 done_test
