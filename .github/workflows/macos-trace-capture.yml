@@ -13,6 +13,8 @@ on:
     paths:
       - .github/workflows/macos-trace-capture.yml
       - macos/tests/burn.c
+      - macos/tests/fake_trace_service.py
+      - macos/dumptriage-collect.sh
 
 permissions:
   contents: read
@@ -118,6 +120,110 @@ jobs:
             --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' \
             --output "$OUT/xctrace-time-profile.xml"
           test -s "$OUT/xctrace-time-profile.xml"
+
+      - name: dumptriage-collect.sh with its real tools, against a stand-in service
+        run: |
+          # /bin/bash is bash 3.2 here, the one a customer has. --profile and --xctrace use sudo and Xcode as on a Mac.
+          mkdir -p "$OUT/service"
+          python3 macos/tests/fake_trace_service.py "$OUT/service" 8765 &
+          SERVICE_PID=$!
+          sleep 2
+          export DUMPTRIAGE_API_URL=http://127.0.0.1:8765 DUMPTRIAGE_API_KEY=dt_ci_key HOME="$WORK/home"
+          mkdir -p "$HOME"
+          status=0
+          for args in "--profile 5" "--sample $BURN_PID 5" "--xctrace 5"; do
+            echo "=== dumptriage-collect.sh $args" | tee -a "$OUT/collector-log.txt"
+            echo y | /bin/bash macos/dumptriage-collect.sh $args 2>&1 | tee -a "$OUT/collector-log.txt" || status=1
+          done
+          kill "$SERVICE_PID" 2>/dev/null || true
+          ls -l "$OUT/service"
+          for t in spindump_text sample_text xctrace_export; do
+            grep -l "\"traceType\":\"$t\"" "$OUT"/service/*.manifest > /dev/null || { echo "no $t upload reached the service"; status=1; }
+          done
+          exit $status
+
+      - name: xctrace symbolicate experiment (Xcode 15.4 on macOS 14 exported 98% of frames as addresses)
+        continue-on-error: true
+        run: |
+          # How many of an export's frames are named, raw and after `xctrace symbolicate` (website#2206).
+          count() {
+            xcrun xctrace export --input "$1" --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' --output "$WORK/count.xml" > /dev/null 2>&1
+            total=$(grep -o '<frame id="[0-9]*" name="[^"]*"' "$WORK/count.xml" | wc -l | tr -d ' ')
+            raw=$(grep -o '<frame id="[0-9]*" name="0x[0-9a-fA-F]*"' "$WORK/count.xml" | wc -l | tr -d ' ')
+            echo "$2: $total frames defined, $raw named as addresses"
+          }
+          # The dSYM of the burner that is running, so --dsym has something to name.
+          dsymutil "$WORK/dtburn" -o "$WORK/dtburn.dSYM" > /dev/null 2>&1
+          {
+            xcrun xctrace record --template 'Time Profiler' --all-processes --time-limit 5s --no-prompt --output "$WORK/sym.trace" 2>&1 | tail -2
+            count "$WORK/sym.trace" "raw export"
+            echo "== xctrace symbolicate, no --dsym"
+            xcrun xctrace symbolicate --input "$WORK/sym.trace" --output "$WORK/sym-a.trace" 2>&1 | tail -3
+            [ -e "$WORK/sym-a.trace" ] && count "$WORK/sym-a.trace" "after symbolicate (no dsym)"
+            echo "== xctrace symbolicate --dsym the burner's dSYM"
+            xcrun xctrace symbolicate --input "$WORK/sym.trace" --output "$WORK/sym-b.trace" --dsym "$WORK/dtburn.dSYM" 2>&1 | tail -3
+            [ -e "$WORK/sym-b.trace" ] && count "$WORK/sym-b.trace" "after symbolicate --dsym"
+          } > "$OUT/xctrace-symbolicate.txt" 2>&1
+          cat "$OUT/xctrace-symbolicate.txt"
+
+      - name: dSYM lookup by UUID (website#2156)
+        continue-on-error: true
+        run: |
+          # The report page tells a developer to find a missing dSYM with `mdfind "com_apple_xcode_dsym_uuids == <UUID>"`
+          # (Apple's TN2151). Build one with a known UUID and try that exactly, with and without a Spotlight index.
+          mkdir -p "$WORK/dsym"
+          cd "$WORK/dsym"
+          clang -g -O0 -o dtburn-dsym "$GITHUB_WORKSPACE/macos/tests/burn.c"
+          dsymutil dtburn-dsym -o dtburn-dsym.dSYM
+          uuid=$(dwarfdump --uuid dtburn-dsym | awk 'NR==1{print $2}')
+          {
+            echo "== dwarfdump --uuid (binary, then dSYM)"
+            dwarfdump --uuid dtburn-dsym dtburn-dsym.dSYM
+            echo "== mdutil -s /"
+            mdutil -s / 2>&1
+            echo "== mdfind, this folder only"
+            mdfind -onlyin "$PWD" "com_apple_xcode_dsym_uuids == $uuid"
+            echo "== mdfind, everywhere"
+            mdfind "com_apple_xcode_dsym_uuids == $uuid"
+            echo "== mdls of the dSYM"
+            mdls -name com_apple_xcode_dsym_uuids dtburn-dsym.dSYM
+            echo "== mdimport the dSYM, wait, mdfind again"
+            mdimport "$PWD/dtburn-dsym.dSYM" 2>&1
+            sleep 10
+            mdfind -onlyin "$PWD" "com_apple_xcode_dsym_uuids == $uuid"
+            mdfind "com_apple_xcode_dsym_uuids == $uuid"
+            echo "== mdls again"
+            mdls -name com_apple_xcode_dsym_uuids dtburn-dsym.dSYM
+            echo "== the same query in lower case"
+            mdfind "com_apple_xcode_dsym_uuids == $(echo "$uuid" | tr 'A-F' 'a-f')"
+            echo "== importers that mention dSYM or Xcode"
+            mdimport -L 2>&1 | grep -i -E 'dsym|xcode|debug' || echo "(none listed)"
+            echo "== mdimport -t -d1 on the dSYM bundle and on its DWARF file"
+            mdimport -t -d1 "$PWD/dtburn-dsym.dSYM" 2>&1 | head -40
+            mdimport -t -d1 "$PWD/dtburn-dsym.dSYM/Contents/Resources/DWARF/dtburn-dsym" 2>&1 | head -20
+            echo "== indexing state of this folder and of every volume"
+            mdutil -s "$PWD" 2>&1
+            mdutil -a -s 2>&1
+            echo "== register Xcode's uuid.mdimporter (it supplies com_apple_xcode_dsym_uuids), re-import, wait, mdfind"
+            importer="$(xcode-select -p)/../Library/Spotlight/uuid.mdimporter"
+            ls -d "$importer" 2>&1
+            mdimport -r "$importer" 2>&1
+            sleep 5
+            mdimport -L 2>&1 | grep -i uuid || echo "(still not listed)"
+            mdimport -t -d1 "$PWD/dtburn-dsym.dSYM" 2>&1 | head -5
+            mdimport "$PWD/dtburn-dsym.dSYM" 2>&1
+            sleep 20
+            echo "-- mdls"
+            mdls -name com_apple_xcode_dsym_uuids dtburn-dsym.dSYM
+            echo "-- mdfind, this folder only, then everywhere (UUID $uuid)"
+            mdfind -onlyin "$PWD" "com_apple_xcode_dsym_uuids == $uuid"
+            mdfind "com_apple_xcode_dsym_uuids == $uuid"
+            echo "== xcode-select and DebugSymbols"
+            xcode-select -p
+            ls /Applications/Xcode*.app/Contents/Library/Spotlight 2>&1 | head
+            ls /Library/Spotlight /System/Library/Spotlight 2>&1 | grep -i -E 'dsym|xcode|debug' || echo "(no dSYM importer in Spotlight folders)"
+          } > "$OUT/dsym-lookup.txt" 2>&1
+          cat "$OUT/dsym-lookup.txt"
 
       - name: powermetrics snapshot
         continue-on-error: true
