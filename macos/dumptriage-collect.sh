@@ -22,7 +22,10 @@
 #   --dir DIR      look in DIR instead of the two DiagnosticReports folders (repeatable)
 #
 # Performance profiles (website#1999): a timed capture of a slow Mac, sent as a performance trace rather than
-# a report. Each takes 5 to 120 seconds (default 10), asks before sending, and sends nothing else with it.
+# a report. Each takes up to 120 seconds (default 30), asks before sending, and sends nothing else with it.
+# The service needs about 2,000 on-CPU samples and 10 s to judge a profile (website#2208): spindump samples every
+# 10 ms, about 100 a second for each busy core, so --profile takes at least 30 s; sample and xctrace sample every
+# 1 ms, so --sample and --xctrace take at least 15.
 #
 #   --profile [S]  system-wide spindump (built in; sudo asks for your password)
 #   --sample X [S] `sample` of one process, pid or name (built in)
@@ -56,7 +59,7 @@ AGENT_VERSION="0.1.0"
 PROFILE=0
 SAMPLE_TARGET=""
 XCTRACE=0
-TRACE_SECONDS=10
+TRACE_SECONDS=30
 TRACE_DIR=""
 WATCH_ONCE=0
 SEND_HELD=0
@@ -81,8 +84,8 @@ seconds_next() {
     case "${1:-}" in
         ''|*[!0-9]*) return 1 ;;
     esac
-    if [ "$1" -lt 5 ] || [ "$1" -gt 120 ]; then
-        die "seconds must be 5 to 120, not $1" 2
+    if [ "$1" -lt 15 ] || [ "$1" -gt 120 ]; then
+        die "seconds must be 15 to 120 (30 to 120 for --profile), not $1" 2
     fi
     TRACE_SECONDS=$1
 }
@@ -115,6 +118,9 @@ done
 
 if [ ${#DIRS[@]} -eq 0 ]; then
     DIRS=("$HOME/Library/Logs/DiagnosticReports" "/Library/Logs/DiagnosticReports")
+fi
+if [ "$PROFILE" -eq 1 ] && [ "$TRACE_SECONDS" -lt 30 ]; then
+    die "--profile needs 30 to 120 seconds, not $TRACE_SECONDS: spindump samples every 10 ms, and a shorter profile is too thin to judge" 2
 fi
 
 # What a report is, from its name and, for an .ips, its first line's bug_type
@@ -184,6 +190,54 @@ take_spindump() {
 
 utc_now() {
     date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+# A Unix time as UTC: BSD date (macOS) takes -r, GNU date (the Linux tests) -d @.
+utc_at() {
+    date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ
+}
+
+# An Xcode's version from its Info.plist (no xctrace start, no licence prompt): "16.2" for Xcode_16.2.app.
+xcode_version() {
+    defaults read "$1/Contents/Info" CFBundleShortVersionString 2>/dev/null
+}
+
+# xctrace from Xcode 15 leaves almost every frame of an export as an address: on macOS 14 it named 1.6% of them,
+# where Xcode 16.2's on the same Mac named 70% and the burner's own function (website#2206, #46). The selected Xcode
+# is used when it is 16 or later, or when its version can't be read; otherwise the newest release (no beta) of 16 or
+# later in /Applications (or $DUMPTRIAGE_XCODE_APPS), and without one the script says so rather than send a profile
+# nobody can read. XCTRACE_VERSION is `xctrace version`'s line for the manifest.
+choose_xctrace() {
+    apps=${DUMPTRIAGE_XCODE_APPS:-/Applications}
+    if xcrun --find xctrace >/dev/null 2>&1; then
+        XCTRACE_VERSION=$(xcrun xctrace version 2>/dev/null | head -n 1)
+        major=$(printf '%s\n' "$XCTRACE_VERSION" | sed -n 's/^xctrace version \([0-9][0-9]*\).*/\1/p')
+        [ -n "$major" ] && [ "$major" -lt 16 ] || return 0
+        why="the selected Xcode's xctrace ($major) leaves most frames unnamed"
+    else
+        major=""
+        why="the selected developer tools have no xctrace"
+    fi
+    best="" best_key=0
+    for app in "$apps"/Xcode*.app; do  # a glob: names may hold spaces
+        [ -d "$app/Contents/Developer" ] || continue
+        case "$app" in *[Bb]eta*|*_RC*|*Release_Candidate*) continue ;; esac
+        version=$(xcode_version "$app")
+        vmajor=${version%%.*}
+        vminor=${version#*.}; vminor=${vminor%%.*}
+        case "$vmajor$vminor" in ''|*[!0-9]*) continue ;; esac
+        [ "$vminor" = "$version" ] && vminor=0
+        key=$((vmajor * 1000 + vminor))
+        if [ "$vmajor" -ge 16 ] && [ "$key" -gt "$best_key" ]; then best=$app best_key=$key; fi
+    done
+    if [ -n "$best" ]; then
+        printf 'Using %s: %s.\n' "$(basename "$best")" "$why"
+        export DEVELOPER_DIR="$best/Contents/Developer"
+        XCTRACE_VERSION=$(xcrun xctrace version 2>/dev/null | head -n 1)
+        return 0
+    fi
+    [ -n "$major" ] || die "xctrace is part of Xcode 16 or later; the Command Line Tools alone do not have it (or use --profile)"
+    die "this Xcode's xctrace (version $major) leaves almost every frame unnamed: install Xcode 16 or later in $apps, or use --profile"
 }
 
 # A JSON string's body: backslash and quote escaped. Values here are tool output and command lines, never multi-line.
@@ -338,19 +392,32 @@ capture_sample() {
 }
 
 capture_xctrace() {
-    xcrun --find xctrace >/dev/null 2>&1 || die "xctrace is part of Xcode; the Command Line Tools alone do not have it"
+    choose_xctrace
     trace="$TRACE_DIR/cap.trace"
     printf 'Recording every process for %s seconds with Instruments (Time Profiler)...\n' "$TRACE_SECONDS"
-    TRACE_START=$(utc_now)
+    started=$(date +%s)
+    TRACE_START=$(utc_at "$started")
     if ! xcrun xctrace record --template 'Time Profiler' --all-processes --time-limit "${TRACE_SECONDS}s" --no-prompt \
             --output "$trace" > "$TRACE_DIR/record.log" 2>&1; then
         printf 'That needed administrator rights here; trying again with sudo...\n'
         rm -rf "$trace"
-        sudo xcrun xctrace record --template 'Time Profiler' --all-processes --time-limit "${TRACE_SECONDS}s" --no-prompt \
+        started=$(date +%s)
+        # sudo resets the environment: carry a DEVELOPER_DIR that picked a particular Xcode.
+        sudo ${DEVELOPER_DIR:+DEVELOPER_DIR="$DEVELOPER_DIR"} xcrun xctrace record --template 'Time Profiler' --all-processes --time-limit "${TRACE_SECONDS}s" --no-prompt \
             --output "$trace" > "$TRACE_DIR/record.log" 2>&1 || die "xctrace record failed: $(tail -n 3 "$TRACE_DIR/record.log" | tr '\n' ' ')"
         sudo chown -R "$(id -un)" "$trace"
     fi
-    TRACE_STOP=$(utc_now)
+    # The window is the recording's own, from the trace's table of contents: xctrace takes as long again as the
+    # recording to start and save (60 s for 30 s on macOS 14, 126 s on 26), and the service reads the window as the
+    # profile's length. Without one, the start plus --time-limit.
+    toc=$(xcrun xctrace export --input "$trace" --toc 2>/dev/null)
+    toc_start=$(printf '%s\n' "$toc" | sed -n 's/.*<start-date>\([0-9T:-]*\)[.0-9]*Z<\/start-date>.*/\1Z/p' | head -n 1)
+    toc_end=$(printf '%s\n' "$toc" | sed -n 's/.*<end-date>\([0-9T:-]*\)[.0-9]*Z<\/end-date>.*/\1Z/p' | head -n 1)
+    if [ -n "$toc_start" ] && [ -n "$toc_end" ]; then
+        TRACE_START=$toc_start TRACE_STOP=$toc_end
+    else
+        TRACE_START=$(utc_at "$started") TRACE_STOP=$(utc_at $((started + TRACE_SECONDS)))
+    fi
     xcrun xctrace export --input "$trace" --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' \
         --output "$TRACE_DIR/time-profile.xml" > /dev/null 2>&1 || die "xctrace export failed"
     out="$TRACE_DIR/xctrace.folded"
@@ -361,7 +428,7 @@ capture_xctrace() {
     TRACE_FILE=$out
     TRACE_TYPE=xctrace_export
     TRACE_TOOL=xctrace
-    TRACE_TOOL_VERSION=$(xcrun xctrace version 2>/dev/null | head -n 1)
+    TRACE_TOOL_VERSION=$XCTRACE_VERSION
     TRACE_COMMAND="xctrace record --template 'Time Profiler' --all-processes --time-limit ${TRACE_SECONDS}s; xctrace export --xpath time-profile; folded on this Mac"
 }
 
@@ -648,11 +715,15 @@ check_triggers() {
 # A triggered capture into the spool, held: a folder per capture with the trace, its manifest and its type.
 spool_capture() {
     backend=$(cfg backend spindump)
-    max_sec=$(cfg limits.maxDurationSec 60)
     max_mb=$(cfg limits.maxDiskMB 512)
-    TRACE_SECONDS=$max_sec
-    [ "$TRACE_SECONDS" -le 30 ] || TRACE_SECONDS=30   # a system-wide spindump of 30 s is tens of megabytes
-    [ "$TRACE_SECONDS" -ge 5 ] || TRACE_SECONDS=5
+    max_sec=$(cfg limits.maxDurationSec 60)
+    # 30 s whatever maxDurationSec says: shorter is too thin for the service to judge (website#2208), and a
+    # system-wide spindump of 30 s is already tens of megabytes. A lower limit is said, not silently overridden.
+    TRACE_SECONDS=30
+    case "$max_sec" in
+        ''|*[!0-9]*) ;;
+        *) [ "$max_sec" -ge 30 ] || printf 'maxDurationSec %s is under the 30 s a macOS profile needs; capturing 30 s\n' "$max_sec" ;;
+    esac
     trace_workdir
     case "$backend" in
         spindump) capture_profile ;;

@@ -93,7 +93,7 @@ EOF
     cat > "$T/bin/sudo" <<EOF
 #!/bin/bash
 printf 'sudo %s\n' "\$*" >> "$LOG"
-"\$@"
+env "\$@"   # as sudo does, a leading VAR=value sets it for the command
 EOF
     cat > "$T/bin/spindump" <<EOF
 #!/bin/bash
@@ -118,22 +118,37 @@ EOF
     cat > "$T/bin/xcrun" <<EOF
 #!/bin/bash
 printf 'xcrun %s\n' "\$*" >> "$LOG"
-if [ "\$1" = --find ]; then [ -z "\${FAKE_NO_XCODE:-}" ] && echo /Applications/Xcode.app/Contents/Developer/usr/bin/xctrace; exit \$([ -z "\${FAKE_NO_XCODE:-}" ] && echo 0 || echo 1); fi
+if [ "\$1" = --find ]; then
+    case "\${DEVELOPER_DIR:-}" in *Xcode_*) exit 0 ;; esac
+    [ -z "\${FAKE_NO_XCODE:-}" ] && echo /Applications/Xcode.app/Contents/Developer/usr/bin/xctrace; exit \$([ -z "\${FAKE_NO_XCODE:-}" ] && echo 0 || echo 1)
+fi
 [ "\$1" = xctrace ] || exit 1
 shift
 case "\$1" in
-    version) echo "xctrace version 16.0 (17F113)" ;;
+    version) case "\${DEVELOPER_DIR:-}" in
+                 *Xcode_16*) echo "xctrace version 16.0 (16C5032a)" ;;
+                 *) echo "\${FAKE_XCTRACE_VERSION:-xctrace version 16.0 (17F113)}" ;;
+             esac ;;
     record)
         if [ -n "\${FAKE_RECORD_NEEDS_SUDO:-}" ] && [ -z "\${SUDO_FAKE:-}" ]; then echo "not permitted" >&2; exit 1; fi
         while [ \$# -gt 0 ]; do [ "\$1" = --output ] && out=\$2; shift; done
         mkdir -p "\$out" && echo bundle > "\$out/data" ;;
     export)
+        if printf '%s\n' "\$@" | grep -qx -- --toc; then  # the table of contents, on stdout
+            [ -n "\${FAKE_NO_TOC:-}" ] || printf '<trace-toc><run number="1"><info><summary>\n<start-date>2026-10-23T18:22:21.694Z</start-date>\n<end-date>2026-10-23T18:22:52.597Z</end-date>\n</summary></info></run></trace-toc>\n'
+            exit 0
+        fi
         while [ \$# -gt 0 ]; do [ "\$1" = --output ] && out=\$2; shift; done
         cp "\${FAKE_EXPORT:-$FIXTURES/xctrace-time-profile-macos26.xml}" "\$out" ;;
 esac
 EOF
+    # fake defaults: an Xcode's CFBundleShortVersionString from a `version` file in the app folder
+    cat > "$T/bin/defaults" <<EOF
+#!/bin/bash
+cat "\$(dirname "\$2")/version" 2>/dev/null
+EOF
     # sudo marks its children so the fake xcrun can tell a privileged run
-    sed -i.bak 's/^"\$@"$/SUDO_FAKE=1 "\$@"/' "$T/bin/sudo" && rm -f "$T/bin/sudo.bak"
+    sed -i.bak 's/^env "\$@"/SUDO_FAKE=1 env "\$@"/' "$T/bin/sudo" && rm -f "$T/bin/sudo.bak"
     chmod +x "$T/bin/"*
 }
 
@@ -380,7 +395,25 @@ done_test
 setup profile_seconds_are_checked_and_trace_options_stand_alone
 run "" --profile 3
 assert_eq "$CODE" 2
-assert_contains "$OUT" "seconds must be 5 to 120, not 3"
+assert_contains "$OUT" "seconds must be 15 to 120 (30 to 120 for --profile), not 3"
+# website#2208: spindump's 10 ms needs 30 s for the service's 2,000 samples; sample and xctrace (1 ms) need 15.
+run "" --profile 29 --dry-run
+assert_eq "$CODE" 2
+assert_contains "$OUT" "--profile needs 30 to 120 seconds, not 29"
+run "" --profile 121 --dry-run
+assert_eq "$CODE" 2
+run "" --profile 30 --dry-run
+assert_eq "$CODE" 0
+assert_contains "$OUT" "Would sample every process for 30 s with spindump"
+run "" --profile 120 --dry-run
+assert_eq "$CODE" 0
+run "" --profile --dry-run
+assert_contains "$OUT" "Would sample every process for 30 s with spindump"   # the default
+run "" --sample 4242 15 --dry-run
+assert_eq "$CODE" 0
+assert_contains "$OUT" "Would sample 4242 for 15 s with sample"
+run "" --xctrace 14 --dry-run
+assert_eq "$CODE" 2
 run "" --profile 500 --dry-run
 assert_eq "$CODE" 2
 run "" --sample
@@ -391,28 +424,28 @@ assert_contains "$OUT" "run it apart from"
 done_test
 
 setup a_dry_run_profile_captures_and_sends_nothing
-run "" --dry-run --profile 15 --sample 4242 20 --xctrace
+run "" --dry-run --profile 45 --sample 4242 60 --xctrace
 assert_eq "$CODE" 0
-assert_contains "$OUT" "Would sample every process for 20 s with spindump (sudo)"   # the last number given is the length
-assert_contains "$OUT" "Would sample 4242 for 20 s with sample"
-assert_contains "$OUT" "Would record every process for 20 s with xctrace"
+assert_contains "$OUT" "Would sample every process for 60 s with spindump (sudo)"   # the last number given is the length
+assert_contains "$OUT" "Would sample 4242 for 60 s with sample"
+assert_contains "$OUT" "Would record every process for 60 s with xctrace"
 assert_contains "$OUT" "Dry run: nothing captured, nothing sent."
 assert_eq "$(cat "$LOG")" ""
 done_test
 
 setup a_profile_is_captured_with_sudo_confirmed_and_uploaded_as_a_trace_with_its_manifest
 run "y
-" --profile 12
+" --profile 40
 assert_eq "$CODE" 0
 calls=$(cat "$LOG")
-assert_contains "$calls" "sudo spindump -notarget 12 10 -file "
+assert_contains "$calls" "sudo spindump -notarget 40 10 -file "
 assert_contains "$OUT" "spindump_text"
 assert_contains "$OUT" "sent spindump_text (trace 11111111-2222-3333-4444-555555555555)"
 assert_contains "$calls" "[https://triage.example.com/api/v1/traces]"
 assert_contains "$calls" 'config: header = "Authorization: Bearer dt_test_key_123"'
 assert_contains "$calls" '"traceType":"spindump_text"'
 assert_contains "$calls" '"trigger":{"name":"manual","type":"manual"}'
-assert_contains "$calls" '"tool":{"name":"spindump","version":"macOS 26.6.2","command":"spindump -notarget 12 10 -file <file>"}'
+assert_contains "$calls" '"tool":{"name":"spindump","version":"macOS 26.6.2","command":"spindump -notarget 40 10 -file <file>"}'
 assert_contains "$calls" '"os":{"family":"macos","build":"25G83"}'
 assert_contains "$calls" '"agentVersion":"0.1.0"'
 assert_not_contains "$(grep -o 'manifest=[^]]*' "$LOG")" "$T"   # no folder of ours, so no user name, in the manifest
@@ -422,7 +455,7 @@ assert_eq "$(ls "$T" | grep -c '^dumptriage-trace')" 0
 TOKEN=$(cat "$T/home/.config/dumptriage/host-token")
 assert_eq "${#TOKEN}" 16
 run "y
-" --profile 12
+" --profile 40
 assert_eq "$(cat "$T/home/.config/dumptriage/host-token")" "$TOKEN"
 assert_contains "$(cat "$LOG")" "\"hostToken\":\"$TOKEN\""
 done_test
@@ -437,21 +470,21 @@ done_test
 
 setup sample_takes_a_process_and_seconds
 run "y
-" --sample 4242 20
+" --sample 4242 45
 assert_eq "$CODE" 0
 calls=$(cat "$LOG")
-assert_contains "$calls" "sample 4242 20 1 -file "
+assert_contains "$calls" "sample 4242 45 1 -file "
 assert_not_contains "$calls" "sudo"   # no privilege for a process of your own
 assert_contains "$calls" '"traceType":"sample_text"'
-assert_contains "$calls" '"command":"sample <process> 20 1 -file <file>"'  # the process is not named in the manifest
+assert_contains "$calls" '"command":"sample <process> 45 1 -file <file>"'  # the process is not named in the manifest
 done_test
 
 setup xctrace_folds_on_the_mac_and_only_the_stacks_leave
 run "y
-" --xctrace 9
+" --xctrace 31
 assert_eq "$CODE" 0
 calls=$(cat "$LOG")
-assert_contains "$calls" "xcrun xctrace record --template Time Profiler --all-processes --time-limit 9s --no-prompt --output "
+assert_contains "$calls" "xcrun xctrace record --template Time Profiler --all-processes --time-limit 31s --no-prompt --output "
 assert_not_contains "$calls" "sudo"   # unprivileged first, as a customer would run it
 assert_contains "$calls" "--xpath /trace-toc/run[@number=\"1\"]/data/table[@schema=\"time-profile\"]"
 assert_contains "$OUT" "xctrace_export"
@@ -465,16 +498,88 @@ done_test
 
 setup xctrace_retries_with_sudo_when_the_unprivileged_record_is_refused
 FAKE_RECORD_NEEDS_SUDO=1 run "y
-" --xctrace 9
+" --xctrace 31
 assert_eq "$CODE" 0
 assert_contains "$OUT" "trying again with sudo"
 assert_contains "$(cat "$LOG")" "sudo xcrun xctrace record"
 done_test
 
-setup xctrace_needs_xcode
-FAKE_NO_XCODE=1 run "" --xctrace
+setup xctrace_keeps_a_chosen_xcode_through_sudo
+DEVELOPER_DIR=/Applications/Xcode_16.2.app/Contents/Developer FAKE_RECORD_NEEDS_SUDO=1 run "y
+" --xctrace 31
+assert_eq "$CODE" 0
+assert_contains "$(cat "$LOG")" "sudo DEVELOPER_DIR=/Applications/Xcode_16.2.app/Contents/Developer xcrun xctrace record"
+done_test
+
+xcodes() {  # name:version ...
+    for nv in "$@"; do mkdir -p "$T/apps/${nv%%:*}/Contents/Developer"; printf '%s\n' "${nv#*:}" > "$T/apps/${nv%%:*}/Contents/version"; done
+}
+
+setup xctrace_from_xcode_15_switches_to_the_newest_release_beside_it
+xcodes Xcode_15.4.app:15.4 Xcode_16.2.app:16.2 Xcode_16.10.app:16.10 Xcode-beta.app:27.0
+DUMPTRIAGE_XCODE_APPS="$T/apps" FAKE_XCTRACE_VERSION="xctrace version 15.3 (15F31d)" run "y
+" --xctrace 31
+assert_eq "$CODE" 0
+assert_contains "$OUT" "Using Xcode_16.10.app: the selected Xcode's xctrace (15) leaves most frames unnamed."   # 16.10 > 16.2, no beta
+assert_contains "$(cat "$LOG")" '"tool":{"name":"xctrace","version":"xctrace version 16.0 (16C5032a)"'
+done_test
+
+setup xctrace_from_xcode_15_alone_is_refused
+xcodes Xcode_15.4.app:15.4
+DUMPTRIAGE_XCODE_APPS="$T/apps" FAKE_XCTRACE_VERSION="xctrace version 15.3 (15F31d)" run "" --xctrace 31
 assert_eq "$CODE" 1
-assert_contains "$OUT" "xctrace is part of Xcode; the Command Line Tools alone do not have it"
+assert_contains "$OUT" "this Xcode's xctrace (version 15) leaves almost every frame unnamed: install Xcode 16 or later in $T/apps, or use --profile"
+assert_eq "$(grep -c '^curl' "$LOG")" 0
+done_test
+
+setup command_line_tools_selected_with_xcode_16_installed_uses_xcode_16
+xcodes Xcode_16.2.app:16.2
+DUMPTRIAGE_XCODE_APPS="$T/apps" FAKE_NO_XCODE=1 run "y
+" --xctrace 31
+assert_eq "$CODE" 0
+assert_contains "$OUT" "Using Xcode_16.2.app: the selected developer tools have no xctrace."
+done_test
+
+setup an_xctrace_version_that_cannot_be_read_is_let_through
+DUMPTRIAGE_XCODE_APPS="$T/apps" FAKE_XCTRACE_VERSION="Instruments xctrace 27 (beta banner)" run "y
+" --xctrace 31
+assert_eq "$CODE" 0
+assert_not_contains "$OUT" "Using "
+done_test
+
+window() {  # the last uploaded manifest's window: start stop seconds
+    manifest=$(grep -o '"window":{[^}]*}' "$LOG" | tail -1)
+    start=$(printf '%s' "$manifest" | sed 's/.*"startUtc":"\([^"]*\)".*/\1/')
+    stop=$(printf '%s' "$manifest" | sed 's/.*"stopUtc":"\([^"]*\)".*/\1/')
+    echo "$start $stop $(( $(date -u -d "$stop" +%s) - $(date -u -d "$start" +%s) ))"
+}
+
+setup xctrace_window_is_the_recording_from_its_table_of_contents
+DUMPTRIAGE_XCODE_APPS="$T/apps" run "y
+" --xctrace 31
+assert_eq "$CODE" 0
+assert_eq "$(window)" "2026-10-23T18:22:21Z 2026-10-23T18:22:52Z 31"
+FAKE_RECORD_NEEDS_SUDO=1 DUMPTRIAGE_XCODE_APPS="$T/apps" run "y
+" --xctrace 31
+assert_eq "$CODE" 0
+assert_eq "$(window)" "2026-10-23T18:22:21Z 2026-10-23T18:22:52Z 31"
+done_test
+
+setup without_a_table_of_contents_the_window_is_the_time_limit_from_the_recording_that_ran
+FAKE_NO_TOC=1 DUMPTRIAGE_XCODE_APPS="$T/apps" run "y
+" --xctrace 31
+assert_eq "$CODE" 0
+assert_contains "$(window)" " 31"
+FAKE_NO_TOC=1 FAKE_RECORD_NEEDS_SUDO=1 DUMPTRIAGE_XCODE_APPS="$T/apps" run "y
+" --xctrace 31
+assert_eq "$CODE" 0
+assert_contains "$(window)" " 31"
+done_test
+
+setup xctrace_needs_xcode
+DUMPTRIAGE_XCODE_APPS="$T/apps" FAKE_NO_XCODE=1 run "" --xctrace
+assert_eq "$CODE" 1
+assert_contains "$OUT" "xctrace is part of Xcode 16 or later; the Command Line Tools alone do not have it (or use --profile)"
 assert_eq "$(grep -c '^curl' "$LOG")" 0
 done_test
 
@@ -605,7 +710,8 @@ watch "$BASE"
 assert_eq "$CODE" 0
 assert_contains "$OUT" "trigger cpu-high: fire at $BASE (observed 97.5)"
 assert_contains "$OUT" "held cpu-high (spindump_text"
-assert_contains "$(cat "$LOG")" "sudo spindump -notarget 20 10 -file "
+assert_contains "$(cat "$LOG")" "sudo spindump -notarget 30 10 -file "   # 30 s although maxDurationSec is 20 (website#2208)
+assert_contains "$OUT" "maxDurationSec 20 is under the 30 s a macOS profile needs; capturing 30 s"
 HELD_DIR=$(ls -d "$T/state/spool/"*cpu-high)
 assert_eq "$(cat "$HELD_DIR/type")" spindump_text
 M=$(cat "$HELD_DIR/manifest.json")
