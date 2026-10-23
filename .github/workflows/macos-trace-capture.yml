@@ -152,6 +152,8 @@ jobs:
             raw=$(grep -o '<frame id="[0-9]*" name="0x[0-9a-fA-F]*"' "$WORK/count.xml" | wc -l | tr -d ' ')
             echo "$2: $total frames defined, $raw named as addresses"
           }
+          # The dSYM of the burner that is running, so --dsym has something to name.
+          dsymutil "$WORK/dtburn" -o "$WORK/dtburn.dSYM" > /dev/null 2>&1
           {
             xcrun xctrace record --template 'Time Profiler' --all-processes --time-limit 5s --no-prompt --output "$WORK/sym.trace" 2>&1 | tail -2
             count "$WORK/sym.trace" "raw export"
@@ -159,10 +161,8 @@ jobs:
             xcrun xctrace symbolicate --input "$WORK/sym.trace" --output "$WORK/sym-a.trace" 2>&1 | tail -3
             [ -e "$WORK/sym-a.trace" ] && count "$WORK/sym-a.trace" "after symbolicate (no dsym)"
             echo "== xctrace symbolicate --dsym the burner's dSYM"
-            xcrun xctrace symbolicate --input "$WORK/sym.trace" --output "$WORK/sym-b.trace" --dsym "$WORK/dsym/dtburn-dsym.dSYM" 2>&1 | tail -3
+            xcrun xctrace symbolicate --input "$WORK/sym.trace" --output "$WORK/sym-b.trace" --dsym "$WORK/dtburn.dSYM" 2>&1 | tail -3
             [ -e "$WORK/sym-b.trace" ] && count "$WORK/sym-b.trace" "after symbolicate --dsym"
-            echo "== the same trace opened with the burner binary's dSYM next to it"
-            ls "$WORK/dsym"
           } > "$OUT/xctrace-symbolicate.txt" 2>&1
           cat "$OUT/xctrace-symbolicate.txt"
 
