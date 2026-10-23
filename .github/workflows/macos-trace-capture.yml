@@ -6,8 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       seconds:
-        description: Capture length in seconds
-        default: "10"
+        description: Capture length in seconds (5 to 120)
+        type: number
+        default: 10
   pull_request:
     paths:
       - .github/workflows/macos-trace-capture.yml
@@ -23,7 +24,10 @@ jobs:
       matrix:
         os: [macos-14, macos-15, macos-26]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30  # four captures of at most 120 s each, one after another, plus setup
+    defaults:
+      run:
+        shell: bash  # with pipefail, so a capture piped into tee still fails when the tool does
     env:
       SECONDS_TO_CAPTURE: ${{ inputs.seconds || '10' }}
       OUT: ${{ github.workspace }}/capture
@@ -33,6 +37,12 @@ jobs:
 
       - name: Environment
         run: |
+          case "$SECONDS_TO_CAPTURE" in
+            ''|*[!0-9]*) echo "seconds must be a whole number, got '$SECONDS_TO_CAPTURE'"; exit 1 ;;
+          esac
+          if [ "$SECONDS_TO_CAPTURE" -lt 5 ] || [ "$SECONDS_TO_CAPTURE" -gt 120 ]; then
+            echo "seconds must be 5 to 120, got $SECONDS_TO_CAPTURE"; exit 1
+          fi
           mkdir -p "$OUT" "$WORK"
           {
             sw_vers
@@ -59,10 +69,10 @@ jobs:
       - name: Start the burner
         run: |
           clang -g -O0 -o "$WORK/dtburn" macos/tests/burn.c
-          "$WORK/dtburn" 900 > "$WORK/dtburn.pid" &
-          sleep 1
-          echo "BURN_PID=$(cat "$WORK/dtburn.pid")" >> "$GITHUB_ENV"
-          echo "burner pid $(cat "$WORK/dtburn.pid")"
+          # Long enough for every capture below; stopped at the end either way.
+          "$WORK/dtburn" $(( SECONDS_TO_CAPTURE * 4 + 300 )) > /dev/null &
+          echo "BURN_PID=$!" >> "$GITHUB_ENV"
+          echo "burner pid $!"
 
       - name: spindump, system-wide
         continue-on-error: true
@@ -71,6 +81,14 @@ jobs:
           sudo spindump -notarget "$SECONDS_TO_CAPTURE" 10 -file "$OUT/spindump.txt" 2>&1 | tee "$OUT/spindump-log.txt"
           sudo chown "$USER" "$OUT/spindump.txt"
           test -s "$OUT/spindump.txt"
+
+      - name: spindump, the burner only
+        continue-on-error: true
+        run: |
+          # As dumptriage-collect.sh --spindump runs it: one target, default interval.
+          sudo spindump "$BURN_PID" "$SECONDS_TO_CAPTURE" -file "$OUT/spindump-target.txt" 2>&1 | tee "$OUT/spindump-target-log.txt"
+          sudo chown "$USER" "$OUT/spindump-target.txt"
+          test -s "$OUT/spindump-target.txt"
 
       - name: sample, the burner
         continue-on-error: true
@@ -82,15 +100,17 @@ jobs:
         continue-on-error: true
         run: |
           # Unprivileged first, as a customer would run it; sudo only if that fails, and say which one worked (#31).
+          # The unprivileged exit code and log stay in the artifact, so a failure that was not about privilege shows.
           if xcrun xctrace record --template 'Time Profiler' --all-processes --time-limit "${SECONDS_TO_CAPTURE}s" \
                --no-prompt --output "$WORK/cap.trace" > "$OUT/xctrace-record-log.txt" 2>&1; then
             echo "unprivileged" > "$OUT/xctrace-record-mode.txt"
           else
+            echo "unprivileged attempt failed with exit $?; retried with sudo" > "$OUT/xctrace-record-mode.txt"
             rm -rf "$WORK/cap.trace"
             sudo xcrun xctrace record --template 'Time Profiler' --all-processes --time-limit "${SECONDS_TO_CAPTURE}s" \
               --no-prompt --output "$WORK/cap.trace" >> "$OUT/xctrace-record-log.txt" 2>&1
             sudo chown -R "$USER" "$WORK/cap.trace"
-            echo "sudo" > "$OUT/xctrace-record-mode.txt"
+            echo "sudo" >> "$OUT/xctrace-record-mode.txt"
           fi
           cat "$OUT/xctrace-record-log.txt" "$OUT/xctrace-record-mode.txt"
           xcrun xctrace export --input "$WORK/cap.trace" --toc --output "$OUT/xctrace-toc.xml"
@@ -118,7 +138,7 @@ jobs:
         run: |
           ls -l "$OUT"
           missing=0
-          for f in spindump.txt sample.txt xctrace-time-profile.xml; do
+          for f in spindump.txt spindump-target.txt sample.txt xctrace-time-profile.xml; do
             if [ ! -s "$OUT/$f" ]; then echo "missing or empty: $f"; missing=1; fi
           done
           exit $missing
