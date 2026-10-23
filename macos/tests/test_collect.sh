@@ -118,7 +118,10 @@ EOF
     cat > "$T/bin/xcrun" <<EOF
 #!/bin/bash
 printf 'xcrun %s\n' "\$*" >> "$LOG"
-if [ "\$1" = --find ]; then [ -z "\${FAKE_NO_XCODE:-}" ] && echo /Applications/Xcode.app/Contents/Developer/usr/bin/xctrace; exit \$([ -z "\${FAKE_NO_XCODE:-}" ] && echo 0 || echo 1); fi
+if [ "\$1" = --find ]; then
+    case "\${DEVELOPER_DIR:-}" in *Xcode_*) exit 0 ;; esac
+    [ -z "\${FAKE_NO_XCODE:-}" ] && echo /Applications/Xcode.app/Contents/Developer/usr/bin/xctrace; exit \$([ -z "\${FAKE_NO_XCODE:-}" ] && echo 0 || echo 1)
+fi
 [ "\$1" = xctrace ] || exit 1
 shift
 case "\$1" in
@@ -131,9 +134,18 @@ case "\$1" in
         while [ \$# -gt 0 ]; do [ "\$1" = --output ] && out=\$2; shift; done
         mkdir -p "\$out" && echo bundle > "\$out/data" ;;
     export)
+        if printf '%s\n' "\$@" | grep -qx -- --toc; then  # the table of contents, on stdout
+            [ -n "\${FAKE_NO_TOC:-}" ] || printf '<trace-toc><run number="1"><info><summary>\n<start-date>2026-10-23T18:22:21.694Z</start-date>\n<end-date>2026-10-23T18:22:52.597Z</end-date>\n</summary></info></run></trace-toc>\n'
+            exit 0
+        fi
         while [ \$# -gt 0 ]; do [ "\$1" = --output ] && out=\$2; shift; done
         cp "\${FAKE_EXPORT:-$FIXTURES/xctrace-time-profile-macos26.xml}" "\$out" ;;
 esac
+EOF
+    # fake defaults: an Xcode's CFBundleShortVersionString from a `version` file in the app folder
+    cat > "$T/bin/defaults" <<EOF
+#!/bin/bash
+cat "\$(dirname "\$2")/version" 2>/dev/null
 EOF
     # sudo marks its children so the fake xcrun can tell a privileged run
     sed -i.bak 's/^env "\$@"/SUDO_FAKE=1 env "\$@"/' "$T/bin/sudo" && rm -f "$T/bin/sudo.bak"
@@ -499,36 +511,75 @@ assert_eq "$CODE" 0
 assert_contains "$(cat "$LOG")" "sudo DEVELOPER_DIR=/Applications/Xcode_16.2.app/Contents/Developer xcrun xctrace record"
 done_test
 
-setup xctrace_from_xcode_15_switches_to_a_newer_xcode_beside_it
-mkdir -p "$T/apps/Xcode_15.4.app/Contents/Developer" "$T/apps/Xcode_16.2.app/Contents/Developer"
+xcodes() {  # name:version ...
+    for nv in "$@"; do mkdir -p "$T/apps/${nv%%:*}/Contents/Developer"; printf '%s\n' "${nv#*:}" > "$T/apps/${nv%%:*}/Contents/version"; done
+}
+
+setup xctrace_from_xcode_15_switches_to_the_newest_release_beside_it
+xcodes Xcode_15.4.app:15.4 Xcode_16.2.app:16.2 Xcode_16.10.app:16.10 Xcode-beta.app:27.0
 DUMPTRIAGE_XCODE_APPS="$T/apps" FAKE_XCTRACE_VERSION="xctrace version 15.3 (15F31d)" run "y
 " --xctrace 31
 assert_eq "$CODE" 0
-assert_contains "$OUT" "Using Xcode_16.2.app: the selected Xcode's xctrace (15) leaves most frames unnamed."
+assert_contains "$OUT" "Using Xcode_16.10.app: the selected Xcode's xctrace (15) leaves most frames unnamed."   # 16.10 > 16.2, no beta
 assert_contains "$(cat "$LOG")" '"tool":{"name":"xctrace","version":"xctrace version 16.0 (16C5032a)"'
 done_test
 
 setup xctrace_from_xcode_15_alone_is_refused
-mkdir -p "$T/apps/Xcode_15.4.app/Contents/Developer"
+xcodes Xcode_15.4.app:15.4
 DUMPTRIAGE_XCODE_APPS="$T/apps" FAKE_XCTRACE_VERSION="xctrace version 15.3 (15F31d)" run "" --xctrace 31
 assert_eq "$CODE" 1
-assert_contains "$OUT" "this Xcode's xctrace (version 15) leaves almost every frame unnamed: install Xcode 16 or later, or use --profile"
+assert_contains "$OUT" "this Xcode's xctrace (version 15) leaves almost every frame unnamed: install Xcode 16 or later in $T/apps, or use --profile"
 assert_eq "$(grep -c '^curl' "$LOG")" 0
 done_test
 
-setup xctrace_window_is_the_recording_not_the_save
+setup command_line_tools_selected_with_xcode_16_installed_uses_xcode_16
+xcodes Xcode_16.2.app:16.2
+DUMPTRIAGE_XCODE_APPS="$T/apps" FAKE_NO_XCODE=1 run "y
+" --xctrace 31
+assert_eq "$CODE" 0
+assert_contains "$OUT" "Using Xcode_16.2.app: the selected developer tools have no xctrace."
+done_test
+
+setup an_xctrace_version_that_cannot_be_read_is_let_through
+DUMPTRIAGE_XCODE_APPS="$T/apps" FAKE_XCTRACE_VERSION="Instruments xctrace 27 (beta banner)" run "y
+" --xctrace 31
+assert_eq "$CODE" 0
+assert_not_contains "$OUT" "Using "
+done_test
+
+window() {  # the last uploaded manifest's window: start stop seconds
+    manifest=$(grep -o '"window":{[^}]*}' "$LOG" | tail -1)
+    start=$(printf '%s' "$manifest" | sed 's/.*"startUtc":"\([^"]*\)".*/\1/')
+    stop=$(printf '%s' "$manifest" | sed 's/.*"stopUtc":"\([^"]*\)".*/\1/')
+    echo "$start $stop $(( $(date -u -d "$stop" +%s) - $(date -u -d "$start" +%s) ))"
+}
+
+setup xctrace_window_is_the_recording_from_its_table_of_contents
 DUMPTRIAGE_XCODE_APPS="$T/apps" run "y
 " --xctrace 31
-manifest=$(grep -o '"window":{[^}]*}' "$LOG" | head -1)
-start=$(printf '%s' "$manifest" | sed 's/.*"startUtc":"\([^"]*\)".*/\1/')
-stop=$(printf '%s' "$manifest" | sed 's/.*"stopUtc":"\([^"]*\)".*/\1/')
-assert_eq "$(( $(date -u -d "$stop" +%s) - $(date -u -d "$start" +%s) ))" 31
+assert_eq "$CODE" 0
+assert_eq "$(window)" "2026-10-23T18:22:21Z 2026-10-23T18:22:52Z 31"
+FAKE_RECORD_NEEDS_SUDO=1 DUMPTRIAGE_XCODE_APPS="$T/apps" run "y
+" --xctrace 31
+assert_eq "$CODE" 0
+assert_eq "$(window)" "2026-10-23T18:22:21Z 2026-10-23T18:22:52Z 31"
+done_test
+
+setup without_a_table_of_contents_the_window_is_the_time_limit_from_the_recording_that_ran
+FAKE_NO_TOC=1 DUMPTRIAGE_XCODE_APPS="$T/apps" run "y
+" --xctrace 31
+assert_eq "$CODE" 0
+assert_contains "$(window)" " 31"
+FAKE_NO_TOC=1 FAKE_RECORD_NEEDS_SUDO=1 DUMPTRIAGE_XCODE_APPS="$T/apps" run "y
+" --xctrace 31
+assert_eq "$CODE" 0
+assert_contains "$(window)" " 31"
 done_test
 
 setup xctrace_needs_xcode
-FAKE_NO_XCODE=1 run "" --xctrace
+DUMPTRIAGE_XCODE_APPS="$T/apps" FAKE_NO_XCODE=1 run "" --xctrace
 assert_eq "$CODE" 1
-assert_contains "$OUT" "xctrace is part of Xcode; the Command Line Tools alone do not have it"
+assert_contains "$OUT" "xctrace is part of Xcode 16 or later; the Command Line Tools alone do not have it (or use --profile)"
 assert_eq "$(grep -c '^curl' "$LOG")" 0
 done_test
 

@@ -197,27 +197,47 @@ utc_at() {
     date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ
 }
 
-# The major version `xctrace version` prints ("xctrace version 15.3 (15F31d)" is 15; Xcode 16 and 26 both say 16.0).
-xctrace_major() {
-    xcrun xctrace version 2>/dev/null | head -n 1 | sed -n 's/^xctrace version \([0-9][0-9]*\).*/\1/p'
+# An Xcode's version from its Info.plist (no xctrace start, no licence prompt): "16.2" for Xcode_16.2.app.
+xcode_version() {
+    defaults read "$1/Contents/Info" CFBundleShortVersionString 2>/dev/null
 }
 
 # xctrace from Xcode 15 leaves almost every frame of an export as an address: on macOS 14 it named 1.6% of them,
-# where Xcode 16.2's on the same Mac named 70% and the burner's own function (website#2206, #46). Use a newer Xcode
-# when one is installed beside it; without one, say so rather than send a profile nobody can read.
+# where Xcode 16.2's on the same Mac named 70% and the burner's own function (website#2206, #46). The selected Xcode
+# is used when it is 16 or later, or when its version can't be read; otherwise the newest release (no beta) of 16 or
+# later in /Applications (or $DUMPTRIAGE_XCODE_APPS), and without one the script says so rather than send a profile
+# nobody can read. XCTRACE_VERSION is `xctrace version`'s line for the manifest.
 choose_xctrace() {
-    major=$(xctrace_major)
-    [ "${major:-0}" -lt 16 ] || return 0
-    newer=$(for app in "${DUMPTRIAGE_XCODE_APPS:-/Applications}"/Xcode*.app; do  # a glob: names may hold spaces
+    apps=${DUMPTRIAGE_XCODE_APPS:-/Applications}
+    if xcrun --find xctrace >/dev/null 2>&1; then
+        XCTRACE_VERSION=$(xcrun xctrace version 2>/dev/null | head -n 1)
+        major=$(printf '%s\n' "$XCTRACE_VERSION" | sed -n 's/^xctrace version \([0-9][0-9]*\).*/\1/p')
+        [ -n "$major" ] && [ "$major" -lt 16 ] || return 0
+        why="the selected Xcode's xctrace ($major) leaves most frames unnamed"
+    else
+        major=""
+        why="the selected developer tools have no xctrace"
+    fi
+    best="" best_key=0
+    for app in "$apps"/Xcode*.app; do  # a glob: names may hold spaces
         [ -d "$app/Contents/Developer" ] || continue
-        [ "$(DEVELOPER_DIR="$app/Contents/Developer" xctrace_major)" -ge 16 ] 2>/dev/null && printf '%s\n' "$app"
-    done | sort | tail -n 1)
-    if [ -n "$newer" ]; then
-        printf 'Using %s: the selected Xcode'"'"'s xctrace (%s) leaves most frames unnamed.\n' "$(basename "$newer")" "${major:-unknown}"
-        export DEVELOPER_DIR="$newer/Contents/Developer"
+        case "$app" in *[Bb]eta*|*_RC*|*Release_Candidate*) continue ;; esac
+        version=$(xcode_version "$app")
+        vmajor=${version%%.*}
+        vminor=${version#*.}; vminor=${vminor%%.*}
+        case "$vmajor$vminor" in ''|*[!0-9]*) continue ;; esac
+        [ "$vminor" = "$version" ] && vminor=0
+        key=$((vmajor * 1000 + vminor))
+        if [ "$vmajor" -ge 16 ] && [ "$key" -gt "$best_key" ]; then best=$app best_key=$key; fi
+    done
+    if [ -n "$best" ]; then
+        printf 'Using %s: %s.\n' "$(basename "$best")" "$why"
+        export DEVELOPER_DIR="$best/Contents/Developer"
+        XCTRACE_VERSION=$(xcrun xctrace version 2>/dev/null | head -n 1)
         return 0
     fi
-    die "this Xcode's xctrace (version ${major:-unknown}) leaves almost every frame unnamed: install Xcode 16 or later, or use --profile"
+    [ -n "$major" ] || die "xctrace is part of Xcode 16 or later; the Command Line Tools alone do not have it (or use --profile)"
+    die "this Xcode's xctrace (version $major) leaves almost every frame unnamed: install Xcode 16 or later in $apps, or use --profile"
 }
 
 # A JSON string's body: backslash and quote escaped. Values here are tool output and command lines, never multi-line.
@@ -372,7 +392,6 @@ capture_sample() {
 }
 
 capture_xctrace() {
-    xcrun --find xctrace >/dev/null 2>&1 || die "xctrace is part of Xcode; the Command Line Tools alone do not have it"
     choose_xctrace
     trace="$TRACE_DIR/cap.trace"
     printf 'Recording every process for %s seconds with Instruments (Time Profiler)...\n' "$TRACE_SECONDS"
@@ -382,14 +401,23 @@ capture_xctrace() {
             --output "$trace" > "$TRACE_DIR/record.log" 2>&1; then
         printf 'That needed administrator rights here; trying again with sudo...\n'
         rm -rf "$trace"
+        started=$(date +%s)
         # sudo resets the environment: carry a DEVELOPER_DIR that picked a particular Xcode.
         sudo ${DEVELOPER_DIR:+DEVELOPER_DIR="$DEVELOPER_DIR"} xcrun xctrace record --template 'Time Profiler' --all-processes --time-limit "${TRACE_SECONDS}s" --no-prompt \
             --output "$trace" > "$TRACE_DIR/record.log" 2>&1 || die "xctrace record failed: $(tail -n 3 "$TRACE_DIR/record.log" | tr '\n' ' ')"
         sudo chown -R "$(id -un)" "$trace"
     fi
-    # The recording is --time-limit long; xctrace takes as long again to start and save (60 s for a 30 s recording on a
-    # macOS 14 runner), and the service reads the window as the profile's length.
-    TRACE_STOP=$(utc_at $((started + TRACE_SECONDS)))
+    # The window is the recording's own, from the trace's table of contents: xctrace takes as long again as the
+    # recording to start and save (60 s for 30 s on macOS 14, 126 s on 26), and the service reads the window as the
+    # profile's length. Without one, the start plus --time-limit.
+    toc=$(xcrun xctrace export --input "$trace" --toc 2>/dev/null)
+    toc_start=$(printf '%s\n' "$toc" | sed -n 's/.*<start-date>\([0-9T:-]*\)[.0-9]*Z<\/start-date>.*/\1Z/p' | head -n 1)
+    toc_end=$(printf '%s\n' "$toc" | sed -n 's/.*<end-date>\([0-9T:-]*\)[.0-9]*Z<\/end-date>.*/\1Z/p' | head -n 1)
+    if [ -n "$toc_start" ] && [ -n "$toc_end" ]; then
+        TRACE_START=$toc_start TRACE_STOP=$toc_end
+    else
+        TRACE_START=$(utc_at "$started") TRACE_STOP=$(utc_at $((started + TRACE_SECONDS)))
+    fi
     xcrun xctrace export --input "$trace" --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' \
         --output "$TRACE_DIR/time-profile.xml" > /dev/null 2>&1 || die "xctrace export failed"
     out="$TRACE_DIR/xctrace.folded"
@@ -400,7 +428,7 @@ capture_xctrace() {
     TRACE_FILE=$out
     TRACE_TYPE=xctrace_export
     TRACE_TOOL=xctrace
-    TRACE_TOOL_VERSION=$(xcrun xctrace version 2>/dev/null | head -n 1)
+    TRACE_TOOL_VERSION=$XCTRACE_VERSION
     TRACE_COMMAND="xctrace record --template 'Time Profiler' --all-processes --time-limit ${TRACE_SECONDS}s; xctrace export --xpath time-profile; folded on this Mac"
 }
 
