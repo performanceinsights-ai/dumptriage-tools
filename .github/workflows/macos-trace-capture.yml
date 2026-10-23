@@ -98,17 +98,6 @@ jobs:
             --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' \
             --output "$OUT/xctrace-time-profile.xml"
           test -s "$OUT/xctrace-time-profile.xml"
-          echo "XCTRACE_RECORDED=1" >> "$GITHUB_ENV"
-
-      - name: xctrace symbolicate, then export again
-        # On macOS 14 (Xcode 15.4) the first run's export named 1% of frames, not even the burner's own (#41).
-        if: env.XCTRACE_RECORDED == '1'
-        continue-on-error: true
-        run: |
-          xcrun xctrace symbolicate --input "$WORK/cap.trace" --output "$WORK/cap-sym.trace" 2>&1 | tee "$OUT/xctrace-symbolicate-log.txt"
-          xcrun xctrace export --input "$WORK/cap-sym.trace" \
-            --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' \
-            --output "$OUT/xctrace-time-profile-symbolicated.xml"
 
       - name: powermetrics snapshot
         continue-on-error: true
