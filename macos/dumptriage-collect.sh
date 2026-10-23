@@ -22,7 +22,9 @@
 #   --dir DIR      look in DIR instead of the two DiagnosticReports folders (repeatable)
 #
 # Performance profiles (website#1999): a timed capture of a slow Mac, sent as a performance trace rather than
-# a report. Each takes 5 to 120 seconds (default 10), asks before sending, and sends nothing else with it.
+# a report. Each takes 30 to 120 seconds (default 30), asks before sending, and sends nothing else with it.
+# 30 s, not less: the service needs about 2,000 on-CPU samples to judge a profile, and spindump's 10 ms gives
+# about 100 a second for each busy core (website#2208).
 #
 #   --profile [S]  system-wide spindump (built in; sudo asks for your password)
 #   --sample X [S] `sample` of one process, pid or name (built in)
@@ -56,7 +58,7 @@ AGENT_VERSION="0.1.0"
 PROFILE=0
 SAMPLE_TARGET=""
 XCTRACE=0
-TRACE_SECONDS=10
+TRACE_SECONDS=30
 TRACE_DIR=""
 WATCH_ONCE=0
 SEND_HELD=0
@@ -81,8 +83,8 @@ seconds_next() {
     case "${1:-}" in
         ''|*[!0-9]*) return 1 ;;
     esac
-    if [ "$1" -lt 5 ] || [ "$1" -gt 120 ]; then
-        die "seconds must be 5 to 120, not $1" 2
+    if [ "$1" -lt 30 ] || [ "$1" -gt 120 ]; then
+        die "seconds must be 30 to 120, not $1 (shorter profiles are too thin to judge)" 2
     fi
     TRACE_SECONDS=$1
 }
@@ -648,11 +650,10 @@ check_triggers() {
 # A triggered capture into the spool, held: a folder per capture with the trace, its manifest and its type.
 spool_capture() {
     backend=$(cfg backend spindump)
-    max_sec=$(cfg limits.maxDurationSec 60)
     max_mb=$(cfg limits.maxDiskMB 512)
-    TRACE_SECONDS=$max_sec
-    [ "$TRACE_SECONDS" -le 30 ] || TRACE_SECONDS=30   # a system-wide spindump of 30 s is tens of megabytes
-    [ "$TRACE_SECONDS" -ge 5 ] || TRACE_SECONDS=5
+    # 30 s whatever maxDurationSec says: shorter is too thin for the service to judge (website#2208), and a
+    # system-wide spindump of 30 s is already tens of megabytes.
+    TRACE_SECONDS=30
     trace_workdir
     case "$backend" in
         spindump) capture_profile ;;

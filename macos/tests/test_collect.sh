@@ -380,7 +380,9 @@ done_test
 setup profile_seconds_are_checked_and_trace_options_stand_alone
 run "" --profile 3
 assert_eq "$CODE" 2
-assert_contains "$OUT" "seconds must be 5 to 120, not 3"
+assert_contains "$OUT" "seconds must be 30 to 120, not 3 (shorter profiles are too thin to judge)"
+run "" --profile 29 --dry-run   # website#2208: under 30 s a profile is too thin to judge
+assert_eq "$CODE" 2
 run "" --profile 500 --dry-run
 assert_eq "$CODE" 2
 run "" --sample
@@ -391,28 +393,28 @@ assert_contains "$OUT" "run it apart from"
 done_test
 
 setup a_dry_run_profile_captures_and_sends_nothing
-run "" --dry-run --profile 15 --sample 4242 20 --xctrace
+run "" --dry-run --profile 45 --sample 4242 60 --xctrace
 assert_eq "$CODE" 0
-assert_contains "$OUT" "Would sample every process for 20 s with spindump (sudo)"   # the last number given is the length
-assert_contains "$OUT" "Would sample 4242 for 20 s with sample"
-assert_contains "$OUT" "Would record every process for 20 s with xctrace"
+assert_contains "$OUT" "Would sample every process for 60 s with spindump (sudo)"   # the last number given is the length
+assert_contains "$OUT" "Would sample 4242 for 60 s with sample"
+assert_contains "$OUT" "Would record every process for 60 s with xctrace"
 assert_contains "$OUT" "Dry run: nothing captured, nothing sent."
 assert_eq "$(cat "$LOG")" ""
 done_test
 
 setup a_profile_is_captured_with_sudo_confirmed_and_uploaded_as_a_trace_with_its_manifest
 run "y
-" --profile 12
+" --profile 40
 assert_eq "$CODE" 0
 calls=$(cat "$LOG")
-assert_contains "$calls" "sudo spindump -notarget 12 10 -file "
+assert_contains "$calls" "sudo spindump -notarget 40 10 -file "
 assert_contains "$OUT" "spindump_text"
 assert_contains "$OUT" "sent spindump_text (trace 11111111-2222-3333-4444-555555555555)"
 assert_contains "$calls" "[https://triage.example.com/api/v1/traces]"
 assert_contains "$calls" 'config: header = "Authorization: Bearer dt_test_key_123"'
 assert_contains "$calls" '"traceType":"spindump_text"'
 assert_contains "$calls" '"trigger":{"name":"manual","type":"manual"}'
-assert_contains "$calls" '"tool":{"name":"spindump","version":"macOS 26.6.2","command":"spindump -notarget 12 10 -file <file>"}'
+assert_contains "$calls" '"tool":{"name":"spindump","version":"macOS 26.6.2","command":"spindump -notarget 40 10 -file <file>"}'
 assert_contains "$calls" '"os":{"family":"macos","build":"25G83"}'
 assert_contains "$calls" '"agentVersion":"0.1.0"'
 assert_not_contains "$(grep -o 'manifest=[^]]*' "$LOG")" "$T"   # no folder of ours, so no user name, in the manifest
@@ -422,7 +424,7 @@ assert_eq "$(ls "$T" | grep -c '^dumptriage-trace')" 0
 TOKEN=$(cat "$T/home/.config/dumptriage/host-token")
 assert_eq "${#TOKEN}" 16
 run "y
-" --profile 12
+" --profile 40
 assert_eq "$(cat "$T/home/.config/dumptriage/host-token")" "$TOKEN"
 assert_contains "$(cat "$LOG")" "\"hostToken\":\"$TOKEN\""
 done_test
@@ -437,21 +439,21 @@ done_test
 
 setup sample_takes_a_process_and_seconds
 run "y
-" --sample 4242 20
+" --sample 4242 45
 assert_eq "$CODE" 0
 calls=$(cat "$LOG")
-assert_contains "$calls" "sample 4242 20 1 -file "
+assert_contains "$calls" "sample 4242 45 1 -file "
 assert_not_contains "$calls" "sudo"   # no privilege for a process of your own
 assert_contains "$calls" '"traceType":"sample_text"'
-assert_contains "$calls" '"command":"sample <process> 20 1 -file <file>"'  # the process is not named in the manifest
+assert_contains "$calls" '"command":"sample <process> 45 1 -file <file>"'  # the process is not named in the manifest
 done_test
 
 setup xctrace_folds_on_the_mac_and_only_the_stacks_leave
 run "y
-" --xctrace 9
+" --xctrace 31
 assert_eq "$CODE" 0
 calls=$(cat "$LOG")
-assert_contains "$calls" "xcrun xctrace record --template Time Profiler --all-processes --time-limit 9s --no-prompt --output "
+assert_contains "$calls" "xcrun xctrace record --template Time Profiler --all-processes --time-limit 31s --no-prompt --output "
 assert_not_contains "$calls" "sudo"   # unprivileged first, as a customer would run it
 assert_contains "$calls" "--xpath /trace-toc/run[@number=\"1\"]/data/table[@schema=\"time-profile\"]"
 assert_contains "$OUT" "xctrace_export"
@@ -465,7 +467,7 @@ done_test
 
 setup xctrace_retries_with_sudo_when_the_unprivileged_record_is_refused
 FAKE_RECORD_NEEDS_SUDO=1 run "y
-" --xctrace 9
+" --xctrace 31
 assert_eq "$CODE" 0
 assert_contains "$OUT" "trying again with sudo"
 assert_contains "$(cat "$LOG")" "sudo xcrun xctrace record"
@@ -605,7 +607,7 @@ watch "$BASE"
 assert_eq "$CODE" 0
 assert_contains "$OUT" "trigger cpu-high: fire at $BASE (observed 97.5)"
 assert_contains "$OUT" "held cpu-high (spindump_text"
-assert_contains "$(cat "$LOG")" "sudo spindump -notarget 20 10 -file "
+assert_contains "$(cat "$LOG")" "sudo spindump -notarget 30 10 -file "   # 30 s although maxDurationSec is 20 (website#2208)
 HELD_DIR=$(ls -d "$T/state/spool/"*cpu-high)
 assert_eq "$(cat "$HELD_DIR/type")" spindump_text
 M=$(cat "$HELD_DIR/manifest.json")

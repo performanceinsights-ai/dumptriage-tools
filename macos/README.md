@@ -13,7 +13,7 @@ dumptriage-collect.sh --watch-once | --send-held                                
 
 | Option | What it does |
 |---|---|
-| `--profile [S]` | system-wide `spindump` for S seconds (5 to 120, default 10); sudo asks for your password |
+| `--profile [S]` | system-wide `spindump` for S seconds (30 to 120, default 30: shorter profiles are too thin to judge); sudo asks for your password |
 | `--sample X [S]` | `sample` of one process, by pid or name |
 | `--xctrace [S]` | Instruments' Time Profiler over every process, then `xctrace export` of the time-profile table and a fold to `process;frame;...;frame count` **on this Mac**. Only the folded stacks are sent: the `.trace` bundle and the XML are removed. Needs Xcode: the Command Line Tools do not include `xctrace` (checked on GitHub's macOS 14, 15 and 26 runners). |
 
@@ -41,8 +41,8 @@ Off until `~/.config/dumptriage/tracing.json` says so. The config is the shared 
 
 `--watch-once` checks each trigger once and remembers a run above its threshold between calls, so `sustainSec` works across
 calls. When one is met, outside the cooldown and under the daily cap (the rule every platform shares, replayed from
-`tests/fixtures/tracing/triggers.json`), it takes a capture with `backend` (`spindump` or `xctrace`; at most 30 s, and not kept if
-over `maxDiskMB`) and holds it in `~/.config/dumptriage/tracing-state/spool/`. **Nothing is ever sent from here**: you send what is held with
+`tests/fixtures/tracing/triggers.json`), it takes a capture with `backend` (`spindump` or `xctrace`; always 30 s whatever `maxDurationSec`
+says, since a shorter profile is too thin to judge, and not kept if over `maxDiskMB`) and holds it in `~/.config/dumptriage/tracing-state/spool/`. **Nothing is ever sent from here**: you send what is held with
 `dumptriage-collect.sh --send-held`, which lists it, asks, and removes what was sent. `submission` in the config is not read on macOS:
 a root daemon cannot read your keychain, so every capture is held.
 

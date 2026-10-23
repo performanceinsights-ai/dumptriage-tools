@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       seconds:
-        description: Capture length in seconds (5 to 120)
+        description: Capture length in seconds (30 to 120, as the collector takes; website#2208)
         type: number
-        default: 10
+        default: 30
   pull_request:
     paths:
       - .github/workflows/macos-trace-capture.yml
@@ -26,12 +26,12 @@ jobs:
       matrix:
         os: [macos-14, macos-15, macos-26]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30  # four captures of at most 120 s each, one after another, plus setup
+    timeout-minutes: 75  # about ten captures of 30 to 120 s each, one after another, plus setup
     defaults:
       run:
         shell: bash  # with pipefail, so a capture piped into tee still fails when the tool does
     env:
-      SECONDS_TO_CAPTURE: ${{ inputs.seconds || '10' }}
+      SECONDS_TO_CAPTURE: ${{ inputs.seconds || '30' }}
       OUT: ${{ github.workspace }}/capture
       WORK: ${{ github.workspace }}/../capture-work
     steps:
@@ -42,8 +42,8 @@ jobs:
           case "$SECONDS_TO_CAPTURE" in
             ''|*[!0-9]*) echo "seconds must be a whole number, got '$SECONDS_TO_CAPTURE'"; exit 1 ;;
           esac
-          if [ "$SECONDS_TO_CAPTURE" -lt 5 ] || [ "$SECONDS_TO_CAPTURE" -gt 120 ]; then
-            echo "seconds must be 5 to 120, got $SECONDS_TO_CAPTURE"; exit 1
+          if [ "$SECONDS_TO_CAPTURE" -lt 30 ] || [ "$SECONDS_TO_CAPTURE" -gt 120 ]; then
+            echo "seconds must be 30 to 120, got $SECONDS_TO_CAPTURE"; exit 1
           fi
           mkdir -p "$OUT" "$WORK"
           {
@@ -58,6 +58,8 @@ jobs:
               echo "xctrace under CommandLineTools: $(DEVELOPER_DIR=/Library/Developer/CommandLineTools xcrun --find xctrace 2>&1)"
             fi
             xcrun xctrace version || true
+            echo "installed Xcodes:"
+            ls -d /Applications/Xcode*.app 2>&1
           } > "$OUT/environment.txt" 2>&1
           cat "$OUT/environment.txt"
           # The tools' own usage text, to pin the flags each macOS version takes.
@@ -72,7 +74,7 @@ jobs:
         run: |
           clang -g -O0 -o "$WORK/dtburn" macos/tests/burn.c
           # Long enough for every capture below; stopped at the end either way.
-          "$WORK/dtburn" $(( SECONDS_TO_CAPTURE * 4 + 300 )) > /dev/null &
+          "$WORK/dtburn" $(( SECONDS_TO_CAPTURE * 14 + 600 )) > /dev/null &
           echo "BURN_PID=$!" >> "$GITHUB_ENV"
           echo "burner pid $!"
 
@@ -131,7 +133,7 @@ jobs:
           export DUMPTRIAGE_API_URL=http://127.0.0.1:8765 DUMPTRIAGE_API_KEY=dt_ci_key HOME="$WORK/home"
           mkdir -p "$HOME"
           status=0
-          for args in "--profile 5" "--sample $BURN_PID 5" "--xctrace 5"; do
+          for args in "--profile $SECONDS_TO_CAPTURE" "--sample $BURN_PID $SECONDS_TO_CAPTURE" "--xctrace $SECONDS_TO_CAPTURE"; do
             echo "=== dumptriage-collect.sh $args" | tee -a "$OUT/collector-log.txt"
             echo y | /bin/bash macos/dumptriage-collect.sh $args 2>&1 | tee -a "$OUT/collector-log.txt" || status=1
           done
@@ -157,7 +159,7 @@ jobs:
              {"name": "any-load", "type": "loadPerCpu", "threshold": 0},
              {"name": "never", "type": "cpuPercent", "process": "dtburn", "threshold": 100000},
              {"name": "no-psi", "type": "psiSomeAvg10", "threshold": 1}],
-           "limits": {"maxDurationSec": 5, "cooldownMin": 0, "dailyCap": 10}}
+           "limits": {"maxDurationSec": 30, "cooldownMin": 0, "dailyCap": 10}}
           JSON
           sed -i.bak 's/^          //' "$HOME/.config/dumptriage/tracing.json" && rm -f "$HOME/.config/dumptriage/tracing.json.bak"
           status=0
@@ -193,12 +195,57 @@ jobs:
             count "$WORK/sym.trace" "raw export"
             echo "== xctrace symbolicate, no --dsym"
             xcrun xctrace symbolicate --input "$WORK/sym.trace" --output "$WORK/sym-a.trace" 2>&1 | tail -3
-            [ -e "$WORK/sym-a.trace" ] && count "$WORK/sym-a.trace" "after symbolicate (no dsym)"
+            # `if`, not `&&`: under bash -e a false test ended the block here before the --dsym try (#46).
+            if [ -e "$WORK/sym-a.trace" ]; then count "$WORK/sym-a.trace" "after symbolicate (no dsym)"; fi
             echo "== xctrace symbolicate --dsym the burner's dSYM"
             xcrun xctrace symbolicate --input "$WORK/sym.trace" --output "$WORK/sym-b.trace" --dsym "$WORK/dtburn.dSYM" 2>&1 | tail -3
-            [ -e "$WORK/sym-b.trace" ] && count "$WORK/sym-b.trace" "after symbolicate --dsym"
+            if [ -e "$WORK/sym-b.trace" ]; then count "$WORK/sym-b.trace" "after symbolicate --dsym"; fi
           } > "$OUT/xctrace-symbolicate.txt" 2>&1
           cat "$OUT/xctrace-symbolicate.txt"
+
+      - name: xctrace with the newest Xcode of each major version (Xcode 15.4 on macOS 14 names 2% of frames, #46)
+        if: matrix.os == 'macos-14'
+        continue-on-error: true
+        run: |
+          # The image ships several Xcodes; record and export with the newest of each major version and count how many
+          # frames come back named, and whether the burner's own function is among them.
+          mkdir -p "$OUT/xcodes"
+          for major in 15 16 26; do
+            app=$(ls -d /Applications/Xcode_${major}*.app 2>/dev/null | sort -V | tail -1)
+            [ -n "$app" ] || { echo "Xcode $major: not installed" | tee -a "$OUT/xcodes/summary.txt"; continue; }
+            dev="$app/Contents/Developer"
+            name=$(basename "$app" .app)
+            trace="$WORK/$name.trace"
+            if ! DEVELOPER_DIR="$dev" xcrun xctrace record --template 'Time Profiler' --all-processes \
+                 --time-limit "${SECONDS_TO_CAPTURE}s" --no-prompt --output "$trace" > "$OUT/xcodes/$name-record.txt" 2>&1; then
+              echo "$name: record failed" | tee -a "$OUT/xcodes/summary.txt"; continue
+            fi
+            DEVELOPER_DIR="$dev" xcrun xctrace export --input "$trace" \
+              --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' --output "$OUT/xcodes/$name.xml"
+            total=$(grep -o '<frame id="[0-9]*" name="[^"]*"' "$OUT/xcodes/$name.xml" | wc -l | tr -d ' ')
+            raw=$(grep -o '<frame id="[0-9]*" name="0x[0-9a-fA-F]*"' "$OUT/xcodes/$name.xml" | wc -l | tr -d ' ')
+            burner=$(grep -c 'name="dt_burn_inner"' "$OUT/xcodes/$name.xml" || true)
+            echo "$name ($(DEVELOPER_DIR="$dev" xcrun xctrace version 2>&1)): $total frames defined, $raw named as addresses, dt_burn_inner named: $burner" \
+              | tee -a "$OUT/xcodes/summary.txt"
+            gzip -f "$OUT/xcodes/$name.xml"
+          done
+
+      - name: dumptriage-collect.sh --xctrace with the newest Xcode (macOS 14, #46)
+        if: matrix.os == 'macos-14'
+        continue-on-error: true
+        run: |
+          app=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          export DEVELOPER_DIR="$app/Contents/Developer"
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR"
+          mkdir -p "$OUT/service-newest-xcode"
+          python3 macos/tests/fake_trace_service.py "$OUT/service-newest-xcode" 8766 &
+          SERVICE_PID=$!
+          sleep 2
+          export DUMPTRIAGE_API_URL=http://127.0.0.1:8766 DUMPTRIAGE_API_KEY=dt_ci_key HOME="$WORK/home-newest-xcode"
+          mkdir -p "$HOME"
+          echo y | /bin/bash macos/dumptriage-collect.sh --xctrace "$SECONDS_TO_CAPTURE" 2>&1 | tee "$OUT/service-newest-xcode/log.txt"
+          kill "$SERVICE_PID" 2>/dev/null || true
+          ls -l "$OUT/service-newest-xcode"
 
       - name: dSYM lookup by UUID (website#2156)
         continue-on-error: true
