@@ -333,11 +333,22 @@ assert_eq "$(grep -c '^curl' "$LOG")" 0
 [ -z "$(ls "$T"/dumptriage-spindump-* 2>/dev/null)" ] || fail "a declined spindump was left in TMPDIR"
 done_test
 
-setup no_url_stops_before_taking_a_spindump
-DUMPTRIAGE_API_URL= run "" --dir "$REPORTS" --spindump Xcode
-assert_eq "$CODE" 2
-assert_eq "$(grep -c '^sudo' "$LOG")" 0
-[ -z "$(ls "$T"/dumptriage-spindump-* 2>/dev/null)" ] || fail "a spindump that could not be sent was left in TMPDIR"
+setup no_url_sends_to_the_hosted_api
+DUMPTRIAGE_API_URL= run "y
+" --dir "$REPORTS" --all
+assert_eq "$CODE" 0
+assert_contains "$OUT" "file(s) to https://api.performanceinsights.ai?"
+assert_contains "$(cat "$LOG")" "https://api.performanceinsights.ai/api/v1/dumps"
+done_test
+
+setup help_documents_the_environment_variables
+run "" --help
+assert_eq "$CODE" 0
+for v in DUMPTRIAGE_API_URL DUMPTRIAGE_API_KEY DUMPTRIAGE_PORTAL_URL DUMPTRIAGE_TRACING_CONFIG DUMPTRIAGE_STATE_DIR DUMPTRIAGE_XCODE_APPS; do
+    assert_contains "$OUT" "$v"
+done
+assert_contains "$OUT" "https://api.performanceinsights.ai"
+assert_contains "$OUT" "sudo DUMPTRIAGE_API_URL=... DUMPTRIAGE_API_KEY=..."
 done_test
 
 setup dry_run_spindump_runs_nothing
