@@ -41,7 +41,9 @@
 #   --send-held    list what is held, show the files, ask, send, and remove what was sent
 #
 # Environment:
-#   DUMPTRIAGE_API_URL     the service, e.g. https://dumptriage.example.com (required to send)
+#   DUMPTRIAGE_API_URL     the service (default: the hosted one, https://api.performanceinsights.ai); set it for a
+#                          self-hosted install, e.g. https://dumptriage.example.com. sudo drops it unless you write
+#                          sudo DUMPTRIAGE_API_URL=... ./dumptriage-collect.sh
 #   DUMPTRIAGE_API_KEY     your API key; if unset, read from the login keychain:
 #                          security add-generic-password -U -s dumptriage -a "$USER" -w
 #                          No account yet? Run this anyway: it says where to sign up.
@@ -49,6 +51,7 @@
 
 set -u
 
+DEFAULT_API_URL=https://api.performanceinsights.ai   # the hosted service, as in every other tool
 DAYS=7
 SEND_ALL=0
 DRY_RUN=0
@@ -936,8 +939,7 @@ upload() {
 # Where to send, and the key, before anything else: a customer with no key
 # learns it before picking reports or typing a sudo password for a spindump.
 if [ "$DRY_RUN" -eq 0 ] && [ "$WATCH_ONCE" -eq 0 ]; then  # watching only captures and holds: nothing is sent
-    API_URL=${DUMPTRIAGE_API_URL:-}
-    [ -n "$API_URL" ] || die "set DUMPTRIAGE_API_URL to the service's address, e.g. https://dumptriage.example.com" 2
+    API_URL=${DUMPTRIAGE_API_URL:-$DEFAULT_API_URL}
     PORTAL_URL=${DUMPTRIAGE_PORTAL_URL:-$API_URL}
     KEY=""
     api_key || no_key

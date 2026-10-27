@@ -9,6 +9,9 @@ dumptriage-collect.sh --profile [S] | --sample PID|NAME [S] | --xctrace [S]     
 dumptriage-collect.sh --watch-once | --send-held                                             watching
 ```
 
+It sends to the hosted service, `https://api.performanceinsights.ai`. For a self-hosted install set `DUMPTRIAGE_API_URL`
+(under `sudo` write `sudo DUMPTRIAGE_API_URL=https://... ./dumptriage-collect.sh`: sudo drops the variable otherwise).
+
 ## A performance capture
 
 | Option | What it does |
