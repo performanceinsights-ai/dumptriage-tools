@@ -40,14 +40,19 @@
 #                  configured backend (spindump or xctrace) and keep it in the spool folder, held.
 #   --send-held    list what is held, show the files, ask, send, and remove what was sent
 #
-# Environment:
-#   DUMPTRIAGE_API_URL     the service (default: the hosted one, https://api.performanceinsights.ai); set it for a
-#                          self-hosted install, e.g. https://dumptriage.example.com. sudo drops it unless you write
-#                          sudo DUMPTRIAGE_API_URL=... ./dumptriage-collect.sh
-#   DUMPTRIAGE_API_KEY     your API key; if unset, read from the login keychain:
-#                          security add-generic-password -U -s dumptriage -a "$USER" -w
-#                          No account yet? Run this anyway: it says where to sign up.
-#   DUMPTRIAGE_PORTAL_URL  where report links point (defaults to DUMPTRIAGE_API_URL)
+# Environment (set them for one run, VAR=value ./dumptriage-collect.sh ..., or export them in your shell):
+#   DUMPTRIAGE_API_URL      the service. Default: the hosted one, https://api.performanceinsights.ai. For a
+#                           self-hosted install: DUMPTRIAGE_API_URL=https://dumptriage.example.com
+#   DUMPTRIAGE_API_KEY      your API key; if unset, read from the login keychain:
+#                           security add-generic-password -U -s dumptriage -a "$USER" -w
+#                           No account yet? Run this anyway: it says where to sign up.
+#   DUMPTRIAGE_PORTAL_URL   where report links point. Default: DUMPTRIAGE_API_URL
+#   DUMPTRIAGE_TRACING_CONFIG  the --watch-once config. Default: ~/.config/dumptriage/tracing.json
+#   DUMPTRIAGE_STATE_DIR    where --watch-once keeps its state and held captures.
+#                           Default: ~/.config/dumptriage/tracing-state
+#   DUMPTRIAGE_XCODE_APPS   the folder searched for Xcode 16 or later by --xctrace. Default: /Applications
+# sudo does not pass these on, and reads root's keychain, not yours: sudo DUMPTRIAGE_API_URL=... DUMPTRIAGE_API_KEY=...
+# ./dumptriage-collect.sh. You do not need sudo to run the script: it asks for it where a capture needs it.
 
 set -u
 

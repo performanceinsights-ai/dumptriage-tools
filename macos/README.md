@@ -9,8 +9,23 @@ dumptriage-collect.sh --profile [S] | --sample PID|NAME [S] | --xctrace [S]     
 dumptriage-collect.sh --watch-once | --send-held                                             watching
 ```
 
-It sends to the hosted service, `https://api.performanceinsights.ai`. For a self-hosted install set `DUMPTRIAGE_API_URL`
-(under `sudo` write `sudo DUMPTRIAGE_API_URL=https://... ./dumptriage-collect.sh`: sudo drops the variable otherwise).
+## Settings
+
+Settings are environment variables, for one run (`DUMPTRIAGE_API_URL=https://... ./dumptriage-collect.sh`) or exported in
+your shell. `dumptriage-collect.sh --help` lists them too.
+
+| Variable | Default | What it is |
+|---|---|---|
+| `DUMPTRIAGE_API_URL` | `https://api.performanceinsights.ai` (the hosted service) | The service to send to. Set it for a self-hosted install, e.g. `https://dumptriage.example.com`. |
+| `DUMPTRIAGE_API_KEY` | read from the login keychain | Your API key. To keep it in the keychain: `security add-generic-password -U -s dumptriage -a "$USER" -w` (it asks for the key). With no key the script says where to sign up. |
+| `DUMPTRIAGE_PORTAL_URL` | `DUMPTRIAGE_API_URL` | Where the report and sign-up links point. |
+| `DUMPTRIAGE_TRACING_CONFIG` | `~/.config/dumptriage/tracing.json` | The `--watch-once` config (see Watching). |
+| `DUMPTRIAGE_STATE_DIR` | `~/.config/dumptriage/tracing-state` | Where `--watch-once` keeps its state and held captures. |
+| `DUMPTRIAGE_XCODE_APPS` | `/Applications` | The folder searched for Xcode 16 or later by `--xctrace`. |
+
+`sudo` does not pass these on, and reads root's keychain, not yours. Under sudo write
+`sudo DUMPTRIAGE_API_URL=https://... DUMPTRIAGE_API_KEY=... ./dumptriage-collect.sh`. You do not need sudo to run the script:
+it asks for it where a capture needs it (`--spindump`, `--profile`, `--xctrace`).
 
 ## A performance capture
 

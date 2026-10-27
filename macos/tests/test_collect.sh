@@ -341,6 +341,16 @@ assert_contains "$OUT" "file(s) to https://api.performanceinsights.ai?"
 assert_contains "$(cat "$LOG")" "https://api.performanceinsights.ai/api/v1/dumps"
 done_test
 
+setup help_documents_the_environment_variables
+run "" --help
+assert_eq "$CODE" 0
+for v in DUMPTRIAGE_API_URL DUMPTRIAGE_API_KEY DUMPTRIAGE_PORTAL_URL DUMPTRIAGE_TRACING_CONFIG DUMPTRIAGE_STATE_DIR DUMPTRIAGE_XCODE_APPS; do
+    assert_contains "$OUT" "$v"
+done
+assert_contains "$OUT" "https://api.performanceinsights.ai"
+assert_contains "$OUT" "sudo DUMPTRIAGE_API_URL=... DUMPTRIAGE_API_KEY=..."
+done_test
+
 setup dry_run_spindump_runs_nothing
 run "" --dir "$REPORTS" --spindump 4242 --dry-run
 assert_eq "$CODE" 0
