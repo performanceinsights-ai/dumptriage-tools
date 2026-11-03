@@ -46,6 +46,13 @@ agent with `configure-dumps.sh` and `configure-tracing.sh` (`dumptriage-agent-li
 [performanceinsights.ai/downloads](https://performanceinsights.ai/downloads/). A `v*` tag publishes a release
 (`.github/workflows/release.yml`).
 
+Each asset carries a build-provenance attestation from that workflow (#65). `SHA256SUMS` sits in the same release, so
+it only catches a broken download; the attestation shows the file was built by this repository's release workflow:
+
+```
+gh attestation verify dumptriage-agent-windows-x64.zip -R performanceinsights-ai/dumptriage-tools
+```
+
 ## Tracing contracts
 
 Automated performance-trace capture (website#1999) is defined once here so the three platforms cannot drift:
