@@ -122,9 +122,19 @@ CURRENT=install_sh_refuses_a_plain_http_api_url CURRENT_FAILED=0
 # dumptriage-tools#60: the key and the dumps would go in clear.
 OUT=$(bash "$INSTALL" --dry-run --method cron --api-url http://dumptriage.corp.example 2>&1) && fail "accepted plain http"
 assert_contains "$OUT" "--api-url must be an https URL"
-for url in http://127.0.0.1.evil.example http://localhost:x@evil.example; do
+for url in http://127.0.0.1.evil.example http://localhost:x@evil.example http://127.0.0.1@evil.example 'http://[::1'; do
   OUT=$(bash "$INSTALL" --dry-run --method cron --api-url "$url" 2>&1) && fail "accepted $url"
+  assert_contains "$OUT" "--api-url must be an https URL"
+  assert_not_contains "$OUT" "Traceback"
 done
+# An upgrade over a config.json that already holds a plain-http URL is refused, with the fix named.
+home=$(mktemp -d "$WORK/home.XXXXXX")
+mkdir -p "$home/.config/dumptriage"
+printf '{"apiBaseUrl": "http://dumptriage.corp.example"}' > "$home/.config/dumptriage/config.json"
+OUT=$(HOME=$home XDG_CONFIG_HOME="$home/.config" bash "$INSTALL" --dry-run --method cron 2>&1) && fail "upgraded over an http config"
+assert_contains "$OUT" "re-run with --api-url https://"
+OUT=$(HOME=$home XDG_CONFIG_HOME="$home/.config" bash "$INSTALL" --dry-run --method cron --api-url https://dumptriage.corp.example 2>&1) \
+  || fail "refused the fix: $OUT"
 for url in https://dumptriage.corp.example http://127.0.0.1:8000 http://localhost:8000; do
   OUT=$(bash "$INSTALL" --dry-run --method cron --api-url "$url" 2>&1) || fail "refused $url: $OUT"
 done

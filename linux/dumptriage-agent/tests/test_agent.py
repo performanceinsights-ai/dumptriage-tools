@@ -297,15 +297,21 @@ class UploadTests(unittest.TestCase):
             self.assertTrue(da.secure_api_url(url), url)
         for url in ("http://api.performanceinsights.ai", "http://10.0.0.5:8000", "http://localhost.evil.example",
                     "http://127.0.0.1.evil.example", "http://localhost:x@evil.example", "http://127.0.0.1@evil.example",
-                    "https://api.example:abc", "ftp://x.example", "https://", "api.performanceinsights.ai", "", None, 42):
+                    "https://api.example:abc", "http://[::1", "http://[localhost]:80", "ftp://x.example", "https://",
+                    "api.performanceinsights.ai", "", None, 42):
             self.assertFalse(da.secure_api_url(url), url)
         p = Path(tempfile.mkdtemp()) / "c"
         p.write_bytes(USER_CORE)
-        # Not the key's fault, so not AUTH (which would pause uploads and blame the key).
+        # The config's fault: not AUTH (which would pause uploads and blame the key), not TRANSIENT (which uses up the
+        # dump's attempts).
         outcome, status, msg = da.upload_dump("http://203.0.113.9:1", "k", str(p), None)
-        self.assertEqual((outcome, status), (da.TRANSIENT, None))
+        self.assertEqual((outcome, status), (da.CONFIG, None))
         self.assertIn("must be an https URL", msg)
-        self.assertEqual(da.upload_trace("http://203.0.113.9:1", "k", str(p), "{}", None)[0], da.TRANSIENT)
+        self.assertEqual(da.upload_trace("http://203.0.113.9:1", "k", str(p), "{}", None)[0], da.CONFIG)
+
+    def test_an_ipv6_loopback_url_without_a_port_reaches_port_80(self):
+        conn, prefix = da.api_connection("http://[::1]/base", 5)
+        self.assertEqual((conn.host, conn.port, prefix), ("::1", 80, "/base"))
 
     def test_a_plain_http_api_url_stops_the_daemon_but_not_the_local_commands(self):
         d = Path(tempfile.mkdtemp())

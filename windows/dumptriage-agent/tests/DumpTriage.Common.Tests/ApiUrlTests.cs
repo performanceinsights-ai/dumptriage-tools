@@ -24,4 +24,20 @@ public class ApiUrlTests
     [InlineData("")]
     [InlineData(null)]
     public void AnythingElseIsRefused(string? url) => Assert.False(AgentConfig.IsSecureApiUrl(url));
+
+    [Fact]
+    public void TheServiceRefusesAnInsecureUrlBeforeItCanSend()
+    {
+        // The check lives in Program.cs's top-level startup, which no test can run: pin that it follows the config load
+        // and comes before the HTTP client and the hosted services are registered, so a refactor can't drop or move it.
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null && !Directory.Exists(Path.Combine(dir.FullName, "schemas"))) dir = dir.Parent;
+        Assert.NotNull(dir);
+        var program = File.ReadAllText(Path.Combine(dir!.FullName, "windows", "dumptriage-agent", "src", "DumpTriageAgent", "Program.cs"));
+        var load = program.IndexOf("var config = await ConfigLoader.LoadOrCreateDefaultAsync(configPath);", StringComparison.Ordinal);
+        var check = program.IndexOf("if (!AgentConfig.IsSecureApiUrl(config.ApiBaseUrl))", StringComparison.Ordinal);
+        var client = program.IndexOf("AddHttpClient<DumpTriageApiClient>", StringComparison.Ordinal);
+        Assert.True(load >= 0 && check > load && client > check, $"load {load}, check {check}, client {client}");
+        Assert.Contains("return 1;", program.Substring(check, 300));
+    }
 }

@@ -86,24 +86,39 @@ die() {
     exit "${2:-1}"
 }
 
-# The key and the captures go to $1: https, or plain http to this machine only (dumptriage-tools#60), the agents' rule.
-# The host is parsed out, so userinfo (http://localhost:x@elsewhere) and lookalikes (http://127.0.0.1.elsewhere) fail.
+# The key and the captures go to $1: https, or plain http to this machine only (dumptriage-tools#60), the agents' rule
+# (the Linux agent's secure_api_url), case for case: the host is parsed out, so userinfo on http
+# (http://localhost:x@elsewhere), lookalikes (http://127.0.0.1.elsewhere) and malformed ports or [hosts] fail.
 secure_api_url() {
-    local url=$1 authority host
+    local url=$1 scheme authority host port
     case $url in
-        https://*) authority=${url#https://} ;;
-        http://*) authority=${url#http://} ;;
+        https://*) scheme=https ;;
+        http://*) scheme=http ;;
         *) return 1 ;;
     esac
+    authority=${url#*://}
     authority=${authority%%[/?#]*}
-    case $authority in "" | *@*) return 1 ;; esac
-    case $url in https://*) return 0 ;; esac
     case $authority in
-        \[*\]* )
-            host=${authority#[}; host=${host%%]*}
-            case ${authority#*]} in "" | :[0-9]*) ;; *) return 1 ;; esac ;;
-        *) host=${authority%%:*} ;;
+        *@*) [ "$scheme" = https ] || return 1; authority=${authority##*@} ;;
     esac
+    case $authority in
+        \[*)
+            host=${authority#[}
+            case $host in *\]*) ;; *) return 1 ;; esac
+            port=${host#*]}
+            host=${host%%]*}
+            case $host in "" | *[!0-9a-fA-F:.]*) return 1 ;; esac ;;
+        *)
+            host=${authority%%:*}
+            port=${authority#"$host"} ;;
+    esac
+    [ -n "$host" ] || return 1
+    case $port in
+        "" | ":") ;;
+        :*) [[ ${port#:} =~ ^[0-9]{1,5}$ ]] || return 1 ;;
+        *) return 1 ;;
+    esac
+    [ "$scheme" = https ] && return 0
     case $host in localhost | ::1) return 0 ;; esac
     [[ $host =~ ^127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]
 }

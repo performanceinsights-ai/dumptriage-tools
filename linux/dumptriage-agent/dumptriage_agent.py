@@ -297,9 +297,9 @@ def secure_api_url(url):
     Test-ApiBaseUrl is the same rule; install.sh calls this one."""
     if not isinstance(url, str):
         return False
-    u = urllib.parse.urlsplit(url)
     try:
-        u.port  # a malformed port raises here, not halfway into an upload
+        u = urllib.parse.urlsplit(url)  # a malformed [host] raises here
+        u.port  # and a malformed port here, not halfway into an upload
     except ValueError:
         return False
     if u.scheme == "https" and u.hostname:
@@ -319,7 +319,9 @@ def api_connection(base_url, timeout):
         raise ValueError(f"refusing to send the API key: {insecure_api_url_message(base_url)}")
     u = urllib.parse.urlsplit(base_url)
     conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
-    return conn_cls(u.hostname, u.port, timeout=timeout), u.path.rstrip("/")
+    # An IPv6 literal keeps its brackets: bare, http.client would read "::1"'s last ":1" as the port.
+    host = f"[{u.hostname}]" if ":" in u.hostname else u.hostname
+    return conn_cls(host, u.port, timeout=timeout), u.path.rstrip("/")
 
 
 def form_value(value):
@@ -476,6 +478,9 @@ class Queue:
 # --- upload ------------------------------------------------------------------
 
 SUCCESS, REJECTED, QUOTA, AUTH, TRANSIENT = "success", "rejected", "quota", "auth", "transient"
+# The agent's own config is wrong (an insecure apiBaseUrl): not the dump's fault, so no attempt is used, and not the
+# key's, so no key pause either (dumptriage-tools#60).
+CONFIG = "config"
 AUTH_BACKOFF_SECONDS = 600
 
 
@@ -494,8 +499,8 @@ def upload_dump(base_url, api_key, path, hostname, name=None, timeout=1800):
     size = os.path.getsize(path)
     try:
         conn, prefix = api_connection(base_url, timeout)
-    except ValueError as e:  # `run` refuses such a config first; this is the last guard, and not the key's fault
-        return TRANSIENT, None, str(e)
+    except ValueError as e:  # `run` refuses such a config first; this is the last guard
+        return CONFIG, None, str(e)
     try:
         conn.putrequest("POST", prefix + "/api/v1/dumps")
         conn.putheader("Authorization", f"Bearer {api_key}")
@@ -916,8 +921,8 @@ def upload_trace(base_url, api_key, path, manifest_json, hostname, name="trace.f
     size = os.path.getsize(path)
     try:
         conn, prefix = api_connection(base_url, timeout)
-    except ValueError as e:  # `run` refuses such a config first; this is the last guard, and not the key's fault
-        return TRANSIENT, None, str(e)
+    except ValueError as e:  # `run` refuses such a config first; this is the last guard
+        return CONFIG, None, str(e)
     try:
         conn.putrequest("POST", prefix + "/api/v1/traces")
         conn.putheader("Authorization", f"Bearer {api_key}")
@@ -1531,6 +1536,9 @@ class Agent:
         elif outcome in (REJECTED, QUOTA):
             log.warning("%s %s rejected (%s): %s", r["kind"], r["file_path"], status, msg)
             self.queue.update(r["id"], state=FAILED, last_error=f"{status}: {msg}")
+        elif outcome == CONFIG:
+            log.error("%s %s not sent: %s", r["kind"], r["file_path"], msg)
+            self.queue.update(r["id"], state=QUEUED, last_error=msg)
         elif outcome == AUTH:
             # Not the dump's fault and no attempt used: the key is wrong, revoked or rotated.
             stamp = self.used_key_stamp  # the key this upload used, not one stored meanwhile
