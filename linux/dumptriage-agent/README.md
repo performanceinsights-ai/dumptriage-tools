@@ -30,7 +30,7 @@ The installer picks how to run in the background:
 
 Override with `--method`. Re-running the installer upgrades the agent and keeps `config.json`; options given
 on the command line (`--policy`, `--api-url`, `--watch`) update just those fields. The key is read from
-`--api-key-file` (deleted once stored) or stdin (`--api-key-stdin`), never from argv. `installer/uninstall.sh`
+`--api-key-file` (deleted once stored) or stdin (`--api-key-stdin`), never from argv. `apiBaseUrl` must be https; plain `http://` is accepted only for this machine (`localhost`, `127.x.x.x`, `[::1]`), for a local test backend. Since dumptriage-tools#60 the agent (and `install.sh --api-url`) refuses to start with any other http URL, because it would send the API key and the dumps unencrypted: a self-hosted install still on plain http needs a TLS address before upgrading. `installer/uninstall.sh`
 removes the service, cron job and binaries; `--remove-data` also deletes config, key and queue.
 
 A user-mode install can only read what that user may read. The kernel writes each core as the crashing

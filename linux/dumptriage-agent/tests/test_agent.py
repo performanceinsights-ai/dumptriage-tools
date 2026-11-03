@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import lzma
 import os
@@ -287,6 +289,49 @@ class UploadTests(unittest.TestCase):
         p = Path(tempfile.mkdtemp()) / "c"
         p.write_bytes(USER_CORE)
         self.assertEqual(da.upload_dump("http://127.0.0.1:1", "k", str(p), None)[0], da.TRANSIENT)
+
+    def test_the_key_goes_only_over_https_or_to_this_machine(self):
+        # dumptriage-tools#60: plain http to another host would send the key and the dump in clear.
+        for url in ("https://api.performanceinsights.ai", "https://dt.corp.example:8443/base",
+                    "http://127.0.0.1:8000", "http://localhost:8000", "http://[::1]:8000"):
+            self.assertTrue(da.secure_api_url(url), url)
+        for url in ("http://api.performanceinsights.ai", "http://10.0.0.5:8000", "http://localhost.evil.example",
+                    "http://127.0.0.1.evil.example", "http://localhost:x@evil.example", "http://127.0.0.1@evil.example",
+                    "https://api.example:abc", "http://[::1", "http://[localhost]:80", "ftp://x.example", "https://",
+                    "api.performanceinsights.ai", "", None, 42):
+            self.assertFalse(da.secure_api_url(url), url)
+        p = Path(tempfile.mkdtemp()) / "c"
+        p.write_bytes(USER_CORE)
+        # The config's fault: not AUTH (which would pause uploads and blame the key), not TRANSIENT (which uses up the
+        # dump's attempts).
+        outcome, status, msg = da.upload_dump("http://203.0.113.9:1", "k", str(p), None)
+        self.assertEqual((outcome, status), (da.CONFIG, None))
+        self.assertIn("must be an https URL", msg)
+        self.assertEqual(da.upload_trace("http://203.0.113.9:1", "k", str(p), "{}", None)[0], da.CONFIG)
+
+    def test_an_ipv6_loopback_url_without_a_port_reaches_port_80(self):
+        conn, prefix = da.api_connection("http://[::1]/base", 5)
+        self.assertEqual((conn.host, conn.port, prefix), ("::1", 80, "/base"))
+
+    def test_a_plain_http_api_url_stops_the_daemon_but_not_the_local_commands(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "cfg").mkdir()
+        (d / "cfg" / "config.json").write_text(json.dumps({"apiBaseUrl": "http://dumptriage.corp.example"}))
+        dirs = ["--config-dir", str(d / "cfg"), "--state-dir", str(d / "state")]
+        with self.assertRaises(SystemExit) as refused:
+            da.main(dirs + ["run", "--once"])
+        self.assertIn("must be an https URL", str(refused.exception))
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(da.main(dirs + ["status"]), 0)
+        self.assertIn("warning: apiBaseUrl must be an https URL", err.getvalue())
+
+    def test_a_file_name_cannot_end_the_multipart_header(self):
+        url, seen = self.serve(201)
+        p = Path(tempfile.mkdtemp()) / "c"
+        p.write_bytes(USER_CORE)
+        da.upload_dump(url, "k", str(p), None, name='core"\r\nX-Injected: 1\r\n.dmp')
+        self.assertNotIn(b"X-Injected: 1\r\n", seen["body"])
 
 
 

@@ -44,6 +44,15 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# The key and the trace go to -ApiUrl: https, or plain http to this machine only (dumptriage-tools#60), the rule
+# Invoke-DumpTriageCollect.ps1's Test-ApiBaseUrl uses. With -Upload it is checked before recording, so a bad URL wastes
+# no capture; without, the curl line printed at the end is left out for such a URL.
+$apiUri = $null
+$secureApiUrl = [Uri]::TryCreate($ApiUrl, [UriKind]::Absolute, [ref]$apiUri) -and
+    ($apiUri.Scheme -eq 'https' -or ($apiUri.Scheme -eq 'http' -and $apiUri.IsLoopback))
+if ($Upload -and -not $secureApiUrl) {
+    throw "-ApiUrl must be an https URL (plain http only to this machine), got '$ApiUrl'"
+}
 $profilePath = Join-Path $PSScriptRoot 'PerfInsights.wprp'
 if (-not (Test-Path -LiteralPath $profilePath)) { throw "PerfInsights.wprp must be next to this script ($profilePath)" }
 $wpr = Join-Path $env:SystemRoot 'System32\wpr.exe'
@@ -123,6 +132,9 @@ if ($Upload) {
     $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
     if (-not $response.IsSuccessStatusCode) { throw "upload refused ($([int]$response.StatusCode)): $body" }
     Write-Host "Uploaded: $body"
+}
+elseif (-not $secureApiUrl) {
+    Write-Warning "-ApiUrl '$ApiUrl' is not https, so no upload command is shown: the key would cross the network unencrypted. Use an https URL (plain http only to this machine)."
 }
 else {
     Write-Host "To send it: set `$env:DUMPTRIAGE_API_KEY and run this script again with -Upload, or:"

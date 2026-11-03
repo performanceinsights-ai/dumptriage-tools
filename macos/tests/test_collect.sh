@@ -341,6 +341,28 @@ assert_contains "$OUT" "file(s) to https://api.performanceinsights.ai?"
 assert_contains "$(cat "$LOG")" "https://api.performanceinsights.ai/api/v1/dumps"
 done_test
 
+setup a_plain_http_url_is_refused_before_anything_is_sent
+# dumptriage-tools#60: the key and the reports would go in clear.
+DUMPTRIAGE_API_URL=http://triage.example.com run "y
+" --dir "$REPORTS" --all
+assert_eq "$CODE" 1
+assert_contains "$OUT" "DUMPTRIAGE_API_URL must be an https URL"
+assert_eq "$(grep -c '^curl' "$LOG")" 0
+done_test
+
+setup the_url_check_parses_the_host
+# shellcheck source=/dev/null
+eval "$(sed -n '/^secure_api_url() {/,/^}/p' "$SCRIPT")"
+for url in https://dt.corp.example https://dt.corp.example:8443/x https://user@dt.corp.example http://127.0.0.1:8000 http://localhost http://localhost:8000/x "http://[::1]:8000" "http://[::1]"; do
+    secure_api_url "$url" || fail "refused $url"
+done
+for url in http://dt.corp.example http://127.0.0.1.evil.example http://localhost:x@evil.example http://127.0.0.1@evil.example \
+           http://localhost.evil.example "http://[::1].evil" http://localhost:x "http://[::1]:8x" http://127.0.0.1:8000:9 \
+           https://h:abc "http://[localhost]" "http://[::1" ftp://x https:// ""; do
+    secure_api_url "$url" && fail "accepted $url"
+done
+done_test
+
 setup help_documents_the_environment_variables
 run "" --help
 assert_eq "$CODE" 0

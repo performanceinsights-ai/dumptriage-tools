@@ -45,6 +45,26 @@ case $policy in "" | AlwaysSubmit | AskFirst | NotifyOnly | RuleBased) ;; *) die
 [[ -f $agent_src ]] || die "cannot find $agent_src"
 command -v python3 >/dev/null || die "python3 is required"
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' || die "python 3.8+ is required"
+# The key and the dumps go to this URL: the agent's own rule (secure_api_url, dumptriage-tools#60), so the installer
+# can't accept a URL the daemon then refuses to start with. Exit 1 is a refused URL, 2 an agent that won't load.
+check_api_url() { # url
+  python3 - "$agent_src" "$1" <<'PY'
+import importlib.util, sys
+try:
+    spec = importlib.util.spec_from_file_location("dumptriage_agent", sys.argv[1])
+    agent = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(agent)
+except Exception as e:
+    print(f"install.sh: cannot load {sys.argv[1]}: {e!r}", file=sys.stderr)
+    sys.exit(2)
+sys.exit(0 if agent.secure_api_url(sys.argv[2]) else 1)
+PY
+}
+if [[ -n $api_url ]]; then
+  rc=0; check_api_url "$api_url" || rc=$?
+  ((rc == 1)) && die "--api-url must be an https URL (plain http only to this machine), got $api_url"
+  ((rc == 0)) || die "could not check --api-url"
+fi
 
 if ((EUID == 0)); then
   lib=/usr/local/lib/dumptriage bin=/usr/local/bin cfg=/etc/dumptriage state=/var/lib/dumptriage
@@ -56,6 +76,15 @@ else
 fi
 agent=$lib/dumptriage_agent.py
 cli=$bin/dumptriage-agent
+# An upgrade keeps config.json: one whose apiBaseUrl is plain http would leave a daemon that refuses every start.
+if [[ -z $api_url && -f $cfg/config.json ]]; then
+  kept=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("apiBaseUrl", ""))' "$cfg/config.json" 2>/dev/null || true)
+  if [[ -n $kept ]]; then
+    rc=0; check_api_url "$kept" || rc=$?
+    ((rc == 1)) && die "$cfg/config.json has apiBaseUrl $kept, which the agent refuses (https only, plain http only to this machine): re-run with --api-url https://..."
+    ((rc == 0)) || die "could not check the apiBaseUrl in $cfg/config.json"
+  fi
+fi
 
 if [[ $method == auto ]]; then
   if ((EUID == 0)) && [[ -d /run/systemd/system ]]; then method=systemd-system

@@ -16,7 +16,7 @@ your shell. `dumptriage-collect.sh --help` lists them too.
 
 | Variable | Default | What it is |
 |---|---|---|
-| `DUMPTRIAGE_API_URL` | `https://api.performanceinsights.ai` (the hosted service) | The service to send to. Set it for a self-hosted install, e.g. `https://dumptriage.example.com`. |
+| `DUMPTRIAGE_API_URL` | `https://api.performanceinsights.ai` (the hosted service) | The service to send to. Set it for a self-hosted install, e.g. `https://dumptriage.example.com`. Must be https: plain `http://` only to this machine (dumptriage-tools#60), since the key and reports would go unencrypted. |
 | `DUMPTRIAGE_API_KEY` | read from the login keychain | Your API key. To keep it in the keychain: `security add-generic-password -U -s dumptriage -a "$USER" -w` (it asks for the key). With no key the script says where to sign up. |
 | `DUMPTRIAGE_PORTAL_URL` | `DUMPTRIAGE_API_URL` | Where the report and sign-up links point. |
 | `DUMPTRIAGE_TRACING_CONFIG` | `~/.config/dumptriage/tracing.json` | The `--watch-once` config (see Watching). |
