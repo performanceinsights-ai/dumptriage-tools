@@ -73,8 +73,9 @@ jobs:
       - name: Start the burner
         run: |
           clang -g -O0 -o "$WORK/dtburn" macos/tests/burn.c
-          # Long enough for every capture below; stopped at the end either way.
-          "$WORK/dtburn" $(( SECONDS_TO_CAPTURE * 14 + 600 )) > /dev/null &
+          # Stopped at the end either way, so it lives as long as the job may run (timeout-minutes: 75): a hung xctrace step (#47) alone takes 15 of them, and a
+          # burner that exited first fails every later --sample on a dead pid.
+          "$WORK/dtburn" 4500 > /dev/null &
           echo "BURN_PID=$!" >> "$GITHUB_ENV"
           echo "burner pid $!"
 
