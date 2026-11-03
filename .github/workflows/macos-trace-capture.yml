@@ -365,7 +365,7 @@ jobs:
           missing=0
           for f in spindump.txt spindump-target.txt sample.txt xctrace-time-profile.xml; do
             [ -s "$OUT/$f" ] && continue
-            if [ "$f" = xctrace-time-profile.xml ] && [ "$XCTRACE_OUTCOME" = failure ]; then
+            if [ "$f" = xctrace-time-profile.xml ] && [ "$XCTRACE_OUTCOME" != success ]; then
               echo "::warning::no $f: the xctrace step failed or hung (#47)"
               continue
             fi
