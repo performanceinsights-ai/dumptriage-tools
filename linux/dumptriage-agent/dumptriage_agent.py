@@ -282,17 +282,26 @@ def merge(base, over):
 
 
 def load_config(path):
-    cfg = merge(DEFAULT_CONFIG, json.loads(Path(path).read_text())) if Path(path).exists() else DEFAULT_CONFIG
-    if not secure_api_url(cfg["apiBaseUrl"]):
-        raise SystemExit(f"apiBaseUrl must be an https URL (plain http only to this machine), got {cfg['apiBaseUrl']!r}")
-    return cfg
+    if Path(path).exists():
+        return merge(DEFAULT_CONFIG, json.loads(Path(path).read_text()))
+    return DEFAULT_CONFIG
+
+
+def insecure_api_url_message(url):
+    return f"apiBaseUrl must be an https URL (plain http only to this machine), got {url!r}"
 
 
 def secure_api_url(url):
     """https, or plain http to this machine only (a local test backend): the API key and the dump travel in the
     request, so anything else would send them in clear (dumptriage-tools#60). Invoke-DumpTriageCollect.ps1's
-    Test-ApiBaseUrl is the same rule."""
+    Test-ApiBaseUrl is the same rule; install.sh calls this one."""
+    if not isinstance(url, str):
+        return False
     u = urllib.parse.urlsplit(url)
+    try:
+        u.port  # a malformed port raises here, not halfway into an upload
+    except ValueError:
+        return False
     if u.scheme == "https" and u.hostname:
         return True
     if u.scheme != "http" or not u.hostname:
@@ -307,7 +316,7 @@ def secure_api_url(url):
 
 def api_connection(base_url, timeout):
     if not secure_api_url(base_url):
-        raise ValueError(f"refusing to send the API key to {base_url!r}: not https")
+        raise ValueError(f"refusing to send the API key: {insecure_api_url_message(base_url)}")
     u = urllib.parse.urlsplit(base_url)
     conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
     return conn_cls(u.hostname, u.port, timeout=timeout), u.path.rstrip("/")
@@ -485,8 +494,8 @@ def upload_dump(base_url, api_key, path, hostname, name=None, timeout=1800):
     size = os.path.getsize(path)
     try:
         conn, prefix = api_connection(base_url, timeout)
-    except ValueError as e:
-        return AUTH, None, str(e)
+    except ValueError as e:  # `run` refuses such a config first; this is the last guard, and not the key's fault
+        return TRANSIENT, None, str(e)
     try:
         conn.putrequest("POST", prefix + "/api/v1/dumps")
         conn.putheader("Authorization", f"Bearer {api_key}")
@@ -907,8 +916,8 @@ def upload_trace(base_url, api_key, path, manifest_json, hostname, name="trace.f
     size = os.path.getsize(path)
     try:
         conn, prefix = api_connection(base_url, timeout)
-    except ValueError as e:
-        return AUTH, None, str(e)
+    except ValueError as e:  # `run` refuses such a config first; this is the last guard, and not the key's fault
+        return TRANSIENT, None, str(e)
     try:
         conn.putrequest("POST", prefix + "/api/v1/traces")
         conn.putheader("Authorization", f"Bearer {api_key}")
@@ -2026,6 +2035,12 @@ def main(argv=None):
         return 0
 
     cfg = load_config(config_dir / "config.json")
+    if not secure_api_url(cfg["apiBaseUrl"]):
+        # The daemon is what sends: it refuses to start. The other commands only read or change the local queue.
+        if args.cmd == "run":
+            raise SystemExit(insecure_api_url_message(cfg["apiBaseUrl"]))
+        print(f"warning: {insecure_api_url_message(cfg['apiBaseUrl'])}; the agent won't send until it is",
+              file=sys.stderr)
     if args.cmd == "trace-capture":
         if not cfg["tracing"]["enabled"]:
             print("tracing is off in the config", file=sys.stderr)

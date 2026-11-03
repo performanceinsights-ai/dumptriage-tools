@@ -122,6 +122,9 @@ CURRENT=install_sh_refuses_a_plain_http_api_url CURRENT_FAILED=0
 # dumptriage-tools#60: the key and the dumps would go in clear.
 OUT=$(bash "$INSTALL" --dry-run --method cron --api-url http://dumptriage.corp.example 2>&1) && fail "accepted plain http"
 assert_contains "$OUT" "--api-url must be an https URL"
+for url in http://127.0.0.1.evil.example http://localhost:x@evil.example; do
+  OUT=$(bash "$INSTALL" --dry-run --method cron --api-url "$url" 2>&1) && fail "accepted $url"
+done
 for url in https://dumptriage.corp.example http://127.0.0.1:8000 http://localhost:8000; do
   OUT=$(bash "$INSTALL" --dry-run --method cron --api-url "$url" 2>&1) || fail "refused $url: $OUT"
 done

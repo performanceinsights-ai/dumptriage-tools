@@ -16,27 +16,12 @@ public class ApiUrlTests
     [Theory]
     [InlineData("http://api.performanceinsights.ai")]
     [InlineData("http://10.0.0.5:8000")]
+    [InlineData("http://127.0.0.1.evil.example")]
+    [InlineData("http://localhost:x@evil.example")]
+    [InlineData("http://127.0.0.1@evil.example")]
     [InlineData("ftp://x.example")]
     [InlineData("api.performanceinsights.ai")]
     [InlineData("")]
     [InlineData(null)]
     public void AnythingElseIsRefused(string? url) => Assert.False(AgentConfig.IsSecureApiUrl(url));
-
-    [Fact]
-    public async Task AConfigWithAPlainHttpUrlIsRefusedAtLoad()
-    {
-        var path = Path.Combine(Path.GetTempPath(), "dt-cfg-" + Guid.NewGuid().ToString("N") + ".json");
-        await File.WriteAllTextAsync(path, """{"apiBaseUrl": "http://dumptriage.corp.example"}""");
-        try
-        {
-            var refused = await Assert.ThrowsAsync<InvalidOperationException>(() => ConfigLoader.LoadOrCreateDefaultAsync(path));
-            Assert.Contains("must be an https URL", refused.Message);
-            await File.WriteAllTextAsync(path, """{"apiBaseUrl": "https://dumptriage.corp.example"}""");
-            Assert.Equal("https://dumptriage.corp.example", (await ConfigLoader.LoadOrCreateDefaultAsync(path)).ApiBaseUrl);
-        }
-        finally
-        {
-            File.Delete(path);
-        }
-    }
 }

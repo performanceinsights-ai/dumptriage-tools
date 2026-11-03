@@ -110,6 +110,8 @@ ACL on it at every start. It refuses to start if that folder is a junction or
 is owned by any other account, since another user could have created it
 first; delete it and reinstall.
 
+`apiBaseUrl` must be https; plain `http://` is accepted only for this machine (`localhost`, `127.x.x.x`, `[::1]`), for a local test backend. Since dumptriage-tools#60 the agent refuses to start with any other http URL, because it would send the API key and the dumps unencrypted: a self-hosted install still on plain http needs a TLS address before upgrading.
+
 ```jsonc
 {
   "apiBaseUrl": "https://api.performanceinsights.ai",

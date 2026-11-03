@@ -350,6 +350,18 @@ assert_contains "$OUT" "DUMPTRIAGE_API_URL must be an https URL"
 assert_eq "$(grep -c '^curl' "$LOG")" 0
 done_test
 
+setup the_url_check_parses_the_host
+# shellcheck source=/dev/null
+eval "$(sed -n '/^secure_api_url() {/,/^}/p' "$SCRIPT")"
+for url in https://dt.corp.example https://dt.corp.example:8443/x http://127.0.0.1:8000 http://localhost http://localhost:8000/x "http://[::1]:8000"; do
+    secure_api_url "$url" || fail "refused $url"
+done
+for url in http://dt.corp.example http://127.0.0.1.evil.example http://localhost:x@evil.example http://127.0.0.1@evil.example \
+           http://localhost.evil.example "http://[::1].evil" ftp://x https:// ""; do
+    secure_api_url "$url" && fail "accepted $url"
+done
+done_test
+
 setup help_documents_the_environment_variables
 run "" --help
 assert_eq "$CODE" 0

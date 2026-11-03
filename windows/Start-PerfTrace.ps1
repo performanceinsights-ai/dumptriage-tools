@@ -44,12 +44,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-# The key and the trace go to -ApiUrl: https, or plain http to this machine only (dumptriage-tools#60), the rule
-# Invoke-DumpTriageCollect.ps1's Test-ApiBaseUrl uses.
-$apiUri = $null
-if (-not [Uri]::TryCreate($ApiUrl, [UriKind]::Absolute, [ref]$apiUri) -or
-    -not ($apiUri.Scheme -eq 'https' -or ($apiUri.Scheme -eq 'http' -and $apiUri.IsLoopback))) {
-    throw "-ApiUrl must be an https URL (plain http only to this machine), got '$ApiUrl'"
+# With -Upload the key and the trace go to -ApiUrl: https, or plain http to this machine only (dumptriage-tools#60), the
+# rule Invoke-DumpTriageCollect.ps1's Test-ApiBaseUrl uses. Checked before recording, so a bad URL wastes no capture.
+if ($Upload) {
+    $apiUri = $null
+    if (-not [Uri]::TryCreate($ApiUrl, [UriKind]::Absolute, [ref]$apiUri) -or
+        -not ($apiUri.Scheme -eq 'https' -or ($apiUri.Scheme -eq 'http' -and $apiUri.IsLoopback))) {
+        throw "-ApiUrl must be an https URL (plain http only to this machine), got '$ApiUrl'"
+    }
 }
 $profilePath = Join-Path $PSScriptRoot 'PerfInsights.wprp'
 if (-not (Test-Path -LiteralPath $profilePath)) { throw "PerfInsights.wprp must be next to this script ($profilePath)" }

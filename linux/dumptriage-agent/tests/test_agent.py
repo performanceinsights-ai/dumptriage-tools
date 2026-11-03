@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import lzma
 import os
@@ -294,23 +296,29 @@ class UploadTests(unittest.TestCase):
                     "http://127.0.0.1:8000", "http://localhost:8000", "http://[::1]:8000"):
             self.assertTrue(da.secure_api_url(url), url)
         for url in ("http://api.performanceinsights.ai", "http://10.0.0.5:8000", "http://localhost.evil.example",
-                    "ftp://x.example", "https://", "api.performanceinsights.ai", ""):
+                    "http://127.0.0.1.evil.example", "http://localhost:x@evil.example", "http://127.0.0.1@evil.example",
+                    "https://api.example:abc", "ftp://x.example", "https://", "api.performanceinsights.ai", "", None, 42):
             self.assertFalse(da.secure_api_url(url), url)
         p = Path(tempfile.mkdtemp()) / "c"
         p.write_bytes(USER_CORE)
+        # Not the key's fault, so not AUTH (which would pause uploads and blame the key).
         outcome, status, msg = da.upload_dump("http://203.0.113.9:1", "k", str(p), None)
-        self.assertEqual((outcome, status), (da.AUTH, None))
-        self.assertIn("not https", msg)
-        self.assertEqual(da.upload_trace("http://203.0.113.9:1", "k", str(p), "{}", None)[0], da.AUTH)
+        self.assertEqual((outcome, status), (da.TRANSIENT, None))
+        self.assertIn("must be an https URL", msg)
+        self.assertEqual(da.upload_trace("http://203.0.113.9:1", "k", str(p), "{}", None)[0], da.TRANSIENT)
 
-    def test_a_config_with_a_plain_http_api_url_is_refused_at_load(self):
-        cfg = Path(tempfile.mkdtemp()) / "config.json"
-        cfg.write_text(json.dumps({"apiBaseUrl": "http://dumptriage.corp.example"}))
+    def test_a_plain_http_api_url_stops_the_daemon_but_not_the_local_commands(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "cfg").mkdir()
+        (d / "cfg" / "config.json").write_text(json.dumps({"apiBaseUrl": "http://dumptriage.corp.example"}))
+        dirs = ["--config-dir", str(d / "cfg"), "--state-dir", str(d / "state")]
         with self.assertRaises(SystemExit) as refused:
-            da.load_config(cfg)
+            da.main(dirs + ["run", "--once"])
         self.assertIn("must be an https URL", str(refused.exception))
-        cfg.write_text(json.dumps({"apiBaseUrl": "https://dumptriage.corp.example"}))
-        self.assertEqual(da.load_config(cfg)["apiBaseUrl"], "https://dumptriage.corp.example")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(da.main(dirs + ["status"]), 0)
+        self.assertIn("warning: apiBaseUrl must be an https URL", err.getvalue())
 
     def test_a_file_name_cannot_end_the_multipart_header(self):
         url, seen = self.serve(201)

@@ -86,6 +86,28 @@ die() {
     exit "${2:-1}"
 }
 
+# The key and the captures go to $1: https, or plain http to this machine only (dumptriage-tools#60), the agents' rule.
+# The host is parsed out, so userinfo (http://localhost:x@elsewhere) and lookalikes (http://127.0.0.1.elsewhere) fail.
+secure_api_url() {
+    local url=$1 authority host
+    case $url in
+        https://*) authority=${url#https://} ;;
+        http://*) authority=${url#http://} ;;
+        *) return 1 ;;
+    esac
+    authority=${authority%%[/?#]*}
+    case $authority in "" | *@*) return 1 ;; esac
+    case $url in https://*) return 0 ;; esac
+    case $authority in
+        \[*\]* )
+            host=${authority#[}; host=${host%%]*}
+            case ${authority#*]} in "" | :[0-9]*) ;; *) return 1 ;; esac ;;
+        *) host=${authority%%:*} ;;
+    esac
+    case $host in localhost | ::1) return 0 ;; esac
+    [[ $host =~ ^127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]
+}
+
 # An optional number of seconds after --profile, --sample X or --xctrace. True when $1 is one (and sets
 # TRACE_SECONDS), for the caller to shift past it; false when $1 is another option or there is none.
 seconds_next() {
@@ -945,11 +967,7 @@ upload() {
 # learns it before picking reports or typing a sudo password for a spindump.
 if [ "$DRY_RUN" -eq 0 ] && [ "$WATCH_ONCE" -eq 0 ]; then  # watching only captures and holds: nothing is sent
     API_URL=${DUMPTRIAGE_API_URL:-$DEFAULT_API_URL}
-    # The key and the captures go there: https, or plain http to this machine only (dumptriage-tools#60).
-    case $API_URL in
-        https://?* | http://127.* | http://localhost | http://localhost[:/]* | "http://[::1]"*) ;;
-        *) die "DUMPTRIAGE_API_URL must be an https URL (plain http only to this machine), got $API_URL" ;;
-    esac
+    secure_api_url "$API_URL" || die "DUMPTRIAGE_API_URL must be an https URL (plain http only to this machine), got $API_URL"
     PORTAL_URL=${DUMPTRIAGE_PORTAL_URL:-$API_URL}
     KEY=""
     api_key || no_key

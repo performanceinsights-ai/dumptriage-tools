@@ -42,14 +42,20 @@ while (($#)); do
   esac
 done
 case $policy in "" | AlwaysSubmit | AskFirst | NotifyOnly | RuleBased) ;; *) die "bad --policy $policy" ;; esac
-# The key and the dumps go to this URL: https, or plain http to this machine only (dumptriage-tools#60).
-case $api_url in
-  "" | https://?* | http://127.* | http://localhost | http://localhost[:/]* | "http://[::1]"*) ;;
-  *) die "--api-url must be an https URL (plain http only to this machine), got $api_url" ;;
-esac
 [[ -f $agent_src ]] || die "cannot find $agent_src"
 command -v python3 >/dev/null || die "python3 is required"
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' || die "python 3.8+ is required"
+# The key and the dumps go to this URL: the agent's own rule (secure_api_url, dumptriage-tools#60), so the installer
+# can't accept a URL the daemon then refuses to start with.
+if [[ -n $api_url ]]; then
+  python3 - "$agent_src" "$api_url" <<'PY' || die "--api-url must be an https URL (plain http only to this machine), got $api_url"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("dumptriage_agent", sys.argv[1])
+agent = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(agent)
+sys.exit(0 if agent.secure_api_url(sys.argv[2]) else 1)
+PY
+fi
 
 if ((EUID == 0)); then
   lib=/usr/local/lib/dumptriage bin=/usr/local/bin cfg=/etc/dumptriage state=/var/lib/dumptriage
