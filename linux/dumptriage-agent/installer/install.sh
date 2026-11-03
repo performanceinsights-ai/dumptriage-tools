@@ -42,6 +42,11 @@ while (($#)); do
   esac
 done
 case $policy in "" | AlwaysSubmit | AskFirst | NotifyOnly | RuleBased) ;; *) die "bad --policy $policy" ;; esac
+# The key and the dumps go to this URL: https, or plain http to this machine only (dumptriage-tools#60).
+case $api_url in
+  "" | https://?* | http://127.* | http://localhost | http://localhost[:/]* | "http://[::1]"*) ;;
+  *) die "--api-url must be an https URL (plain http only to this machine), got $api_url" ;;
+esac
 [[ -f $agent_src ]] || die "cannot find $agent_src"
 command -v python3 >/dev/null || die "python3 is required"
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' || die "python 3.8+ is required"

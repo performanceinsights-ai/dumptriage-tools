@@ -20,6 +20,7 @@ import errno
 import fnmatch
 import hashlib
 import http.client
+import ipaddress
 import json
 import logging
 import lzma
@@ -281,9 +282,40 @@ def merge(base, over):
 
 
 def load_config(path):
-    if Path(path).exists():
-        return merge(DEFAULT_CONFIG, json.loads(Path(path).read_text()))
-    return DEFAULT_CONFIG
+    cfg = merge(DEFAULT_CONFIG, json.loads(Path(path).read_text())) if Path(path).exists() else DEFAULT_CONFIG
+    if not secure_api_url(cfg["apiBaseUrl"]):
+        raise SystemExit(f"apiBaseUrl must be an https URL (plain http only to this machine), got {cfg['apiBaseUrl']!r}")
+    return cfg
+
+
+def secure_api_url(url):
+    """https, or plain http to this machine only (a local test backend): the API key and the dump travel in the
+    request, so anything else would send them in clear (dumptriage-tools#60). Invoke-DumpTriageCollect.ps1's
+    Test-ApiBaseUrl is the same rule."""
+    u = urllib.parse.urlsplit(url)
+    if u.scheme == "https" and u.hostname:
+        return True
+    if u.scheme != "http" or not u.hostname:
+        return False
+    if u.hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(u.hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def api_connection(base_url, timeout):
+    if not secure_api_url(base_url):
+        raise ValueError(f"refusing to send the API key to {base_url!r}: not https")
+    u = urllib.parse.urlsplit(base_url)
+    conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+    return conn_cls(u.hostname, u.port, timeout=timeout), u.path.rstrip("/")
+
+
+def form_value(value):
+    """A multipart header value: no quote, CR or LF, so a file or host name can't end the header early."""
+    return value.replace('"', "").replace("\r", "").replace("\n", "")
 
 
 def default_dirs():
@@ -442,20 +474,21 @@ def upload_dump(base_url, api_key, path, hostname, name=None, timeout=1800):
     """Stream one file to POST /api/v1/dumps as multipart/form-data (same request
     as the web uploader and the Windows agent), named `name` (default: the path's
     basename). Returns (outcome, status, message)."""
-    u = urllib.parse.urlsplit(base_url)
     boundary = uuid.uuid4().hex
     pre = b""
     if hostname:
         pre += (f'--{boundary}\r\nContent-Disposition: form-data; name="hostname"\r\n\r\n{hostname}\r\n').encode()
-    name = (name or os.path.basename(path)).replace('"', "")
+    name = form_value(name or os.path.basename(path))
     pre += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
             "Content-Type: application/octet-stream\r\n\r\n").encode()
     post = f"\r\n--{boundary}--\r\n".encode()
     size = os.path.getsize(path)
-    conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
-    conn = conn_cls(u.hostname, u.port, timeout=timeout)
     try:
-        conn.putrequest("POST", (u.path.rstrip("/") or "") + "/api/v1/dumps")
+        conn, prefix = api_connection(base_url, timeout)
+    except ValueError as e:
+        return AUTH, None, str(e)
+    try:
+        conn.putrequest("POST", prefix + "/api/v1/dumps")
         conn.putheader("Authorization", f"Bearer {api_key}")
         conn.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
         conn.putheader("Content-Length", str(len(pre) + size + len(post)))
@@ -862,21 +895,22 @@ def fold_perf_script(lines, window_sec=None):
 def upload_trace(base_url, api_key, path, manifest_json, hostname, name="trace.folded", timeout=600, content_type="text/plain"):
     """POST /api/v1/traces as multipart/form-data: the manifest.json text, the optional hostname and the folded
     stacks as `file`. Returns (outcome, status, message), like upload_dump."""
-    u = urllib.parse.urlsplit(base_url)
     boundary = uuid.uuid4().hex
     pre = b""
     for field, value in (("manifest", manifest_json), ("hostname", hostname)):
         if value:
             pre += f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"\r\n\r\n{value}\r\n'.encode()
-    name = name.replace('"', "")
+    name = form_value(name)
     pre += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
             f"Content-Type: {content_type}\r\n\r\n").encode()
     post = f"\r\n--{boundary}--\r\n".encode()
     size = os.path.getsize(path)
-    conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
-    conn = conn_cls(u.hostname, u.port, timeout=timeout)
     try:
-        conn.putrequest("POST", (u.path.rstrip("/") or "") + "/api/v1/traces")
+        conn, prefix = api_connection(base_url, timeout)
+    except ValueError as e:
+        return AUTH, None, str(e)
+    try:
+        conn.putrequest("POST", prefix + "/api/v1/traces")
         conn.putheader("Authorization", f"Bearer {api_key}")
         conn.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
         conn.putheader("Content-Length", str(len(pre) + size + len(post)))

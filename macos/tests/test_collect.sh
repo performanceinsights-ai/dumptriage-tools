@@ -341,6 +341,15 @@ assert_contains "$OUT" "file(s) to https://api.performanceinsights.ai?"
 assert_contains "$(cat "$LOG")" "https://api.performanceinsights.ai/api/v1/dumps"
 done_test
 
+setup a_plain_http_url_is_refused_before_anything_is_sent
+# dumptriage-tools#60: the key and the reports would go in clear.
+DUMPTRIAGE_API_URL=http://triage.example.com run "y
+" --dir "$REPORTS" --all
+assert_eq "$CODE" 1
+assert_contains "$OUT" "DUMPTRIAGE_API_URL must be an https URL"
+assert_eq "$(grep -c '^curl' "$LOG")" 0
+done_test
+
 setup help_documents_the_environment_variables
 run "" --help
 assert_eq "$CODE" 0

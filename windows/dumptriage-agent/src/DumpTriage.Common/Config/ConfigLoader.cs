@@ -22,8 +22,13 @@ public static class ConfigLoader
         }
 
         await using var stream = File.OpenRead(configPath);
-        var config = await JsonSerializer.DeserializeAsync<AgentConfig>(stream, JsonOptions, cancellationToken);
-        return config ?? new AgentConfig();
+        var config = await JsonSerializer.DeserializeAsync<AgentConfig>(stream, JsonOptions, cancellationToken) ?? new AgentConfig();
+        if (!AgentConfig.IsSecureApiUrl(config.ApiBaseUrl))
+        {
+            throw new InvalidOperationException(
+                $"apiBaseUrl must be an https URL (plain http only to this machine), got '{config.ApiBaseUrl}'");
+        }
+        return config;
     }
 
     public static async Task SaveAsync(string configPath, AgentConfig config, CancellationToken cancellationToken = default)

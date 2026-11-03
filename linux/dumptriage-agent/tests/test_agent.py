@@ -288,6 +288,37 @@ class UploadTests(unittest.TestCase):
         p.write_bytes(USER_CORE)
         self.assertEqual(da.upload_dump("http://127.0.0.1:1", "k", str(p), None)[0], da.TRANSIENT)
 
+    def test_the_key_goes_only_over_https_or_to_this_machine(self):
+        # dumptriage-tools#60: plain http to another host would send the key and the dump in clear.
+        for url in ("https://api.performanceinsights.ai", "https://dt.corp.example:8443/base",
+                    "http://127.0.0.1:8000", "http://localhost:8000", "http://[::1]:8000"):
+            self.assertTrue(da.secure_api_url(url), url)
+        for url in ("http://api.performanceinsights.ai", "http://10.0.0.5:8000", "http://localhost.evil.example",
+                    "ftp://x.example", "https://", "api.performanceinsights.ai", ""):
+            self.assertFalse(da.secure_api_url(url), url)
+        p = Path(tempfile.mkdtemp()) / "c"
+        p.write_bytes(USER_CORE)
+        outcome, status, msg = da.upload_dump("http://203.0.113.9:1", "k", str(p), None)
+        self.assertEqual((outcome, status), (da.AUTH, None))
+        self.assertIn("not https", msg)
+        self.assertEqual(da.upload_trace("http://203.0.113.9:1", "k", str(p), "{}", None)[0], da.AUTH)
+
+    def test_a_config_with_a_plain_http_api_url_is_refused_at_load(self):
+        cfg = Path(tempfile.mkdtemp()) / "config.json"
+        cfg.write_text(json.dumps({"apiBaseUrl": "http://dumptriage.corp.example"}))
+        with self.assertRaises(SystemExit) as refused:
+            da.load_config(cfg)
+        self.assertIn("must be an https URL", str(refused.exception))
+        cfg.write_text(json.dumps({"apiBaseUrl": "https://dumptriage.corp.example"}))
+        self.assertEqual(da.load_config(cfg)["apiBaseUrl"], "https://dumptriage.corp.example")
+
+    def test_a_file_name_cannot_end_the_multipart_header(self):
+        url, seen = self.serve(201)
+        p = Path(tempfile.mkdtemp()) / "c"
+        p.write_bytes(USER_CORE)
+        da.upload_dump(url, "k", str(p), None, name='core"\r\nX-Injected: 1\r\n.dmp')
+        self.assertNotIn(b"X-Injected: 1\r\n", seen["body"])
+
 
 
 

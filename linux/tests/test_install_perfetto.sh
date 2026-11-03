@@ -118,5 +118,14 @@ assert_contains "$OUT" "+ download https://github.com/google/perfetto/releases/d
 assert_contains "$OUT" "installer/../perfetto/flight-recorder.pbtx"
 done_test
 
+CURRENT=install_sh_refuses_a_plain_http_api_url CURRENT_FAILED=0
+# dumptriage-tools#60: the key and the dumps would go in clear.
+OUT=$(bash "$INSTALL" --dry-run --method cron --api-url http://dumptriage.corp.example 2>&1) && fail "accepted plain http"
+assert_contains "$OUT" "--api-url must be an https URL"
+for url in https://dumptriage.corp.example http://127.0.0.1:8000 http://localhost:8000; do
+  OUT=$(bash "$INSTALL" --dry-run --method cron --api-url "$url" 2>&1) || fail "refused $url: $OUT"
+done
+done_test
+
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

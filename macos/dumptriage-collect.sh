@@ -945,6 +945,11 @@ upload() {
 # learns it before picking reports or typing a sudo password for a spindump.
 if [ "$DRY_RUN" -eq 0 ] && [ "$WATCH_ONCE" -eq 0 ]; then  # watching only captures and holds: nothing is sent
     API_URL=${DUMPTRIAGE_API_URL:-$DEFAULT_API_URL}
+    # The key and the captures go there: https, or plain http to this machine only (dumptriage-tools#60).
+    case $API_URL in
+        https://?* | http://127.* | http://localhost | http://localhost[:/]* | "http://[::1]"*) ;;
+        *) die "DUMPTRIAGE_API_URL must be an https URL (plain http only to this machine), got $API_URL" ;;
+    esac
     PORTAL_URL=${DUMPTRIAGE_PORTAL_URL:-$API_URL}
     KEY=""
     api_key || no_key

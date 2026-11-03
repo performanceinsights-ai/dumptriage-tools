@@ -6,6 +6,20 @@ public sealed class AgentConfig
 {
     public string ApiBaseUrl { get; init; } = "https://api.performanceinsights.ai";
 
+    /// <summary>
+    /// https, or plain http to this machine only (a local test backend): the API key and the dump travel in the
+    /// request, so anything else sends them in clear (dumptriage-tools#60). The same rule as the Linux agent's
+    /// secure_api_url and Invoke-DumpTriageCollect.ps1's Test-ApiBaseUrl.
+    /// </summary>
+    public static bool IsSecureApiUrl(string? url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || string.IsNullOrEmpty(uri.Host))
+        {
+            return false;
+        }
+        return uri.Scheme == Uri.UriSchemeHttps || (uri.Scheme == Uri.UriSchemeHttp && uri.IsLoopback);
+    }
+
     /// <summary>Protected API key: a DPAPI blob (base64) on Windows, or a `file:` reference to a root-only key file on Linux. See Security/IApiKeyProtector.</summary>
     public string? ProtectedApiKey { get; set; }
 
