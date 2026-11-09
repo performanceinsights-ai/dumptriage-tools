@@ -4,7 +4,7 @@ Sends macOS crash reports, kernel panics and spin/hang reports to Dump Triage, a
 captures. Plain bash 3.2 and the tools macOS ships; nothing to install. It asks before sending anything.
 
 ```
-dumptriage-collect.sh [--days N] [--all] [--spindump PID|NAME] [--dry-run] [--dir DIR]...   reports
+dumptriage-collect.sh [--days N] [--all] [--spindump PID|NAME [S]] [--dry-run] [--dir DIR]...   reports
 dumptriage-collect.sh --profile [S] | --sample PID|NAME [S] | --xctrace [S]                  one performance capture
 dumptriage-collect.sh --watch-once | --send-held                                             watching
 ```
@@ -26,6 +26,12 @@ your shell. `dumptriage-collect.sh --help` lists them too.
 `sudo` does not pass these on, and reads root's keychain, not yours. Under sudo write
 `sudo DUMPTRIAGE_API_URL=https://... DUMPTRIAGE_API_KEY=... ./dumptriage-collect.sh`. You do not need sudo to run the script:
 it asks for it where a capture needs it (`--spindump`, `--profile`, `--xctrace`).
+
+## A hang right now
+
+`--spindump PID|NAME [S]` samples one process that is hanging or spinning now, for S seconds (10 to 60, default 10), and sends
+the report. Take a longer one (30 s) for a spin in an app whose vendor ships no symbols: every frame is then `image+offset`, and
+a longer window shows whether the main thread stays in the same code. sudo asks for your password.
 
 ## A performance capture
 

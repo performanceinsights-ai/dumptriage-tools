@@ -324,6 +324,28 @@ assert_not_contains "$OUT" "Which to send?"  # only the fresh spindump, no picke
 [ -z "$(ls "$T"/dumptriage-spindump-* 2>/dev/null)" ] || fail "the temporary spindump was not removed"
 done_test
 
+setup spindump_takes_an_optional_length
+run "y
+" --dir "$REPORTS" --spindump Xcode 30
+assert_eq "$CODE" 0
+assert_contains "$(cat "$LOG")" "sudo spindump Xcode 30 -file $T/dumptriage-spindump-"
+done_test
+
+setup spindump_length_after_a_pid
+run "" --dir "$REPORTS" --spindump 4242 60 --dry-run
+assert_eq "$CODE" 0
+assert_contains "$OUT" "Would take a spindump of 4242 (60 s, sudo)"
+done_test
+
+setup spindump_length_out_of_range_is_refused_before_sudo
+run "" --dir "$REPORTS" --spindump Xcode 9
+assert_eq "$CODE" 2
+assert_contains "$OUT" "--spindump seconds must be 10 to 60, not 9"
+run "" --dir "$REPORTS" --spindump Xcode 61
+assert_eq "$CODE" 2
+assert_eq "$(grep -c '^sudo' "$LOG")" 0
+done_test
+
 setup a_declined_spindump_is_removed_too
 run "n
 " --dir "$REPORTS" --spindump Xcode
