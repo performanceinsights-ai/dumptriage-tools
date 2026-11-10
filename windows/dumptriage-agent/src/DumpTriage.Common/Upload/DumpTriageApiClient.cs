@@ -19,11 +19,6 @@ public enum UploadOutcome
     // Resets, so the dump waits; every dump would get the same answer, so the
     // whole queue holds.
     QuotaExceeded,
-    // 429 with a Retry-After of at most ShortRetryAfterMax: the account has its
-    // limit of uploads in progress, or is over its API request rate
-    // (website#3450, #3451). Not the dump's fault and not a spent quota: the
-    // queue waits that long and no retry is spent (dumptriage-tools#73).
-    RateLimited,
     TransientFailure,
     // 403 terms_not_accepted: a signup reissue left the account without a
     // Terms acceptance (website#1313). Not the dump's fault: hold it until the
@@ -44,6 +39,11 @@ public enum UploadOutcome
     // (checked before upload, website#1493): this record is done, and the file is
     // detected again as a new dump.
     FileChanged,
+    // 429 with a Retry-After of at most ShortRetryAfterMax: the account has its
+    // limit of uploads in progress, or is over its API request rate
+    // (website#3450, #3451). Not the dump's fault and not a spent quota: the
+    // queue waits that long and no retry is spent (dumptriage-tools#73).
+    RateLimited,
 }
 
 public sealed record UploadResult(

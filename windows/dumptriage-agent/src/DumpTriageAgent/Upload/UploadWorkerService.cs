@@ -441,11 +441,16 @@ public sealed class UploadWorkerService : BackgroundService
                 // progress or request rate. Every dump would get the same answer for now, so the queue waits the
                 // Retry-After; no retry is spent.
                 var rateHold = RateLimitHoldFor(result.RetryAfter);
+                var rateNow = DateTimeOffset.UtcNow;
                 record.State = DumpQueueState.Queued;
                 record.LastError = result.ErrorMessage;
-                _runtimeState.HoldUploads(
-                    $"Uploads waiting: the service asked this agent to retry in {(int)Math.Ceiling(rateHold.TotalSeconds)} s",
-                    rateHold, DateTimeOffset.UtcNow);
+                // Never shorten a longer hold that is already on (Terms, credentials, quota).
+                if (_runtimeState.ActiveUploadHold(rateNow) is not { } current || current.UntilUtc < rateNow + rateHold)
+                {
+                    _runtimeState.HoldUploads(
+                        $"Uploads waiting: the service asked this agent to retry in {(int)Math.Ceiling(rateHold.TotalSeconds)} s",
+                        rateHold, rateNow);
+                }
                 _logger.LogWarning(
                     "Uploads waiting {Duration}: the service is limiting this account ({Status}: {Error})",
                     rateHold, result.StatusCode, result.ErrorMessage);

@@ -294,7 +294,7 @@ class UploadTraceTests(unittest.TestCase):
         f = Path(tempfile.mkdtemp()) / "t.folded"
         self.addCleanup(shutil.rmtree, f.parent)
         f.write_text("app;main;hot 5\n")
-        self.assertEqual(da.upload_trace(base + "/", "dts_key", str(f), '{"schemaVersion": 1}', "web-01", "t.folded"), (da.SUCCESS, 201, None))
+        self.assertEqual(da.upload_trace(base + "/", "dts_key", str(f), '{"schemaVersion": 1}', "web-01", "t.folded"), (da.SUCCESS, 201, None, None))
         self.assertEqual((seen["path"], seen["auth"]), ("/api/v1/traces", "Bearer dts_key"))
         self.assertTrue(seen["type"].startswith("multipart/form-data; boundary="))
         body = seen["body"].decode()
@@ -435,7 +435,7 @@ class AgentTracingTests(unittest.TestCase):
         self.assertEqual((row["state"], row["retry_count"]), (da.QUEUED, 0))
         self.assertTrue(Path(row["file_path"]).exists())
         self.assertEqual(a.queue.meta("upload_hold_until_utc"), da.iso(self.now + timedelta(seconds=60)))
-        self.assertTrue(a.upload_held(self.now))
+        self.assertTrue(a.upload_held(self.now, "trace"))
 
     def test_notify_only_waits_for_a_person_and_skip_deletes_the_file(self):
         a = self.agent({"submission": "NotifyOnly"})

@@ -279,13 +279,24 @@ class RateLimitedUploadTests(AgentTestBase):
         a = self.agent(FakeUploader((da.HOLD, 429, '{"detail":"monthly quota of 5 dumps exceeded"}', None)))
         self.settle(a)
         self.assertEqual(set(self.rows(a).values()), {da.QUEUED})  # it was FAILED for good before #73
-        self.assertEqual(a.queue.meta("upload_hold_until_utc"), da.iso(self.now + timedelta(seconds=da.QUOTA_HOLD_SECONDS)))
+        self.assertEqual(a.queue.meta("quota_hold_dump_until_utc"), da.iso(self.now + timedelta(seconds=da.QUOTA_HOLD_SECONDS)))
         self.now += timedelta(hours=5)
         a.tick()
         self.assertEqual(len(self.uploader.calls), 1)
         self.now += timedelta(hours=1, minutes=1)
         a.tick()
         self.assertEqual(set(self.rows(a).values()), {da.SUBMITTED})
+
+    def test_a_trace_quota_does_not_hold_dump_uploads_and_a_busy_answer_holds_both(self):
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent(FakeUploader())
+        a.queue.set_meta("quota_hold_trace_until_utc", da.iso(self.now + timedelta(hours=6)))
+        self.assertFalse(a.upload_held(self.now, "dump"))
+        self.assertTrue(a.upload_held(self.now, "trace"))
+        self.settle(a)
+        self.assertEqual(self.rows(a), {"core.a.1.2": da.SUBMITTED})
+        a.queue.set_meta("upload_hold_until_utc", da.iso(self.now + timedelta(seconds=30)))
+        self.assertTrue(a.upload_held(self.now, "dump") and a.upload_held(self.now, "trace"))
 
     def test_a_dump_over_the_per_dump_size_still_fails(self):  # 413, not a 429
         (self.watch / "core.a.1.2").write_bytes(USER_CORE)
@@ -321,7 +332,7 @@ class UploadTests(unittest.TestCase):
         url, seen = self.serve(201)
         p = Path(tempfile.mkdtemp()) / "core.x.1.2"
         p.write_bytes(USER_CORE)
-        self.assertEqual(da.upload_dump(url, "dts_k", str(p), "host1"), (da.SUCCESS, 201, None))
+        self.assertEqual(da.upload_dump(url, "dts_k", str(p), "host1"), (da.SUCCESS, 201, None, None))
         self.assertEqual(seen["path"], "/api/v1/dumps")
         self.assertEqual(seen["auth"], "Bearer dts_k")
         boundary = seen["ctype"].split("boundary=")[1].encode()
@@ -353,16 +364,49 @@ class UploadTests(unittest.TestCase):
             ({"Retry-After": "3600"}, quota, da.HOLD, 3600),
             ({}, quota, da.HOLD, None),
             ({"Retry-After": "soon"}, quota, da.HOLD, None),
+            ({"Retry-After": "\u00b2"}, quota, da.HOLD, None),  # str.isdigit() is true for "²"; int() refuses it
             ({"Retry-After": later}, in_flight, da.BUSY, None),
         ):
             url, _ = self.serve(429, headers, body)
             with self.subTest(headers=headers):
                 got = da.upload_dump(url, "k", str(p), None)
                 self.assertEqual(got[:3], (outcome, 429, body.decode()))
+                self.assertEqual(len(got), 4)
                 if seconds is None and outcome == da.BUSY:  # an HTTP date: about two minutes from now
                     self.assertTrue(100 <= got[3] <= 120, got)
                 else:
                     self.assertEqual(got[3], seconds)
+
+    def test_parse_retry_after(self):
+        now = datetime(2026, 11, 10, 12, 0, tzinfo=timezone.utc)
+        for value, want in (("60", 60), (" 7 ", 7), ("", None), (None, None), ("soon", None), ("-5", None), ("1.5", None),
+                            ("\u00b2", None), ("\u0663\u0660", None),  # str.isdigit() accepts these; int() does not
+                            ("Tue, 10 Nov 2026 12:01:30 GMT", 90), ("Tue, 10 Nov 2026 11:00:00 GMT", 0)):
+            with self.subTest(value=value):
+                self.assertEqual(da.parse_retry_after(value, now), want)
+
+    def test_a_429_sent_before_the_body_is_read_is_still_seen(self):  # #73 review: the server may answer and close early
+        import socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        self.addCleanup(srv.close)
+
+        def answer_early():
+            conn, _ = srv.accept()
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                buf += conn.recv(65536)
+            body = b'{"detail":"this account already has 4 uploads in progress; wait for one to finish, then retry"}'
+            conn.sendall(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nConnection: close\r\n"
+                         b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+            conn.close()  # with the upload's body unread: the client's next send gets a reset
+
+        threading.Thread(target=answer_early, daemon=True).start()
+        p = Path(tempfile.mkdtemp()) / "big"
+        p.write_bytes(b"\0" * (32 << 20))
+        got = da.upload_dump(f"http://127.0.0.1:{srv.getsockname()[1]}", "k", str(p), None)
+        self.assertEqual((got[0], got[1], got[3]), (da.BUSY, 429, 60), got)
 
     def test_connection_refused_is_transient(self):
         p = Path(tempfile.mkdtemp()) / "c"
