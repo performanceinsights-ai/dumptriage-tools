@@ -42,6 +42,9 @@ public sealed class UploadWorkerService : BackgroundService
     internal static readonly TimeSpan TermsHold = TimeSpan.FromMinutes(15);
     internal static readonly TimeSpan CredentialsHold = TimeSpan.FromHours(1);
     internal static readonly TimeSpan QuotaHold = TimeSpan.FromHours(6);
+    // A 429 with a short Retry-After (uploads in progress, request rate; dumptriage-tools#73): the queue waits
+    // that long, at least this much so a Retry-After of 0 doesn't spin.
+    internal static readonly TimeSpan MinRateLimitHold = TimeSpan.FromSeconds(5);
     internal const string FileChangedError =
         "the dump file changed after it was detected; it is detected again as a new dump";
     internal const string NoUsableKeyReason = "Uploads paused: no usable API key on this machine; set one with the installer";
@@ -433,6 +436,21 @@ public sealed class UploadWorkerService : BackgroundService
                     record.FilePath, result.StatusCode, result.ErrorMessage);
                 break;
 
+            case UploadOutcome.RateLimited:
+                // Not this dump's fault and not a spent quota (dumptriage-tools#73): the account's uploads in
+                // progress or request rate. Every dump would get the same answer for now, so the queue waits the
+                // Retry-After; no retry is spent.
+                var rateHold = RateLimitHoldFor(result.RetryAfter);
+                record.State = DumpQueueState.Queued;
+                record.LastError = result.ErrorMessage;
+                _runtimeState.HoldUploads(
+                    $"Uploads waiting: the service asked this agent to retry in {(int)Math.Ceiling(rateHold.TotalSeconds)} s",
+                    rateHold, DateTimeOffset.UtcNow);
+                _logger.LogWarning(
+                    "Uploads waiting {Duration}: the service is limiting this account ({Status}: {Error})",
+                    rateHold, result.StatusCode, result.ErrorMessage);
+                break;
+
             case UploadOutcome.AwaitingTerms:
             case UploadOutcome.CredentialsRejected:
             case UploadOutcome.AccountClosed:
@@ -487,6 +505,14 @@ public sealed class UploadWorkerService : BackgroundService
         {
             // Cut off by shutdown; TryCopyAsync removed its partial file.
         }
+    }
+
+    /// <summary>How long a short 429 holds the queue: its Retry-After, within [MinRateLimitHold, ShortRetryAfterMax].</summary>
+    internal static TimeSpan RateLimitHoldFor(TimeSpan? retryAfter)
+    {
+        var wait = retryAfter ?? MinRateLimitHold;
+        if (wait < MinRateLimitHold) return MinRateLimitHold;
+        return wait > DumpTriageApiClient.ShortRetryAfterMax ? DumpTriageApiClient.ShortRetryAfterMax : wait;
     }
 
     /// <summary>The tray text and hold length for an answer that holds the whole queue.</summary>

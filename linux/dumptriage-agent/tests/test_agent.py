@@ -242,8 +242,60 @@ class AgentTests(AgentTestBase):
         self.assertEqual(self.uploader.calls, [])
 
 
+class RateLimitedUploadTests(AgentTestBase):
+    """#73: a 429 is not a spent quota unless the Retry-After says so, and never fails the dump."""
+
+    def two_dumps(self):
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        (self.watch / "core.b.3.4").write_bytes(USER_CORE)
+
+    def test_a_busy_answer_keeps_every_dump_queued_without_a_retry_and_retries_after_the_wait(self):
+        self.two_dumps()
+        a = self.agent(FakeUploader((da.BUSY, 429, "this account already has 4 uploads in progress; wait for one to finish, then retry", 60)))
+        self.settle(a)
+        self.assertEqual(set(self.rows(a).values()), {da.QUEUED})
+        self.assertEqual({r["retry_count"] for r in a.queue.db.execute("SELECT * FROM dumps")}, {0})
+        self.assertEqual(len(self.uploader.calls), 1)  # the queue stopped after the first answer
+        self.now += timedelta(seconds=59)
+        a.tick()
+        self.assertEqual(len(self.uploader.calls), 1)  # still waiting
+        self.now += timedelta(seconds=2)
+        a.tick()
+        self.assertEqual(set(self.rows(a).values()), {da.SUBMITTED})
+        self.assertEqual(len(self.uploader.calls), 3)
+
+    def test_the_wait_is_the_retry_after_within_sane_bounds(self):
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        for given, wait in ((60, 60), (0, da.MIN_BUSY_HOLD_SECONDS), (None, da.MIN_BUSY_HOLD_SECONDS)):
+            with self.subTest(given=given):
+                a = self.agent(FakeUploader((da.BUSY, 429, "{}", given)))
+                a.queue.db.execute("DELETE FROM dumps")
+                a.queue.set_meta("upload_hold_until_utc", "")
+                self.settle(a)
+                self.assertEqual(a.queue.meta("upload_hold_until_utc"), da.iso(self.now + timedelta(seconds=wait)))
+
+    def test_a_quota_answer_holds_the_queue_for_hours_and_never_fails_the_dump(self):
+        self.two_dumps()
+        a = self.agent(FakeUploader((da.HOLD, 429, '{"detail":"monthly quota of 5 dumps exceeded"}', None)))
+        self.settle(a)
+        self.assertEqual(set(self.rows(a).values()), {da.QUEUED})  # it was FAILED for good before #73
+        self.assertEqual(a.queue.meta("upload_hold_until_utc"), da.iso(self.now + timedelta(seconds=da.QUOTA_HOLD_SECONDS)))
+        self.now += timedelta(hours=5)
+        a.tick()
+        self.assertEqual(len(self.uploader.calls), 1)
+        self.now += timedelta(hours=1, minutes=1)
+        a.tick()
+        self.assertEqual(set(self.rows(a).values()), {da.SUBMITTED})
+
+    def test_a_dump_over_the_per_dump_size_still_fails(self):  # 413, not a 429
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent(FakeUploader((da.QUOTA, 413, '{"detail":"upload exceeds the per-dump limit"}')))
+        self.settle(a)
+        self.assertEqual(self.rows(a), {"core.a.1.2": da.FAILED})
+
+
 class UploadTests(unittest.TestCase):
-    def serve(self, status):
+    def serve(self, status, headers=None, body=b"{}"):
         seen = {}
 
         class H(BaseHTTPRequestHandler):
@@ -252,8 +304,10 @@ class UploadTests(unittest.TestCase):
                 seen.update(path=self.path, auth=self.headers["Authorization"], ctype=self.headers["Content-Type"],
                             body=self.rfile.read(n))
                 self.send_response(status)
+                for name, value in (headers or {}).items():
+                    self.send_header(name, value)
                 self.end_headers()
-                self.wfile.write(b"{}")
+                self.wfile.write(body)
 
             def log_message(self, *a):
                 pass
@@ -279,9 +333,36 @@ class UploadTests(unittest.TestCase):
     def test_status_mapping(self):
         p = Path(tempfile.mkdtemp()) / "c"
         p.write_bytes(USER_CORE)
-        for status, want in ((400, da.REJECTED), (413, da.QUOTA), (429, da.QUOTA), (503, da.TRANSIENT), (500, da.TRANSIENT)):
+        for status, want in ((400, da.REJECTED), (413, da.QUOTA), (429, da.HOLD), (503, da.TRANSIENT), (500, da.TRANSIENT)):
             url, _ = self.serve(status)
             self.assertEqual(da.upload_dump(url, "k", str(p), None)[0], want, status)
+
+    def test_a_429_is_never_a_failure_and_a_short_retry_after_is_a_busy_answer(self):  # #73
+        """The website's real 429 bodies (routers/uploads.py, security/api_keys.py, services/quotas.py)."""
+        p = Path(tempfile.mkdtemp()) / "c"
+        p.write_bytes(USER_CORE)
+        in_flight = b'{"detail":"this account already has 4 uploads in progress; wait for one to finish, then retry"}'
+        rate = b'{"detail":"this account is over its limit of 600 API requests a minute; retry in 37s"}'
+        quota = b'{"detail":"monthly quota of 5 dumps exceeded"}'
+        later = (datetime.now(timezone.utc) + timedelta(seconds=120)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        for headers, body, outcome, seconds in (
+            ({"Retry-After": "60"}, in_flight, da.BUSY, 60),
+            ({"Retry-After": "37"}, rate, da.BUSY, 37),
+            ({"Retry-After": "300"}, rate, da.BUSY, 300),
+            ({"Retry-After": "301"}, rate, da.HOLD, 301),
+            ({"Retry-After": "3600"}, quota, da.HOLD, 3600),
+            ({}, quota, da.HOLD, None),
+            ({"Retry-After": "soon"}, quota, da.HOLD, None),
+            ({"Retry-After": later}, in_flight, da.BUSY, None),
+        ):
+            url, _ = self.serve(429, headers, body)
+            with self.subTest(headers=headers):
+                got = da.upload_dump(url, "k", str(p), None)
+                self.assertEqual(got[:3], (outcome, 429, body.decode()))
+                if seconds is None and outcome == da.BUSY:  # an HTTP date: about two minutes from now
+                    self.assertTrue(100 <= got[3] <= 120, got)
+                else:
+                    self.assertEqual(got[3], seconds)
 
     def test_connection_refused_is_transient(self):
         p = Path(tempfile.mkdtemp()) / "c"

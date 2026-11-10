@@ -16,6 +16,7 @@ flight recorder runs under the daemon, a trigger on /proc metrics takes a snapsh
 stacks on the host and queued like a dump (held for approval by default), then uploaded to POST /api/v1/traces.
 """
 import argparse
+import email.utils
 import errno
 import fnmatch
 import hashlib
@@ -435,7 +436,41 @@ class Queue:
 # --- upload ------------------------------------------------------------------
 
 SUCCESS, REJECTED, QUOTA, AUTH, TRANSIENT = "success", "rejected", "quota", "auth", "transient"
+# QUOTA is a 413, the plan's per-dump size: the same bytes get the same answer, so the dump fails. A 429 is never that
+# (#73). HOLD: a 429 with no short Retry-After, the monthly quota, which resets: the queue waits QUOTA_HOLD_SECONDS and
+# the dump stays queued. BUSY: a 429 with a Retry-After of at most SHORT_RETRY_AFTER_MAX seconds (the account has too
+# many uploads in progress, or is over its API request rate): the queue waits that long. Neither is the dump's fault,
+# so neither spends a retry. An uploader returns (outcome, status, message), and for these two a fourth item: the
+# Retry-After in seconds, or None.
+HOLD, BUSY = "hold", "busy"
 AUTH_BACKOFF_SECONDS = 600
+QUOTA_HOLD_SECONDS = 6 * 3600
+SHORT_RETRY_AFTER_MAX = 300
+MIN_BUSY_HOLD_SECONDS = 5
+
+
+def parse_retry_after(value, now=None):
+    """Seconds from a Retry-After header (delta-seconds or an HTTP date), or None if it is missing or unreadable."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    if value.isdigit():
+        return int(value)
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0, int((when - (now or datetime.now(timezone.utc))).total_seconds()))
+
+
+def classify_429(retry_after_header):
+    """(outcome, retry_after_seconds) for a 429: BUSY for a short Retry-After, else HOLD."""
+    seconds = parse_retry_after(retry_after_header)
+    if seconds is not None and seconds <= SHORT_RETRY_AFTER_MAX:
+        return BUSY, seconds
+    return HOLD, seconds
 
 
 def upload_dump(base_url, api_key, path, hostname, name=None, timeout=1800):
@@ -475,7 +510,10 @@ def upload_dump(base_url, api_key, path, hostname, name=None, timeout=1800):
         return SUCCESS, 201, None
     if resp.status == 400:
         return REJECTED, 400, body
-    if resp.status in (413, 429):
+    if resp.status == 429:
+        outcome, retry_after = classify_429(resp.getheader("Retry-After"))
+        return outcome, 429, body, retry_after
+    if resp.status == 413:
         return QUOTA, resp.status, body
     if resp.status in (401, 403):
         return AUTH, resp.status, body
@@ -896,7 +934,10 @@ def upload_trace(base_url, api_key, path, manifest_json, hostname, name="trace.f
         return SUCCESS, 201, None
     if resp.status in (400, 422):
         return REJECTED, resp.status, body
-    if resp.status in (413, 429):
+    if resp.status == 429:
+        outcome, retry_after = classify_429(resp.getheader("Retry-After"))
+        return outcome, 429, body, retry_after
+    if resp.status == 413:
         return QUOTA, resp.status, body
     if resp.status in (401, 403):
         return AUTH, resp.status, body
@@ -1416,6 +1457,8 @@ class Agent:
             return
         if self.auth_paused(now):
             return  # the key was refused; don't send dumps to be refused again (#11)
+        if self.upload_held(now):
+            return  # the service said 429: wait out its Retry-After or the quota hold (#73)
         self.used_key_stamp = self.key_stamp()  # before reading the key, so a key stored in between isn't blamed
         key = self.api_key()
         due = [r for r in self.queue.in_state(QUEUED) if not r["next_attempt_utc"] or datetime.fromisoformat(r["next_attempt_utc"]) <= now]
@@ -1424,12 +1467,12 @@ class Agent:
             return
         refused = False
         for r in due:
-            if self.submit_one(r, key) == AUTH:
+            if self.submit_one(r, key) in (AUTH, BUSY, HOLD):
                 refused = True
                 break  # the rest would be refused too
         if batching["mode"] == "ScheduledTimeOfDay" and not refused:
-            # The slot is used, even if nothing was due. Not when the key was refused, or (returns
-            # above) during an auth pause or without a key: then it is taken once that clears.
+            # The slot is used, even if nothing was due. Not when the key was refused or the service said 429,
+            # or (returns above) during an auth pause, a hold or without a key: then it is taken once that clears.
             self.queue.set_meta("last_flush_utc", iso(now))
 
     def key_stamp(self):
@@ -1447,6 +1490,11 @@ class Agent:
         if self.queue.meta("auth_refused_key_stamp") != self.key_stamp():
             return False
         return True
+
+    def upload_held(self, now):
+        """After a 429, uploads wait: a BUSY answer's Retry-After, or QUOTA_HOLD_SECONDS for the monthly quota (#73)."""
+        until = self.queue.meta("upload_hold_until_utc")
+        return bool(until) and datetime.fromisoformat(until) > now
 
     def roots(self):
         return [root_path(r) for r in self.cfg["watchedPaths"]]
@@ -1469,17 +1517,18 @@ class Agent:
                     # The uploader opens this again: /proc/self/fd/N is the file already opened
                     # (safely), whatever the path points at by now.
                     path, name = f"/proc/self/fd/{f.fileno()}", os.path.basename(r["file_path"])
-                outcome, status, msg = self.uploader(self.cfg["apiBaseUrl"], key, path, self.hostname, name)
+                outcome, status, msg, *rest = self.uploader(self.cfg["apiBaseUrl"], key, path, self.hostname, name)
+                retry_after = rest[0] if rest else None
         except NotWatched as e:
-            outcome, status, msg = REJECTED, None, str(e)
+            outcome, status, msg, retry_after = REJECTED, None, str(e), None
         except (OSError, subprocess.SubprocessError, lzma.LZMAError) as e:
-            outcome, status, msg = TRANSIENT, None, str(e)
+            outcome, status, msg, retry_after = TRANSIENT, None, str(e), None
         finally:
             if spool:
                 spool.unlink(missing_ok=True)
-        return self.record_outcome(r, outcome, status, msg)
+        return self.record_outcome(r, outcome, status, msg, retry_after)
 
-    def record_outcome(self, r, outcome, status, msg):
+    def record_outcome(self, r, outcome, status, msg, retry_after=None):
         """What an upload's outcome does to the row: submitted, failed, retried later, or the key paused."""
         if outcome == SUCCESS:
             log.info("submitted %s", r["file_path"])
@@ -1488,6 +1537,17 @@ class Agent:
         elif outcome in (REJECTED, QUOTA):
             log.warning("%s %s rejected (%s): %s", r["kind"], r["file_path"], status, msg)
             self.queue.update(r["id"], state=FAILED, last_error=f"{status}: {msg}")
+        elif outcome in (BUSY, HOLD):
+            # Not the dump's fault and no attempt used (#73): a 429 is the account's limit of uploads in progress or
+            # request rate (wait the Retry-After) or the monthly quota (resets). The dump stays queued and the whole
+            # queue waits, since each try may send the whole dump.
+            if outcome == BUSY:
+                wait = max(MIN_BUSY_HOLD_SECONDS, min(retry_after or 0, SHORT_RETRY_AFTER_MAX))
+            else:
+                wait = QUOTA_HOLD_SECONDS
+            log.warning("%s %s not accepted (%s): %s; uploads wait %d s", r["kind"], r["file_path"], status, msg, wait)
+            self.queue.update(r["id"], state=QUEUED, last_error=f"{status}: {msg}")
+            self.queue.set_meta("upload_hold_until_utc", iso(self.clock() + timedelta(seconds=wait)))
         elif outcome == AUTH:
             # Not the dump's fault and no attempt used: the key is wrong, revoked or rotated.
             stamp = self.used_key_stamp  # the key this upload used, not one stored meanwhile
@@ -1901,11 +1961,11 @@ class Agent:
             return self.record_outcome(r, REJECTED, None, "the folded stacks file is gone")
         self.queue.update(r["id"], state=SUBMITTING)
         binary = r["dump_type"] == PERFETTO_TRACE_TYPE
-        outcome, status, msg = self.trace_uploader(self.cfg["apiBaseUrl"], key, str(path), r["manifest"], self.hostname, path.name,
-                                                   content_type="application/octet-stream" if binary else "text/plain")
+        outcome, status, msg, *rest = self.trace_uploader(self.cfg["apiBaseUrl"], key, str(path), r["manifest"], self.hostname, path.name,
+                                                          content_type="application/octet-stream" if binary else "text/plain")
         if outcome == AUTH and status == 403 and ("traces_disabled" in (msg or "") or "not enabled" in (msg or "")):
             outcome = TRANSIENT  # the service has traces off: not the key's fault, try again later
-        result = self.record_outcome(r, outcome, status, msg)
+        result = self.record_outcome(r, outcome, status, msg, rest[0] if rest else None)
         if outcome == SUCCESS:
             path.unlink(missing_ok=True)
         return result

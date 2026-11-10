@@ -11,15 +11,19 @@ public class DumpTriageApiClientTests : IDisposable
 
     public void Dispose() => File.Delete(_dumpPath);
 
-    private sealed class FixedResponse(HttpStatusCode status, string body) : HttpMessageHandler
+    private sealed class FixedResponse(HttpStatusCode status, string body, string? retryAfter = null) : HttpMessageHandler
     {
-        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
-            Task.FromResult(new HttpResponseMessage(status) { Content = new StringContent(body) });
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var response = new HttpResponseMessage(status) { Content = new StringContent(body) };
+            if (retryAfter is not null) response.Headers.TryAddWithoutValidation("Retry-After", retryAfter);
+            return Task.FromResult(response);
+        }
     }
 
-    private Task<UploadResult> Upload(HttpStatusCode status, string body)
+    private Task<UploadResult> Upload(HttpStatusCode status, string body, string? retryAfter = null)
     {
-        var http = new HttpClient(new FixedResponse(status, body)) { BaseAddress = new Uri("https://api.example") };
+        var http = new HttpClient(new FixedResponse(status, body, retryAfter)) { BaseAddress = new Uri("https://api.example") };
         return new DumpTriageApiClient(http).UploadDumpAsync(_dumpPath, "dts_key", null);
     }
 
@@ -118,6 +122,44 @@ public class DumpTriageApiClientTests : IDisposable
 
     // website#1487: what the server returns (routers/uploads.py, services/ingestion.py,
     // security/api_keys.py), mapped to what the agent should do about it.
+    // dumptriage-tools#73: the website's 429s that are not a spent monthly quota (routers/uploads.py, security/api_keys.py)
+    // carry a Retry-After of a minute or less; the monthly quota carries none.
+    [Theory]
+    [InlineData("this account already has 4 uploads in progress; wait for one to finish, then retry", "60", UploadOutcome.RateLimited, 60)]
+    [InlineData("this account is over its limit of 600 API requests a minute; retry in 37s", "37", UploadOutcome.RateLimited, 37)]
+    [InlineData("rate", "0", UploadOutcome.RateLimited, 0)]
+    [InlineData("rate", "300", UploadOutcome.RateLimited, 300)]
+    [InlineData("rate", "301", UploadOutcome.QuotaExceeded, 301)]
+    [InlineData("monthly quota of 5 dumps exceeded", "86400", UploadOutcome.QuotaExceeded, 86400)]
+    [InlineData("monthly quota of 5 dumps exceeded", null, UploadOutcome.QuotaExceeded, null)]
+    [InlineData("monthly quota of 5 dumps exceeded", "soon", UploadOutcome.QuotaExceeded, null)]
+    public async Task A_429_is_a_short_wait_only_when_its_Retry_After_says_so(string detail, string? retryAfter, UploadOutcome expected, int? seconds)
+    {
+        var result = await Upload(HttpStatusCode.TooManyRequests, "{\"detail\":\"" + detail + "\"}", retryAfter);
+
+        Assert.Equal(expected, result.Outcome);
+        Assert.Equal(seconds is null ? null : TimeSpan.FromSeconds(seconds.Value), result.RetryAfter);
+        Assert.False(result.ShouldRetry); // a wait for the whole queue, not a retry of this dump
+    }
+
+    [Fact]
+    public async Task A_Retry_After_given_as_an_HTTP_date_is_the_time_until_then()
+    {
+        var date = DateTimeOffset.UtcNow.AddSeconds(90).ToString("r");
+
+        var result = await Upload(HttpStatusCode.TooManyRequests, "{}", date);
+
+        Assert.Equal(UploadOutcome.RateLimited, result.Outcome);
+        Assert.InRange(result.RetryAfter!.Value.TotalSeconds, 80, 90);
+    }
+
+    [Fact]
+    public async Task A_Retry_After_on_another_status_changes_nothing()
+    {
+        Assert.Equal(UploadOutcome.TransientFailure, (await Upload(HttpStatusCode.ServiceUnavailable, "{}", "5")).Outcome);
+        Assert.Equal(UploadOutcome.RejectedPermanently, (await Upload(HttpStatusCode.RequestEntityTooLarge, "{}", "5")).Outcome);
+    }
+
     [Theory]
     [InlineData(HttpStatusCode.BadRequest, "{\"detail\":\"no file part\"}", UploadOutcome.RejectedPermanently)]
     [InlineData(HttpStatusCode.RequestEntityTooLarge, "{\"detail\":\"upload exceeds the 1-byte per-dump limit\"}", UploadOutcome.RejectedPermanently)]

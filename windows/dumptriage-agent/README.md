@@ -288,7 +288,10 @@ the release) takes one capture in file mode while you reproduce the problem, wri
   dump at once.
 - **Queue-wide holds**, which spend no retries and show in the tray: Terms
   of Service not accepted (15 minutes), API key rejected or account closed
-  (401/403, 1 hour), monthly quota used up (429, 6 hours).
+  (401/403, 1 hour), monthly quota used up (429 with no short `Retry-After`,
+  6 hours). A 429 with a `Retry-After` of 5 minutes or less (the account has
+  its limit of uploads in progress, or is over its API request rate) holds the
+  queue for that long instead, at least 5 seconds.
 - **Retry failed uploads** in the tray menu puts every `Failed` dump back in
   the queue.
 - A dump cut off mid-upload by a crash, reboot or service stop is requeued at
