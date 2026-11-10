@@ -21,8 +21,13 @@ internal sealed class FakeServer : HttpMessageHandler
     public Func<HttpRequestMessage, Task<HttpResponseMessage>> Respond { get; set; } =
         _ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.Created) { Content = new StringContent("{}") });
 
-    public void RespondWith(HttpStatusCode status, string body = "{}") =>
-        Respond = _ => Task.FromResult(new HttpResponseMessage(status) { Content = new StringContent(body) });
+    public void RespondWith(HttpStatusCode status, string body = "{}", string? retryAfter = null) =>
+        Respond = _ =>
+        {
+            var response = new HttpResponseMessage(status) { Content = new StringContent(body) };
+            if (retryAfter is not null) response.Headers.TryAddWithoutValidation("Retry-After", retryAfter);
+            return Task.FromResult(response);
+        };
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {

@@ -91,7 +91,7 @@ dumptriage-agent status               # counts per state
 `AskFirst` and rule-`Ask` dumps wait `askTimeoutSeconds`, then take `askTimeoutDefaultAction` (Skip by
 default). `NotifyOnly` dumps wait for `approve` with no timeout. Each pending dump is logged to the journal
 (`journalctl -u dumptriage-agent`) with the exact command. Transient failures retry with exponential
-backoff (30 s doubling, capped at 1 h) up to `maxRetries`; a 400, 413 or 429 is final (`Failed`). A 401 or 403 means the key
+backoff (30 s doubling, capped at 1 h) up to `maxRetries`; a 400 or 413 is final (`Failed`). A 429 never fails a dump and spends no attempt: with a `Retry-After` of 5 minutes or less (too many uploads in progress, or over the API request rate) uploads wait that long; without one (the monthly quota) they wait 6 hours. A 401 or 403 means the key
 is wrong or revoked: no attempt is used up, and uploads pause for 10 minutes, doubling with each refusal in
 a row up to 6 hours (every attempt sends the whole dump). Storing a new key with `set-api-key` ends the
 pause. With `ScheduledTimeOfDay`, uploads happen only once a scheduled time has passed since the

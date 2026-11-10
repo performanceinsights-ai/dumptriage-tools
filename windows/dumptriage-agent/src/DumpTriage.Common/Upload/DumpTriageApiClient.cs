@@ -15,8 +15,9 @@ public enum UploadOutcome
     // (not a dump, failed malware scan, unsupported OS): sending the same
     // bytes again gets the same answer.
     RejectedPermanently,
-    // 429: the account's monthly quota is used up. Resets, so the dump waits;
-    // every dump would get the same answer, so the whole queue holds.
+    // 429 with no short Retry-After: the account's monthly quota is used up.
+    // Resets, so the dump waits; every dump would get the same answer, so the
+    // whole queue holds.
     QuotaExceeded,
     TransientFailure,
     // 403 terms_not_accepted: a signup reissue left the account without a
@@ -38,9 +39,15 @@ public enum UploadOutcome
     // (checked before upload, website#1493): this record is done, and the file is
     // detected again as a new dump.
     FileChanged,
+    // 429 with a Retry-After of at most ShortRetryAfterMax: the account has its
+    // limit of uploads in progress, or is over its API request rate
+    // (website#3450, #3451). Not the dump's fault and not a spent quota: the
+    // queue waits that long and no retry is spent (dumptriage-tools#73).
+    RateLimited,
 }
 
-public sealed record UploadResult(UploadOutcome Outcome, HttpStatusCode? StatusCode, string? ErrorMessage)
+public sealed record UploadResult(
+    UploadOutcome Outcome, HttpStatusCode? StatusCode, string? ErrorMessage, TimeSpan? RetryAfter = null)
 {
     public bool ShouldRetry => Outcome is UploadOutcome.TransientFailure or UploadOutcome.FileUnavailable;
 }
@@ -158,7 +165,9 @@ public sealed class DumpTriageApiClient
 
             var responseBody = await response.Content.ReadAsStringAsync(watchdog.Token);
 
-            return new UploadResult(Classify(response.StatusCode, responseBody), response.StatusCode, responseBody);
+            var retryAfter = ReadRetryAfter(response);
+            return new UploadResult(
+                Classify(response.StatusCode, responseBody, retryAfter), response.StatusCode, responseBody, retryAfter);
         }
         catch (HttpRequestException ex)
         {
@@ -213,7 +222,26 @@ public sealed class DumpTriageApiClient
 
     public const string ContentSha256Header = "X-Content-SHA256";
 
-    internal static UploadOutcome Classify(HttpStatusCode status, string body) => status switch
+    /// <summary>
+    /// The longest Retry-After that makes a 429 a short wait instead of a spent quota. The website's
+    /// uploads-in-progress and request-rate answers carry one of 60 s or less; the monthly quota carries none.
+    /// </summary>
+    public static readonly TimeSpan ShortRetryAfterMax = TimeSpan.FromMinutes(5);
+
+    /// <summary>The Retry-After header as a wait (delta-seconds or an HTTP date), or null if absent or unreadable.</summary>
+    internal static TimeSpan? ReadRetryAfter(HttpResponseMessage response, DateTimeOffset? now = null)
+    {
+        var header = response.Headers.RetryAfter;
+        if (header?.Delta is { } delta) return delta < TimeSpan.Zero ? TimeSpan.Zero : delta;
+        if (header?.Date is { } date)
+        {
+            var wait = date - (now ?? DateTimeOffset.UtcNow);
+            return wait < TimeSpan.Zero ? TimeSpan.Zero : wait;
+        }
+        return null;
+    }
+
+    internal static UploadOutcome Classify(HttpStatusCode status, string body, TimeSpan? retryAfter = null) => status switch
     {
         // routers/uploads.py CONTENT_SHA256_MISMATCH: the file changed since it was hashed.
         HttpStatusCode.UnprocessableEntity when body.Contains("content_sha256_mismatch", StringComparison.Ordinal) =>
@@ -222,6 +250,7 @@ public sealed class DumpTriageApiClient
             or HttpStatusCode.RequestEntityTooLarge
             or HttpStatusCode.UnsupportedMediaType
             or HttpStatusCode.UnprocessableEntity => UploadOutcome.RejectedPermanently,
+        HttpStatusCode.TooManyRequests when retryAfter is { } wait && wait <= ShortRetryAfterMax => UploadOutcome.RateLimited,
         HttpStatusCode.TooManyRequests => UploadOutcome.QuotaExceeded,
         HttpStatusCode.Unauthorized => UploadOutcome.CredentialsRejected,
         HttpStatusCode.Forbidden when body.Contains("terms_not_accepted", StringComparison.Ordinal) => UploadOutcome.AwaitingTerms,
