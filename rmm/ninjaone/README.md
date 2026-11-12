@@ -77,15 +77,15 @@ Administration > Library > Automation > Add > New Script:
 Parameters, if you would rather use the preset parameter line:
 `-IncludeMemoryDmp`, `-DryRun`, `-MaxUploads 10`, `-NoHostname`,
 `-ApiBaseUrl https://...`, `-ApiKeyFieldName`, `-ReportFieldName`,
-`-Reference 'client=Acme;device={hostname}'` (a text script variable
+`-Reference 'client=Acme;ticket=INC-4021'` (a text script variable
 `DUMPTRIAGE_REFERENCE` does the same).
 
 `-Reference` is your own label, at most 200 characters. DumpTriage returns it
 in the report webhook so one receiver can route each report to a client or PSA
 ticket; see [any RMM](../README.md#one-receiver-for-every-client-reference).
-`{hostname}` becomes the computer's name, stored as you wrote it, so it cannot
-be combined with `-NoHostname`. A reference over 200 characters stops the run
-with exit code 1 before anything is sent.
+It is stored as you write it, unlike the hostname (only ever a keyed hash on
+our side), so keep machine and user names out of it. A reference over 200
+characters stops the run with exit code 1 before anything is sent.
 
 ### 4. Schedule it
 

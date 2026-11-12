@@ -26,11 +26,12 @@
   dryRun=true, DUMPTRIAGE_REFERENCE.
 
   -Reference is your own label for the dumps this run sends, at most 200
-  characters, for example 'client=Acme;device={hostname}'. DumpTriage returns it
+  characters, for example 'client=Acme;ticket=INC-4021'. DumpTriage returns it
   on the dump and in the report webhook, so one receiver can route each report
-  to the right client or PSA ticket (website#3581). {hostname} becomes this
-  computer's name, in clear text in the label: it cannot be combined with
-  -NoHostname. A service older than website#3581 ignores the field.
+  to the right client or PSA ticket (website#3581). It is stored as you write
+  it, unlike the hostname (which is only ever a keyed hash there), so keep
+  machine and user names out of it. A service older than website#3581 ignores
+  the field.
 
   Exit codes (NinjaOne can alert on a non-zero result):
     0  nothing new, or every new dump was uploaded
@@ -252,17 +253,11 @@ function Get-ResponseField {
 $script:ReferenceMaxLength = 200
 
 function Resolve-Reference {
-    <# The label to send: $Reference with {hostname} filled in. Returns the text ('' for none), or $null when it
-       cannot be used: over 200 characters (the service would refuse every dump, for good), or {hostname} with
-       -NoHostname (which would send the name that switch withholds). #>
-    param([string]$Reference, [string]$MachineName, [switch]$NoHostname)
+    <# The label to send: trimmed. Returns the text ('' for none), or $null when it is over 200 characters (the
+       service would refuse every dump for good). #>
+    param([string]$Reference)
     if (-not $Reference -or -not $Reference.Trim()) { return '' }
     $text = $Reference.Trim()
-    if ($text -match '\{hostname\}') {
-        if ($NoHostname) { return $null }
-        # In a -replace replacement, `$` is special: double it so a name holding one stays literal.
-        $text = $text -replace '\{hostname\}', $MachineName.Replace('$', '$$')
-    }
     if ($text.Length -gt $script:ReferenceMaxLength) { return $null }
     return $text
 }
@@ -289,9 +284,9 @@ function Invoke-DumpTriageCollect {
         return 1
     }
     $uploadUri = $ApiBaseUrl.TrimEnd('/') + '/api/v1/dumps'
-    $referenceText = Resolve-Reference -Reference $Reference -MachineName ([Environment]::MachineName) -NoHostname:$NoHostname
+    $referenceText = Resolve-Reference -Reference $Reference
     if ($null -eq $referenceText) {
-        Write-Host ("ERROR: the reference must be at most {0} characters once {{hostname}} is filled in, and cannot use {{hostname}} with -NoHostname." -f $script:ReferenceMaxLength)
+        Write-Host ("ERROR: the reference must be at most {0} characters." -f $script:ReferenceMaxLength)
         return 1
     }
 

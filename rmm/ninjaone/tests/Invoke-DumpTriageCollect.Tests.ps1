@@ -235,15 +235,13 @@ Describe 'Invoke-DumpTriageCollect' {
         $script:StatePath | Should -Not -Exist
     }
 
-    It 'sends the reference with {hostname} filled in' {
+    It 'sends the trimmed reference' {
         New-FakeDump -Dir $script:Minidumps -Name 'a.dmp' | Out-Null
         Mock Send-DumpTriageUpload { New-UploadResponse }
 
-        Invoke-DumpTriageCollect @Run -Reference ' client=Acme;device={HostName} ' | Should -Be 0
+        Invoke-DumpTriageCollect @Run -Reference ' client=Acme;ticket=INC-4021 ' | Should -Be 0
 
-        Should -Invoke Send-DumpTriageUpload -Times 1 -Exactly -ParameterFilter {
-            $Reference -eq ('client=Acme;device=' + [Environment]::MachineName)
-        }
+        Should -Invoke Send-DumpTriageUpload -Times 1 -Exactly -ParameterFilter { $Reference -eq 'client=Acme;ticket=INC-4021' }
     }
 
     It 'sends no reference when none is given' {
@@ -263,16 +261,6 @@ Describe 'Invoke-DumpTriageCollect' {
         Invoke-DumpTriageCollect @Run -Reference ('x' * 200) | Should -Be 0
 
         Should -Invoke Send-DumpTriageUpload -Times 1 -Exactly
-    }
-
-    It 'refuses {hostname} in the reference together with -NoHostname' {
-        New-FakeDump -Dir $script:Minidumps -Name 'a.dmp' | Out-Null
-        Mock Send-DumpTriageUpload { New-UploadResponse }
-
-        Invoke-DumpTriageCollect @Run -NoHostname -Reference 'device={hostname}' | Should -Be 1
-        Invoke-DumpTriageCollect @Run -NoHostname -Reference 'client=Acme' | Should -Be 0
-
-        Should -Invoke Send-DumpTriageUpload -Times 1 -Exactly -ParameterFilter { $Reference -eq 'client=Acme' -and -not $HostName }
     }
 
     It 'exits 1 without a key and uploads nothing' {

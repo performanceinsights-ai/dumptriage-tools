@@ -31,13 +31,13 @@ curl --fail-with-body -sS -H 'Expect:' \
   -H "Authorization: Bearer $DUMPTRIAGE_API_KEY" \
   -F "file=@/var/crash/core.1234" \
   --form-string "hostname=$(hostname)" \
-  --form-string "reference=client=Acme;device=$(hostname)" \
+  --form-string "reference=client=Acme;ticket=INC-4021" \
   https://api.performanceinsights.ai/api/v1/dumps
 # 201 {"id": "...", "report_url": "https://.../dumps/...", "status": "...", ...}
 ```
 
 `-H 'Expect:'` matters: curl adds `Expect: 100-continue` to large uploads and the API answers 417. `--form-string`
-matters for `reference`: `-F` reads a `;` as the start of an option, so `client=Acme;device=PC-17` would be cut at the `;`. `hostname` is
+matters for `reference`: `-F` reads a `;` as the start of an option, so `client=Acme;ticket=INC-4021` would be cut at the `;`. `hostname` is
 turned into a keyed hash on our side and never stored; leave it out to send nothing. Answers to act on:
 `401`/`403` the key is wrong or revoked (stop and alert), `429` quota or too many uploads at once (retry next run),
 `5xx` or no answer (retry next run), `400`/`413`/`415`/`422` the file or a field is refused for good (record it, do
@@ -61,11 +61,11 @@ each dump and it comes back in the webhook body as `reference` (and on the dump,
 receiver can route each report to the right client or PSA ticket without keeping a table of dump ids:
 
 ```
-client=Acme;device=PC-17
+client=Acme;ticket=INC-4021
 ```
 
-At most 200 characters, one line, not read by the analysis. It is your text, so a device name in it is stored as you
-wrote it (up to the dump's retention), unlike `hostname`. A service older than the release that added it ignores the
+At most 200 characters, one line, not read by the analysis. It is stored as you write it (until the dump expires),
+unlike `hostname`, which is only ever a keyed hash on our side: keep machine and user names out of it. A service older than the release that added it ignores the
 field, so a script can send it before then. Register the receiver with `POST /api/v1/customers/me/webhook`; each
 delivery is signed (see the API reference).
 
