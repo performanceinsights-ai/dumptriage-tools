@@ -11,7 +11,8 @@
     2. skips any dump already handled, by path + size + last-write time, from
        the state file %ProgramData%\DumpTriage\ninja-state.json;
     3. uploads the rest to POST {ApiBaseUrl}/api/v1/dumps (multipart `file`
-       and `hostname`, Bearer auth with an upload-only key);
+       and `hostname`, plus `reference` when one is set, Bearer auth with an
+       upload-only key);
     4. writes the newest report link into the `dumptriageLastReport` custom
        field (Ninja-Property-Set, when it exists) and prints every link.
 
@@ -22,7 +23,15 @@
 
   NinjaOne script variables arrive as environment variables, so each switch
   can also be set that way: DUMPTRIAGE_API_BASE_URL, includeMemoryDmp=true,
-  dryRun=true.
+  dryRun=true, DUMPTRIAGE_REFERENCE.
+
+  -Reference is your own label for the dumps this run sends, at most 200
+  characters, for example 'client=Acme;ticket=INC-4021'. DumpTriage returns it
+  on the dump and in the report webhook, so one receiver can route each report
+  to the right client or PSA ticket (website#3581). It is stored as you write
+  it, unlike the hostname (which is only ever a keyed hash there), so keep
+  machine and user names out of it. A service older than website#3581 ignores
+  the field.
 
   Exit codes (NinjaOne can alert on a non-zero result):
     0  nothing new, or every new dump was uploaded
@@ -51,6 +60,7 @@ param(
     [ValidateRange(0, 86400)]
     [int]$MinAgeSeconds = 120,
     [switch]$NoHostname,
+    [string]$Reference,
     # Plain strings, not Join-Path: Join-Path refuses the empty %WINDIR% the
     # tests see when they dot-source this on Linux.
     [string]$MinidumpDir = "$env:WINDIR\Minidump",
@@ -183,6 +193,7 @@ function Send-DumpTriageUpload {
         [string]$ApiKey,
         [string]$Path,
         [string]$HostName,
+        [string]$Reference,
         [int]$TimeoutMinutes = 120
     )
     Add-Type -AssemblyName System.Net.Http
@@ -203,6 +214,7 @@ function Send-DumpTriageUpload {
         $fileContent.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse('application/octet-stream')
         $content.Add($fileContent, 'file', [System.IO.Path]::GetFileName($Path))
         if ($HostName) { $content.Add([System.Net.Http.StringContent]::new($HostName), 'hostname') }
+        if ($Reference) { $content.Add([System.Net.Http.StringContent]::new($Reference), 'reference') }
         $request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, $Uri)
         $request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue('Bearer', $ApiKey)
         $request.Content = $content
@@ -238,6 +250,20 @@ function Get-ResponseField {
     return $null
 }
 
+$script:ReferenceMaxLength = 200
+
+function Resolve-Reference {
+    <# The label to send: trimmed. Returns the text ('' for none), or $null when it is over 200 characters (the
+       service would refuse every dump for good). #>
+    param([string]$Reference)
+    if (-not $Reference -or -not $Reference.Trim()) { return '' }
+    $text = $Reference.Trim()
+    # The service counts characters (code points), not UTF-16 units: an emoji is two units here and one there.
+    $codePoints = ($text -replace '[\uD800-\uDBFF][\uDC00-\uDFFF]', '.').Length
+    if ($codePoints -gt $script:ReferenceMaxLength) { return $null }
+    return $text
+}
+
 function Invoke-DumpTriageCollect {
     <# The whole run; returns the exit code. #>
     param(
@@ -249,6 +275,7 @@ function Invoke-DumpTriageCollect {
         [int]$MaxUploads = 10,
         [int]$MinAgeSeconds = 120,
         [switch]$NoHostname,
+        [string]$Reference,
         [string]$MinidumpDir,
         [string]$MemoryDmpPath,
         [string]$StatePath,
@@ -259,6 +286,11 @@ function Invoke-DumpTriageCollect {
         return 1
     }
     $uploadUri = $ApiBaseUrl.TrimEnd('/') + '/api/v1/dumps'
+    $referenceText = Resolve-Reference -Reference $Reference
+    if ($null -eq $referenceText) {
+        Write-Host ("ERROR: the reference must be at most {0} characters." -f $script:ReferenceMaxLength)
+        return 1
+    }
 
     $candidates = @(Get-DumpCandidate -MinidumpDir $MinidumpDir -MemoryDmpPath $MemoryDmpPath `
         -IncludeMemoryDmp:$IncludeMemoryDmp -MinAgeSeconds $MinAgeSeconds -NowUtc $NowUtc)
@@ -292,7 +324,7 @@ function Invoke-DumpTriageCollect {
     $authFailed = $false
     $lastReport = $null
     foreach ($dump in $batch) {
-        $result = Send-DumpTriageUpload -Uri $uploadUri -ApiKey $apiKey -Path $dump.Path -HostName $hostName
+        $result = Send-DumpTriageUpload -Uri $uploadUri -ApiKey $apiKey -Path $dump.Path -HostName $hostName -Reference $referenceText
         $outcome = Resolve-UploadOutcome -Result $result
         $entry = [pscustomobject]@{
             key        = $dump.Key
@@ -359,11 +391,12 @@ function Invoke-DumpTriageCollect {
 if ($MyInvocation.InvocationName -eq '.') { return }
 
 if (-not $PSBoundParameters.ContainsKey('ApiBaseUrl') -and $env:DUMPTRIAGE_API_BASE_URL) { $ApiBaseUrl = $env:DUMPTRIAGE_API_BASE_URL }
+if (-not $PSBoundParameters.ContainsKey('Reference') -and $env:DUMPTRIAGE_REFERENCE) { $Reference = $env:DUMPTRIAGE_REFERENCE }
 if (Test-EnvFlag 'includeMemoryDmp') { $IncludeMemoryDmp = [switch]$true }
 if (Test-EnvFlag 'dryRun') { $DryRun = [switch]$true }
 
 $code = Invoke-DumpTriageCollect -ApiBaseUrl $ApiBaseUrl -ApiKeyFieldName $ApiKeyFieldName `
     -ReportFieldName $ReportFieldName -IncludeMemoryDmp:$IncludeMemoryDmp -DryRun:$DryRun `
     -MaxUploads $MaxUploads -MinAgeSeconds $MinAgeSeconds -NoHostname:$NoHostname `
-    -MinidumpDir $MinidumpDir -MemoryDmpPath $MemoryDmpPath -StatePath $StatePath
+    -Reference $Reference -MinidumpDir $MinidumpDir -MemoryDmpPath $MemoryDmpPath -StatePath $StatePath
 exit $code
