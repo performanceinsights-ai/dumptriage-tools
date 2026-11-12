@@ -6,10 +6,11 @@ for a specific RMM so far is [NinjaOne](ninjaone/README.md); this page is what t
 
 ## What your RMM has to do
 
-1. **Hold one upload-only key per client**, in a secret field the script can read (not on the command line, where
+1. **Hold an upload-only key per client**, in a secret field the script can read (not on the command line, where
    process listings and logs show it). Mint it with the account's primary key; an upload-only key can call
    `POST /api/v1/dumps` and nothing else, so a key read off one device cannot list or download anything, and revoking
-   one client's key affects nobody else:
+   one client's key affects nobody else. An account holds at most 20 active named keys (the 21st is refused with 409),
+   so past 20 clients let one key serve a group of them and tell the clients apart with the `reference` below:
 
    ```sh
    curl -X POST https://api.performanceinsights.ai/api/v1/customers/me/api-keys \
@@ -27,21 +28,34 @@ for a specific RMM so far is [NinjaOne](ninjaone/README.md); this page is what t
 ## The upload
 
 ```sh
-curl --fail-with-body -sS -H 'Expect:' \
+status=$(curl -sS -H 'Expect:' -o resp.json -w '%{http_code}' \
   -H "Authorization: Bearer $DUMPTRIAGE_API_KEY" \
-  -F "file=@/var/crash/core.1234" \
   --form-string "hostname=$(hostname)" \
   --form-string "reference=client=Acme;ticket=INC-4021" \
-  https://api.performanceinsights.ai/api/v1/dumps
-# 201 {"id": "...", "report_url": "https://.../dumps/...", "status": "...", ...}
+  -F "file=@/var/crash/core.1234" \
+  https://api.performanceinsights.ai/api/v1/dumps)
+# 201, and resp.json has {"id": "...", "report_url": "https://.../dumps/...", "status": "...", ...}
 ```
 
-`-H 'Expect:'` matters: curl adds `Expect: 100-continue` to large uploads and the API answers 417. `--form-string`
-matters for `reference`: `-F` reads a `;` as the start of an option, so `client=Acme;ticket=INC-4021` would be cut at the `;`. `hostname` is
-turned into a keyed hash on our side and never stored; leave it out to send nothing. Answers to act on:
-`401`/`403` the key is wrong or revoked (stop and alert), `429` quota or too many uploads at once (retry next run),
-`5xx` or no answer (retry next run), `400`/`413`/`415`/`422` the file or a field is refused for good (record it, do
-not resend). The [API reference](https://performanceinsights.ai/api-docs/) has the rest.
+- `-H 'Expect:'`: curl adds `Expect: 100-continue` to large uploads and the API answers 417.
+- `--form-string` for `reference`: `-F` reads a `;` as the start of an option, so `client=Acme;ticket=INC-4021` would be
+  cut at the `;`.
+- The text fields come before `file` on purpose: a label that is too long is refused before the dump is read, not
+  after it has been uploaded.
+- `hostname` is turned into a keyed hash on our side and never stored; leave it out to send nothing.
+
+What to do with the status (the body says why):
+
+| Status | Meaning | Do |
+|---|---|---|
+| `201` | Stored (a dump we already have answers `200`/`201` too, no second charge) | Record it, use `report_url` |
+| `401` | The key is unknown or revoked | Stop and alert |
+| `403` | The key cannot upload, or the account needs an action (terms not accepted, account closed) | Stop and alert; read the body |
+| `429` | Quota, or too many uploads at once | Retry next run |
+| `5xx`, no answer | Outage or network | Retry next run |
+| `400`, `413`, `422` | Not a dump, a field refused, too large for the plan, or a dump type the service does not take yet | Record it and do not resend every run; some of these clear later (a plan change, a release), so make it easy to clear |
+
+The [API reference](https://performanceinsights.ai/api-docs/) has the rest.
 
 ## Which script on which OS
 
@@ -56,16 +70,20 @@ The two agents do not take a `reference` yet, and the macOS script does not eith
 
 ## One receiver for every client: `reference`
 
-An account has one webhook URL, and the delivery says only `{dump_id, status, report_url}`. Send your own label with
-each dump and it comes back in the webhook body as `reference` (and on the dump, `GET /api/v1/dumps/{id}`), so one
-receiver can route each report to the right client or PSA ticket without keeping a table of dump ids:
+An account has one webhook URL, and the delivery body is `{dump_id, status, report_url}` (plus `connector_group_url`
+for a dump that came through a crash-platform connector). Send your own label with each dump and it comes back as
+`reference` (absent when none was sent, and on the dump itself, `GET /api/v1/dumps/{id}`), so one receiver can route
+each report to the right client or PSA ticket without keeping a table of dump ids:
 
 ```
 client=Acme;ticket=INC-4021
 ```
 
-At most 200 characters, one line, not read by the analysis. It is stored as you write it (until the dump expires),
-unlike `hostname`, which is only ever a keyed hash on our side: keep machine and user names out of it. A service older than the release that added it ignores the
+At most 200 characters, not read by the analysis. It is trimmed and put on one line (runs of white space become one
+space, invisible format characters are dropped), so match on that form. It is stored until the dump expires, as you
+wrote it apart from that, unlike `hostname`, which is only ever a keyed hash on our side: keep machine and user names
+out of it. Sending the same dump again with a different `reference` re-labels it and sends no new webhook, so keep
+the "already sent" state per client. A service older than the release that added it ignores the
 field, so a script can send it before then. Register the receiver with `POST /api/v1/customers/me/webhook`; each
 delivery is signed (see the API reference).
 

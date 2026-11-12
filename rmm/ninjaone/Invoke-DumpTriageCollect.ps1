@@ -258,7 +258,9 @@ function Resolve-Reference {
     param([string]$Reference)
     if (-not $Reference -or -not $Reference.Trim()) { return '' }
     $text = $Reference.Trim()
-    if ($text.Length -gt $script:ReferenceMaxLength) { return $null }
+    # The service counts characters (code points), not UTF-16 units: an emoji is two units here and one there.
+    $codePoints = ($text -replace '[\uD800-\uDBFF][\uDC00-\uDFFF]', '.').Length
+    if ($codePoints -gt $script:ReferenceMaxLength) { return $null }
     return $text
 }
 
