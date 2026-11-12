@@ -235,6 +235,46 @@ Describe 'Invoke-DumpTriageCollect' {
         $script:StatePath | Should -Not -Exist
     }
 
+    It 'sends the reference with {hostname} filled in' {
+        New-FakeDump -Dir $script:Minidumps -Name 'a.dmp' | Out-Null
+        Mock Send-DumpTriageUpload { New-UploadResponse }
+
+        Invoke-DumpTriageCollect @Run -Reference ' client=Acme;device={HostName} ' | Should -Be 0
+
+        Should -Invoke Send-DumpTriageUpload -Times 1 -Exactly -ParameterFilter {
+            $Reference -eq ('client=Acme;device=' + [Environment]::MachineName)
+        }
+    }
+
+    It 'sends no reference when none is given' {
+        New-FakeDump -Dir $script:Minidumps -Name 'a.dmp' | Out-Null
+        Mock Send-DumpTriageUpload { New-UploadResponse }
+
+        Invoke-DumpTriageCollect @Run | Should -Be 0
+
+        Should -Invoke Send-DumpTriageUpload -Times 1 -Exactly -ParameterFilter { -not $Reference }
+    }
+
+    It 'exits 1 and uploads nothing when the reference is over 200 characters' {
+        New-FakeDump -Dir $script:Minidumps -Name 'a.dmp' | Out-Null
+        Mock Send-DumpTriageUpload { New-UploadResponse }
+
+        Invoke-DumpTriageCollect @Run -Reference ('x' * 201) | Should -Be 1
+        Invoke-DumpTriageCollect @Run -Reference ('x' * 200) | Should -Be 0
+
+        Should -Invoke Send-DumpTriageUpload -Times 1 -Exactly
+    }
+
+    It 'refuses {hostname} in the reference together with -NoHostname' {
+        New-FakeDump -Dir $script:Minidumps -Name 'a.dmp' | Out-Null
+        Mock Send-DumpTriageUpload { New-UploadResponse }
+
+        Invoke-DumpTriageCollect @Run -NoHostname -Reference 'device={hostname}' | Should -Be 1
+        Invoke-DumpTriageCollect @Run -NoHostname -Reference 'client=Acme' | Should -Be 0
+
+        Should -Invoke Send-DumpTriageUpload -Times 1 -Exactly -ParameterFilter { $Reference -eq 'client=Acme' -and -not $HostName }
+    }
+
     It 'exits 1 without a key and uploads nothing' {
         New-FakeDump -Dir $script:Minidumps -Name 'a.dmp' | Out-Null
         Mock Get-DumpTriageApiKey { $null }

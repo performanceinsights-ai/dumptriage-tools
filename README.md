@@ -25,6 +25,7 @@ Send dumps or reports without installing an agent.
 |---|---|
 | [`macos/dumptriage-collect.sh`](macos/dumptriage-collect.sh) | Lists the last week's macOS crash reports, kernel panics and spin/hang reports, lets you pick, and asks before sending. `--spindump` samples a hanging app now; `--profile`, `--sample` and `--xctrace` send a timed performance capture (system-wide spindump, `sample`, Instruments' Time Profiler folded on the Mac) as a performance trace |
 | [`rmm/ninjaone/Invoke-DumpTriageCollect.ps1`](rmm/ninjaone/Invoke-DumpTriageCollect.ps1) | A NinjaOne Script Library script: sends each device's new minidumps on a schedule and writes the report link into a custom field ([setup](rmm/ninjaone/README.md)) |
+| [`rmm/README.md`](rmm/README.md) | Any other RMM: what it has to do, the upload call, which script or agent per OS, and the `reference` label that routes each report to a client or ticket |
 
 ## Agents
 
