@@ -107,6 +107,20 @@ finally {
     Remove-Item -Path $emptyFile -ErrorAction SilentlyContinue
 }
 
+# Install.cmd, the double-click launcher at the zip root (#80): it must start this script with the zip's folders and
+# a process-only bypass, never pass a key, keep CRLF (cmd.exe misreads some LF-only batch files) and land at the root.
+$launcherPath = Join-Path $PSScriptRoot "../Install.cmd"
+$launcher = [System.IO.File]::ReadAllText((Resolve-Path $launcherPath))
+$installLine = 'powershell -NoProfile -ExecutionPolicy Bypass -File "%DT_ROOT%installer\install.ps1" -AgentPublishDir "%DT_ROOT%agent" -TrayPublishDir "%DT_ROOT%tray"'
+Assert-Equal $launcher.Contains($installLine) $true "Install.cmd runs install.ps1 with the zip's agent and tray folders and a process-only bypass"
+$params = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+Assert-Equal (($params -contains 'AgentPublishDir') -and ($params -contains 'TrayPublishDir')) $true "the parameters Install.cmd passes exist in install.ps1"
+Assert-Equal ($launcher -match '(?i)apikey|dts_') $false "Install.cmd passes no API key (install.ps1 prompts for it)"
+Assert-Equal ($launcher -match '(?i)Set-ExecutionPolicy') $false "Install.cmd changes no execution policy setting"
+Assert-Equal ($launcher -match '(?<!\r)\n') $false "Install.cmd has CRLF line endings"
+$release = Get-Content -Raw (Join-Path $PSScriptRoot "../../../../.github/workflows/release.yml")
+Assert-Equal $release.Contains('Move-Item "$out\installer\Install.cmd" "$out\Install.cmd"') $true "release.yml puts Install.cmd at the zip root"
+
 if ($failures.Count -gt 0) {
     Write-Host ""
     $failures | ForEach-Object { Write-Host "FAIL: $_" }

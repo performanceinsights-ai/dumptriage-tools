@@ -33,8 +33,25 @@ jobs:
           dotnet publish src/DumpTriageTray -c Release -r win-x64 --self-contained -o "$out\tray"
           Copy-Item -Recurse installer -Destination "$out\installer"
           Remove-Item -Recurse -Force "$out\installer\linux" -ErrorAction SilentlyContinue
+          # The double-click launcher sits at the zip root, beside agent\, tray\ and installer\ (#80).
+          Move-Item "$out\installer\Install.cmd" "$out\Install.cmd"
           Copy-Item README.md, ..\..\LICENSE -Destination $out
           Compress-Archive -Path "$out\*" -DestinationPath "$env:RUNNER_TEMP\dumptriage-agent-windows-x64.zip"
+      - name: Install.cmd installs the agent from the extracted zip, uninstall.ps1 removes it (#80)
+        shell: pwsh
+        run: |
+          $dir = "$env:RUNNER_TEMP\zip-check"
+          Expand-Archive "$env:RUNNER_TEMP\dumptriage-agent-windows-x64.zip" -DestinationPath $dir
+          # The runner is already elevated, so this takes Install.cmd's install path, not the UAC relaunch. Empty
+          # stdin answers its closing `pause`; with no key given the agent installs and waits for one.
+          $noInput = New-Item -ItemType File "$env:RUNNER_TEMP\no-input.txt" -Force
+          $run = Start-Process cmd.exe -ArgumentList '/c', "`"$dir\Install.cmd`"" -RedirectStandardInput $noInput -NoNewWindow -Wait -PassThru
+          if ($run.ExitCode -ne 0) { throw "Install.cmd exited with $($run.ExitCode)" }
+          $service = Get-Service DumpTriageAgent
+          if ($service.Status -ne 'Running') { throw "DumpTriageAgent is $($service.Status), not Running" }
+          Get-ScheduledTask -TaskName DumpTriageTray | Out-Null
+          & "$dir\installer\uninstall.ps1" -RemoveData
+          if (Get-Service DumpTriageAgent -ErrorAction SilentlyContinue) { throw "uninstall.ps1 left the service" }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-agent
