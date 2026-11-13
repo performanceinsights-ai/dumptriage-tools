@@ -59,8 +59,9 @@ if "%DT_EXIT%"=="0" (
     echo Finished. If a warning above says no API key was provided, run Install.cmd again and answer Y to enter it.
 ) else (
     echo The install failed ^(exit code %DT_EXIT%^). If the message above says running scripts is disabled or
-    echo blocked by policy, a Group Policy or Smart App Control on this PC refuses unsigned scripts: install through
-    echo your IT department, or see README.md.
+    echo blocked by policy: on a managed PC a Group Policy refuses unsigned scripts, so install through your IT
+    echo department. On a PC no organisation manages, Smart App Control blocks unsigned code whoever runs it; that
+    echo needs a signed release. See README.md.
 )
 if not defined DT_ARGS pause
 exit /b %DT_EXIT%
