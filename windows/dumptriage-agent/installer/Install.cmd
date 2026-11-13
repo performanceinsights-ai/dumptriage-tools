@@ -18,7 +18,7 @@ if /i "%~1"=="--elevated" (
 echo Asking Windows for administrator rights...
 rem cmd.exe itself with the path in doubled quotes ([char]34), so a folder named "x (1)" or "a & b" survives /c, and
 rem this window waits so a run that dies before its own pause (a mapped drive the elevated session can't see) shows.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$q = [char]34; $p = Start-Process -FilePath $env:ComSpec -ArgumentList ('/c ' + $q + $q + $env:DT_SELF + $q + ' --elevated' + $q) -Verb RunAs -Wait -PassThru; exit $p.ExitCode"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$q = [char]34; try { $p = Start-Process -FilePath $env:ComSpec -ArgumentList ('/c ' + $q + $q + $env:DT_SELF + $q + ' --elevated' + $q) -Verb RunAs -Wait -PassThru -ErrorAction Stop; exit $p.ExitCode } catch { Write-Host 'Windows did not give administrator rights (the prompt was cancelled or refused).'; exit 1 }"
 if errorlevel 1 (
     echo.
     echo The install did not finish. If the administrator window closed at once and this folder is on a network or
@@ -28,6 +28,11 @@ if errorlevel 1 (
 exit /b
 
 :elevated
+rem Arguments go on to install.ps1 (an RMM tool already running as administrator can pass its key-file option); a UAC
+rem relaunch passes none. With arguments nothing waits for a keypress, so an unattended run ends.
+set "DT_ARGS=%*"
+if /i "%~1"=="--elevated" set "DT_ARGS="
+
 if not exist "%DT_ROOT%installer\install.ps1" goto :layout
 if not exist "%DT_ROOT%agent\DumpTriageAgent.exe" goto :layout
 if not exist "%DT_ROOT%tray\DumpTriageTray.exe" goto :layout
@@ -35,11 +40,6 @@ if not exist "%DT_ROOT%tray\DumpTriageTray.exe" goto :layout
 rem The zip's files carry the downloaded-from-the-internet mark; clear it on the zip's own folders only, so the
 rem installed exes don't meet a SmartScreen prompt when started by hand.
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPath (Join-Path $env:DT_ROOT 'installer'), (Join-Path $env:DT_ROOT 'agent'), (Join-Path $env:DT_ROOT 'tray') -Recurse -File | Unblock-File"
-
-rem Arguments go on to install.ps1 (an RMM tool already running as administrator can pass its key-file option); a UAC
-rem relaunch passes none.
-set "DT_ARGS=%*"
-if /i "%~1"=="--elevated" set "DT_ARGS="
 
 rem A first install asks for the key (install.ps1's masked prompt); a reinstall keeps it unless asked to replace it.
 set "DT_KEY="
@@ -62,12 +62,12 @@ if "%DT_EXIT%"=="0" (
     echo blocked by policy, a Group Policy or Smart App Control on this PC refuses unsigned scripts: install through
     echo your IT department, or see README.md.
 )
-pause
+if not defined DT_ARGS pause
 exit /b %DT_EXIT%
 
 :layout
 echo Install.cmd runs from the extracted release zip ^(dumptriage-agent-windows-x64.zip^): installer\, agent\ and
 echo tray\ must be next to it. Extract the whole zip ^(right-click, Extract All^), then run Install.cmd from the
 echo extracted folder.
-pause
+if not defined DT_ARGS pause
 exit /b 1

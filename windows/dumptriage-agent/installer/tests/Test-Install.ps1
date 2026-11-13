@@ -117,7 +117,7 @@ Assert-Equal (@('AgentPublishDir', 'TrayPublishDir', 'PromptForApiKey') | Where-
 Assert-Equal ($launcher -match '(?i)-ApiKey|dts_') $false "Install.cmd passes no API key (install.ps1 prompts for it)"
 # The UAC relaunch starts cmd.exe with the path in doubled quotes: the .cmd's own runas verb (cmd /C "%1") loses the
 # quotes on a path with ( ) or &, such as a second download's "dumptriage-agent-windows-x64 (1)".
-Assert-Equal $launcher.Contains("-FilePath `$env:ComSpec -ArgumentList ('/c ' + `$q + `$q + `$env:DT_SELF + `$q + ' --elevated' + `$q) -Verb RunAs -Wait -PassThru") $true "the UAC relaunch runs cmd.exe on the doubled-quoted path and waits for it"
+Assert-Equal $launcher.Contains("-FilePath `$env:ComSpec -ArgumentList ('/c ' + `$q + `$q + `$env:DT_SELF + `$q + ' --elevated' + `$q) -Verb RunAs -Wait -PassThru -ErrorAction Stop; exit `$p.ExitCode } catch {") $true "the UAC relaunch runs cmd.exe on the doubled-quoted path and waits for it"
 Assert-Equal ($launcher -match '(?i)Set-ExecutionPolicy') $false "Install.cmd changes no execution policy setting"
 Assert-Equal ($launcher -match '(?<!\r)\n') $false "Install.cmd has CRLF line endings"
 $release = Get-Content -Raw (Join-Path $PSScriptRoot "../../../../.github/workflows/release.yml")
