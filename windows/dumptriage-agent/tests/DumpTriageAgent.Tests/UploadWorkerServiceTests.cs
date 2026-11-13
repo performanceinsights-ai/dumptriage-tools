@@ -10,6 +10,20 @@ namespace DumpTriageAgent.Tests;
 public class UploadWorkerServiceTests
 {
     [Fact]
+    public async Task The_configured_reference_goes_with_every_dump_upload()
+    {
+        // dumptriage-tools#77: the label the report webhook echoes (website#3581).
+        await using var h = await WorkerHarness.CreateAsync(reference: " client=Acme ");
+        await h.AddDumpAsync("a.dmp");
+
+        await h.Worker.TickAsync(CancellationToken.None);
+
+        var body = Assert.Single(h.Server.Bodies);
+        Assert.Contains("name=reference", body);
+        Assert.Contains("\r\n\r\nclient=Acme\r\n", body); // trimmed
+    }
+
+    [Fact]
     public async Task Manual_submit_while_paused_queues_the_dump_without_uploading()
     {
         // website#1492: a manual submit ran fire-and-forget straight from the pipe

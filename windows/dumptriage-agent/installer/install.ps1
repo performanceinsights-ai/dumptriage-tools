@@ -28,6 +28,14 @@
     The key is never taken as a plain command-line argument: that would land
     in PowerShell history, process-creation audit logs and transcripts.
 
+.PARAMETER Reference
+    Your own label for this machine's dumps, at most 200 characters (for
+    example client=Acme): written to config.json, sent with every upload and
+    echoed in the report webhook, so one receiver can route each report to a
+    client or ticket. It is stored as written, so keep machine and user names
+    out of it. -Reference '' removes it; without -Reference a reinstall keeps
+    the one already set.
+
 .PARAMETER AgentPublishDir
     Path to the published DumpTriageAgent output (contains DumpTriageAgent.exe).
 
@@ -41,6 +49,7 @@
 param(
     [string]$ApiKeyFile,
     [switch]$PromptForApiKey,
+    [string]$Reference,
     # Removed: kept only so an old call fails with a clear message.
     [Parameter(DontShow = $true)][string]$ApiKey,
     # Pipeline input only (Get-Content key.txt | .\install.ps1 ...); refused as a named argument.
@@ -63,6 +72,16 @@ if ($ApiKey -or $keyInPath) {
 }
 if ($ApiKeyFile -and $PromptForApiKey) {
     throw "Use either -ApiKeyFile or -PromptForApiKey, not both."
+}
+# The agent refuses to start on a label the service would refuse (AgentConfig.ReferenceProblem); refuse it here first.
+$ReferenceMaxLength = 200
+function Get-ReferenceLength {
+    <# Characters as the service counts them (code points): an emoji is two UTF-16 units here and one there. #>
+    param([string]$Text)
+    ("$Text".Trim() -replace '[\uD800-\uDBFF][\uDC00-\uDFFF]', '.').Length
+}
+if ($PSBoundParameters.ContainsKey('Reference') -and (Get-ReferenceLength $Reference) -gt $ReferenceMaxLength) {
+    throw "-Reference is $(Get-ReferenceLength $Reference) characters; the most the service takes is $ReferenceMaxLength."
 }
 foreach ($dir in @($AgentPublishDir, $TrayPublishDir)) {
     if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
@@ -171,6 +190,23 @@ if ($plaintextKey) {
 }
 elseif (-not $existingService) {
     Write-Warning "No API key provided on first install. Re-run with -PromptForApiKey or -ApiKeyFile <path> before the agent can submit dumps."
+}
+
+# Sets (or, for a blank one, removes) "reference" in config.json and leaves every other setting as it is.
+function Set-ConfigReference {
+    param([string]$ConfigPath, [string]$Reference)
+    $config = if (Test-Path -LiteralPath $ConfigPath) { Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json } else { $null }
+    if (-not $config) { $config = [pscustomobject]@{} }
+    $config.PSObject.Properties.Remove('reference')
+    $text = "$Reference".Trim()
+    if ($text) { $config | Add-Member -NotePropertyName reference -NotePropertyValue $text }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ConfigPath) | Out-Null
+    # No BOM, and deep enough for policy rules and tracing triggers.
+    [IO.File]::WriteAllText($ConfigPath, ($config | ConvertTo-Json -Depth 32), [Text.UTF8Encoding]::new($false))
+}
+if ($PSBoundParameters.ContainsKey('Reference')) {
+    Write-Host "Setting the reference label in config.json..."
+    Set-ConfigReference -ConfigPath (Join-Path $DataDir 'config.json') -Reference $Reference
 }
 
 if ($existingService) {

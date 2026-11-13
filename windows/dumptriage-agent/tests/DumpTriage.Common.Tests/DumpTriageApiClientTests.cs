@@ -180,4 +180,44 @@ public class DumpTriageApiClientTests : IDisposable
 
         Assert.Equal(expected, result.Outcome);
     }
+
+    private static async Task<string> SentBody(string? reference)
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"dt-{Guid.NewGuid():N}.dmp");
+        File.WriteAllBytes(path, new byte[] { 0x4D, 0x44, 0x4D, 0x50 });
+        try
+        {
+            string? body = null;
+            var http = new HttpClient(new Scripted(async (request, ct) =>
+            {
+                body = await request.Content!.ReadAsStringAsync(ct);
+                return new HttpResponseMessage(HttpStatusCode.Created);
+            })) { BaseAddress = new Uri("https://api.example") };
+            var result = await new DumpTriageApiClient(http).UploadDumpAsync(path, "dts_key", null, reference: reference);
+            Assert.Equal(UploadOutcome.Success, result.Outcome);
+            return body!;
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task The_reference_is_sent_as_its_own_field_before_the_file()
+    {
+        // dumptriage-tools#77: the label the report webhook echoes (website#3581).
+        var body = await SentBody("client=Acme;ticket=INC-4021 é");
+
+        var field = body.IndexOf("name=reference", StringComparison.Ordinal);
+        Assert.True(field >= 0, body);
+        Assert.Contains("client=Acme;ticket=INC-4021 é", body);
+        Assert.True(field < body.IndexOf("name=file", StringComparison.Ordinal), body);
+    }
+
+    [Fact]
+    public async Task No_reference_sends_no_field()
+    {
+        Assert.DoesNotContain("name=reference", await SentBody(null));
+    }
 }

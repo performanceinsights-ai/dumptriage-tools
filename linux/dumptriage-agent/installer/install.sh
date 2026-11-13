@@ -2,7 +2,12 @@
 # Installs the DumpTriage Linux agent as a background service.
 #
 #   installer/install.sh [--api-key-file FILE | --api-key-stdin] [--policy MODE]
-#                        [--api-url URL] [--watch PATH]... [--method METHOD] [--with-perfetto] [--dry-run]
+#                        [--api-url URL] [--watch PATH]... [--reference TEXT] [--method METHOD] [--with-perfetto]
+#                        [--dry-run]
+#
+# --reference sets your own label for this host's dumps, at most 200 characters (e.g. "client=Acme"): sent with every
+#   upload and echoed in the report webhook, so one receiver can route each report to a client or ticket. It is stored
+#   as written, so keep machine and user names out of it. --reference "" removes it.
 #
 # --with-perfetto also installs `tracebox` (Perfetto's all-in-one recorder) beside the agent, for tracing.backend "perfetto":
 #   the release pinned in installer/perfetto.pin, downloaded over HTTPS and refused unless its SHA-256 is the one kept in that
@@ -19,7 +24,7 @@
 # Re-running upgrades the agent and keeps config.json, changing only the fields given as options.
 set -euo pipefail
 
-policy="" api_url="" method=auto key_file="" key_stdin=0 dry=0 with_perfetto=0
+policy="" api_url="" reference="" reference_set=0 method=auto key_file="" key_stdin=0 dry=0 with_perfetto=0
 watch=()
 here=$(cd "$(dirname "$0")" && pwd)
 agent_src=$here/../dumptriage_agent.py
@@ -34,6 +39,7 @@ while (($#)); do
     --policy) policy=${2:?}; shift 2 ;;
     --api-url) api_url=${2:?}; shift 2 ;;
     --watch) watch+=("${2:?}"); shift 2 ;;
+    --reference) (($# > 1)) || die "--reference needs a value"; reference=$2 reference_set=1; shift 2 ;;
     --method) method=${2:?}; shift 2 ;;
     --with-perfetto) with_perfetto=1; shift ;;
     --dry-run) dry=1; shift ;;
@@ -45,6 +51,8 @@ case $policy in "" | AlwaysSubmit | AskFirst | NotifyOnly | RuleBased) ;; *) die
 [[ -f $agent_src ]] || die "cannot find $agent_src"
 command -v python3 >/dev/null || die "python3 is required"
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' || die "python 3.8+ is required"
+# The agent's own check (config_reference), so a label the service would refuse stops the install, not every upload.
+python3 -c 'import sys; sys.exit(len(sys.argv[1].strip()) > 200)' "$reference" || die "--reference is over 200 characters"
 
 if ((EUID == 0)); then
   lib=/usr/local/lib/dumptriage bin=/usr/local/bin cfg=/etc/dumptriage state=/var/lib/dumptriage
@@ -131,9 +139,9 @@ fi
 
 # Config: keep what exists, set only the fields given.
 if ((!dry)); then
-  python3 - "$cfg/config.json" "$policy" "$api_url" "${watch[@]+"${watch[@]}"}" <<'PY'
+  python3 - "$cfg/config.json" "$policy" "$api_url" "$reference_set" "$reference" "${watch[@]+"${watch[@]}"}" <<'PY'
 import json, os, sys
-path, policy, api_url, *watch = sys.argv[1:]
+path, policy, api_url, reference_set, reference, *watch = sys.argv[1:]
 cfg = json.load(open(path)) if os.path.exists(path) else {}
 if policy:
     cfg.setdefault("policy", {})["mode"] = policy
@@ -141,6 +149,11 @@ elif "policy" not in cfg:
     cfg["policy"] = {"mode": "AskFirst"}
 if api_url:
     cfg["apiBaseUrl"] = api_url
+if reference_set == "1":
+    if reference.strip():
+        cfg["reference"] = reference.strip()
+    else:
+        cfg.pop("reference", None)
 if watch:
     cfg["watchedPaths"] = watch
 elif "watchedPaths" not in cfg and os.geteuid() != 0:

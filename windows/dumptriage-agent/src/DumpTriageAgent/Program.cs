@@ -95,6 +95,12 @@ Log.Logger = new LoggerConfiguration()
 try
 {
     var config = await ConfigLoader.LoadOrCreateDefaultAsync(configPath);
+    if (config.ReferenceProblem() is { } referenceProblem)
+    {
+        // Every upload would be refused for good (422 reference_too_long): stop here, where it shows.
+        Log.Fatal("{ConfigPath}: {Problem}", configPath, referenceProblem);
+        return 1;
+    }
     var queueStore = await DumpQueueStore.OpenAsync(
         dbPath, new Serilog.Extensions.Logging.SerilogLoggerFactory(Log.Logger).CreateLogger<DumpQueueStore>());
 
