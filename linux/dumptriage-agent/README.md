@@ -78,9 +78,12 @@ Restart the service to apply a change (`systemctl restart dumptriage-agent`; cro
 }
 ```
 
-`reference` is your own label for this machine's dumps, at most 200 characters, sent with each upload and echoed in the report webhook (see [`rmm/README.md`](../../rmm/README.md#one-receiver-for-every-client-reference)). Stored as written, so keep machine and user names out of it. Not sent with traces. Set it at install
-with `--reference 'client=Acme'` (`--reference ""` removes it). The agent refuses to start, and every command but
-`set-api-key` refuses to run, on one over 200 characters.
+`reference` is your own label for this machine's dumps, at most 200 characters, sent with each upload and echoed in
+the report webhook (see [`rmm/README.md`](../../rmm/README.md#one-receiver-for-every-client-reference)). It is kept in
+plain text (not hashed like the hostname), so keep machine and user names out of it. Not sent with traces. Set it at
+install with `--reference 'client=Acme'` (`--reference ""` removes it). Over 200 characters, the installer refuses it
+(also one already in config.json, on a reinstall that keeps it); the agent refuses to start (exit 78, which the systemd
+unit does not restart on), and every command but `set-api-key` refuses to run.
 
 Decision mode (`policy.mode`) decides whether a dump is submitted; timing (`policy.batching`) decides when an
 approved one is uploaded. Linux has no tray, so approvals are made on the command line:

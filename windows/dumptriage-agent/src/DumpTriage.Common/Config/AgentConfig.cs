@@ -20,7 +20,7 @@ public sealed class AgentConfig
     /// Your own label for this machine's dumps (website#3581, dumptriage-tools#77),
     /// such as "client=Acme": sent as the upload's "reference" field and echoed
     /// in the report webhook, so one receiver can route each report to a
-    /// client or ticket. Stored as written, so keep machine and user names out.
+    /// client or ticket. Kept in plain text, not hashed like the hostname, so keep machine and user names out.
     /// </summary>
     public string? Reference { get; init; }
 

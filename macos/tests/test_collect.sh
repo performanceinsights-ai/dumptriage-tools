@@ -234,6 +234,12 @@ assert_contains "$OUT" "DUMPTRIAGE_REFERENCE is 201 characters"
 assert_not_contains "$OUT" "napper"
 done_test
 
+setup a_long_reference_does_not_stop_a_trace_which_never_sends_it
+DUMPTRIAGE_REFERENCE="$(printf 'a%.0s' $(seq 201))" run "" --sample napper --dry-run
+assert_eq "$CODE" 0
+assert_not_contains "$OUT" "DUMPTRIAGE_REFERENCE"
+done_test
+
 setup a_reference_is_counted_in_characters_not_bytes
 DUMPTRIAGE_REFERENCE="$(printf '\303\251%.0s' $(seq 200))" run "" --dir "$REPORTS" --dry-run --all
 assert_eq "$CODE" 0

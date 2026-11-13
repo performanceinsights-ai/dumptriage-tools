@@ -251,7 +251,8 @@ DEFAULT_CONFIG = {
     "apiBaseUrl": "https://api.performanceinsights.ai",
     "sendHostname": True,
     # Your own label for this host's dumps (website#3581, #77), e.g. "client=Acme": sent as the upload's `reference` and
-    # echoed in the report webhook, so one receiver can route each report. Stored as written, so no machine or user names.
+    # echoed in the report webhook, so one receiver can route each report. Kept in plain text, unlike the hostname, so
+    # no machine or user names.
     "reference": None,
     "watchedPaths": ["/var/crash", "/var/lib/systemd/coredump"],
     "pollSeconds": 5,
@@ -278,6 +279,7 @@ DEFAULT_CONFIG = {
 
 
 REFERENCE_MAX = 200  # characters, as the service counts them (website#3581)
+EX_CONFIG = 78  # sysexits.h; the systemd unit does not restart on it (RestartPreventExitStatus)
 
 
 def config_reference(value):
@@ -2094,7 +2096,7 @@ def main(argv=None):
         config_reference(cfg.get("reference"))
     except ValueError as e:
         print(f"{config_dir / 'config.json'}: {e}", file=sys.stderr)
-        return 1
+        return EX_CONFIG
     if args.cmd == "trace-capture":
         if not cfg["tracing"]["enabled"]:
             print("tracing is off in the config", file=sys.stderr)

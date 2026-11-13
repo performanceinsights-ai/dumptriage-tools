@@ -17,7 +17,8 @@ done_test() { if [ "${CURRENT_FAILED:-0}" -eq 0 ]; then printf 'ok   %s\n' "$CUR
 
 if ((EUID == 0)); then echo "run as a normal user: as root install.sh writes /etc"; exit 1; fi
 mkdir -p "$WORK/bin"
-printf '#!/bin/sh\ncat >/dev/null\n' >"$WORK/bin/crontab"
+# `crontab -l` lists nothing (and must not read stdin, a terminal when run by hand); `crontab -` swallows the new table.
+printf '#!/bin/sh\n[ "$1" = -l ] && exit 1\ncat >/dev/null\n' >"$WORK/bin/crontab"
 chmod +x "$WORK/bin/crontab"
 
 setup() { CURRENT=$1 CURRENT_FAILED=0; H="$WORK/$1"; mkdir -p "$H"; }
@@ -51,7 +52,7 @@ done_test
 setup over_200_characters_is_refused_before_anything_is_installed
 install_ --reference "$(printf 'a%.0s' $(seq 201))"
 assert_eq "$CODE" 1
-assert_contains "$OUT" "--reference is over 200 characters"
+assert_contains "$OUT" "install.sh: --reference: reference is 201 characters"
 [ -e "$H/.config/dumptriage" ] && fail "the install went ahead"
 done_test
 
@@ -66,9 +67,14 @@ python3 - "$H/.config/dumptriage/config.json" <<'PY'
 import json, sys
 cfg = json.load(open(sys.argv[1])); cfg["reference"] = "a" * 201; json.dump(cfg, open(sys.argv[1], "w"))
 PY
-OUT=$(HOME="$H" "$H/.local/bin/dumptriage-agent" status 2>&1); CODE=$?
-assert_eq "$CODE" 1
+OUT=$(env -u XDG_CONFIG_HOME -u XDG_STATE_HOME HOME="$H" "$H/.local/bin/dumptriage-agent" status 2>&1); CODE=$?
+assert_eq "$CODE" 78
 assert_contains "$OUT" "reference is 201 characters"
+# and a reinstall that would keep it says so before it changes anything
+install_ --policy AlwaysSubmit
+assert_eq "$CODE" 1
+assert_contains "$OUT" "config.json: reference is 201 characters"
+assert_eq "$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["policy"]["mode"])' "$H/.config/dumptriage/config.json")" "AskFirst"
 done_test
 
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"

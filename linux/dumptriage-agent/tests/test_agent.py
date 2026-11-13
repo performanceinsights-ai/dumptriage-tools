@@ -133,14 +133,17 @@ class AgentTests(AgentTestBase):
         self.settle(a)
         self.assertEqual(self.uploader.references, ["client=Acme"])
 
-    def test_sends_no_reference_by_default_or_for_a_blank_one(self):
-        for over in ({}, {"reference": "   "}):
-            with self.subTest(over=over):
-                self.setUp()
-                (self.watch / "core.a.1.2").write_bytes(USER_CORE)
-                a = self.agent(**over)
-                self.settle(a)
-                self.assertEqual(self.uploader.references, [None])
+    def test_sends_no_reference_by_default(self):
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent()
+        self.settle(a)
+        self.assertEqual(self.uploader.references, [None])
+
+    def test_sends_no_reference_for_a_blank_one(self):
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent(reference="   ")
+        self.settle(a)
+        self.assertEqual(self.uploader.references, [None])
 
     def test_a_reference_the_service_would_refuse_stops_the_agent_at_load(self):
         for bad in ("a" * 201, 42):

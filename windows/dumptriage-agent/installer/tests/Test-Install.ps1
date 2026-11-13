@@ -133,6 +133,10 @@ foreach ($name in @("Get-ReferenceLength", "Set-ConfigReference")) {
 Assert-Equal (Get-ReferenceLength "  client=Acme ") 11 "the reference is trimmed before it is counted"
 Assert-Equal (Get-ReferenceLength ([string]::Concat(@([char]::ConvertFromUtf32(0x1F600)) * 200))) 200 "an emoji counts once, as the service counts it"
 Assert-Equal ($ast.Extent.Text -match "\(Get-ReferenceLength \`$Reference\) -gt \`$ReferenceMaxLength\) \{\s*throw") $true "a -Reference over 200 characters is refused"
+Assert-Equal ($ast.Extent.Text -match "\(Get-ReferenceLength \`$stored\) -gt \`$ReferenceMaxLength\) \{\s*throw") $true "a reinstall that keeps a stored label over 200 characters is refused too"
+# Windows PowerShell 5.1's Get-Content reads a BOM-less file as the ANSI code page; written back as UTF-8 that garbles it.
+$setFn = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "Set-ConfigReference" }, $true) | Select-Object -First 1
+Assert-Equal ($setFn.Extent.Text -match 'Get-Content\s+-') $false "Set-ConfigReference reads config.json as UTF-8 (ReadAllText), not with Get-Content"
 
 $configDir = Join-Path ([System.IO.Path]::GetTempPath()) "install-test-cfg-$([guid]::NewGuid())"
 $configPath = Join-Path $configDir "config.json"
@@ -147,6 +151,11 @@ try {
     Assert-Equal $after.reference "client=Beta;ticket=INC-1" "a reinstall replaces the label"
     Assert-Equal "$($after.protectedApiKey)|$($after.policy.rules[0].dumpType)|$($after.tracing.triggers[0].threshold)" "AQAA|Kernel|90" "and keeps the key, the rules and the triggers"
     Assert-Equal ([IO.File]::ReadAllBytes($configPath)[0]) ([byte][char]'{') "config.json is written without a byte-order mark"
+
+    [IO.File]::WriteAllText($configPath, '{"watchedPaths":["D:\\Soci\u00e9t\u00e9"]}', [Text.UTF8Encoding]::new($false))
+    Set-ConfigReference -ConfigPath $configPath -Reference "client=Caf$([char]0xE9)"
+    $after = [IO.File]::ReadAllText($configPath) | ConvertFrom-Json
+    Assert-Equal "$($after.watchedPaths[0])|$($after.reference)" "D:\Soci$([char]0xE9)t$([char]0xE9)|client=Caf$([char]0xE9)" "non-ASCII paths and labels come through unchanged"
 
     Set-ConfigReference -ConfigPath $configPath -Reference ""
     Assert-Equal ((Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json).PSObject.Properties.Name -contains "reference") $false "-Reference '' removes it"

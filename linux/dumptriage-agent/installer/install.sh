@@ -6,8 +6,8 @@
 #                        [--dry-run]
 #
 # --reference sets your own label for this host's dumps, at most 200 characters (e.g. "client=Acme"): sent with every
-#   upload and echoed in the report webhook, so one receiver can route each report to a client or ticket. It is stored
-#   as written, so keep machine and user names out of it. --reference "" removes it.
+#   upload and echoed in the report webhook, so one receiver can route each report to a client or ticket. It is kept in plain
+#   text (not hashed like the hostname), so keep machine and user names out of it. --reference "" removes it.
 #
 # --with-perfetto also installs `tracebox` (Perfetto's all-in-one recorder) beside the agent, for tracing.backend "perfetto":
 #   the release pinned in installer/perfetto.pin, downloaded over HTTPS and refused unless its SHA-256 is the one kept in that
@@ -51,8 +51,6 @@ case $policy in "" | AlwaysSubmit | AskFirst | NotifyOnly | RuleBased) ;; *) die
 [[ -f $agent_src ]] || die "cannot find $agent_src"
 command -v python3 >/dev/null || die "python3 is required"
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' || die "python 3.8+ is required"
-# The agent's own check (config_reference), so a label the service would refuse stops the install, not every upload.
-python3 -c 'import sys; sys.exit(len(sys.argv[1].strip()) > 200)' "$reference" || die "--reference is over 200 characters"
 
 if ((EUID == 0)); then
   lib=/usr/local/lib/dumptriage bin=/usr/local/bin cfg=/etc/dumptriage state=/var/lib/dumptriage
@@ -64,6 +62,23 @@ else
 fi
 agent=$lib/dumptriage_agent.py
 cli=$bin/dumptriage-agent
+
+# The label to keep (--reference, or on a reinstall without it the stored one), checked with the agent's own
+# config_reference before anything changes: the agent refuses to start on one the service would refuse.
+python3 -I - "$agent_src" "$reference_set" "$reference" "$cfg/config.json" <<'PY' || exit 1
+import importlib.util, json, os, sys
+src, reference_set, reference, path = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("dumptriage_agent", src)
+agent = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(agent)
+where = "--reference"
+if reference_set != "1":
+    reference, where = (json.load(open(path)).get("reference") if os.path.exists(path) else None), path
+try:
+    agent.config_reference(reference)
+except ValueError as e:
+    sys.exit(f"install.sh: {where}: {e}")
+PY
 
 if [[ $method == auto ]]; then
   if ((EUID == 0)) && [[ -d /run/systemd/system ]]; then method=systemd-system
@@ -179,6 +194,8 @@ Wants=network-online.target
 ExecStart=$cli run
 Restart=always
 RestartSec=10
+# A config the agent refuses (EX_CONFIG): restarting changes nothing until it is edited.
+RestartPreventExitStatus=78
 Nice=10
 IOSchedulingClass=idle
 NoNewPrivileges=yes
