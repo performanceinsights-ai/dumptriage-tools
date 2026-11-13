@@ -212,6 +212,33 @@ assert_contains "$OUT" "Not sent."
 assert_eq "$(grep -c '^curl' "$LOG")" 0
 done_test
 
+setup the_reference_goes_with_each_report_before_the_file
+DUMPTRIAGE_REFERENCE="  client=Acme Corp;ticket=INC-4021 " run "y
+" --dir "$REPORTS" --all
+assert_eq "$CODE" 0
+assert_eq "$(grep -c '^curl.*\[--form-string\] \[reference=client=Acme Corp;ticket=INC-4021\] \[-F\] \[file=@' "$LOG")" 3
+done_test
+
+setup no_reference_sends_no_field
+DUMPTRIAGE_REFERENCE="   " run "y
+" --dir "$REPORTS" --all
+assert_eq "$CODE" 0
+assert_eq "$(grep -c '^curl' "$LOG")" 3
+assert_not_contains "$(cat "$LOG")" "reference="
+done_test
+
+setup a_reference_over_200_characters_is_refused_before_anything_is_listed
+DUMPTRIAGE_REFERENCE="$(printf 'a%.0s' $(seq 201))" run "" --dir "$REPORTS" --dry-run
+assert_eq "$CODE" 2
+assert_contains "$OUT" "DUMPTRIAGE_REFERENCE is 201 characters"
+assert_not_contains "$OUT" "napper"
+done_test
+
+setup a_reference_is_counted_in_characters_not_bytes
+DUMPTRIAGE_REFERENCE="$(printf '\303\251%.0s' $(seq 200))" run "" --dir "$REPORTS" --dry-run --all
+assert_eq "$CODE" 0
+done_test
+
 setup an_empty_choice_sends_nothing
 run "
 " --dir "$REPORTS"

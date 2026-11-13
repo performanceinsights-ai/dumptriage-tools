@@ -48,6 +48,9 @@
 #                           security add-generic-password -U -s dumptriage -a "$USER" -w
 #                           No account yet? Run this anyway: it says where to sign up.
 #   DUMPTRIAGE_PORTAL_URL   where report links point. Default: DUMPTRIAGE_API_URL
+#   DUMPTRIAGE_REFERENCE    your own label for the reports this run sends, at most 200 characters (e.g.
+#                           client=Acme), echoed in the report webhook so one receiver can route each report.
+#                           Stored as written, so keep machine and user names out of it. Not sent with traces.
 #   DUMPTRIAGE_TRACING_CONFIG  the --watch-once config. Default: ~/.config/dumptriage/tracing.json
 #   DUMPTRIAGE_STATE_DIR    where --watch-once keeps its state and held captures.
 #                           Default: ~/.config/dumptriage/tracing-state
@@ -136,6 +139,17 @@ while [ $# -gt 0 ]; do
         *) die "unknown option '$1' (see --help)" 2 ;;
     esac
 done
+
+# The reference label (dumptriage-tools#77), trimmed. Refused here, before anything is listed or sent, when the
+# service would refuse it (422 reference_too_long). Counted in characters as the service counts them: the UTF-8 bytes
+# that are not continuation bytes, whatever the locale.
+REFERENCE=${DUMPTRIAGE_REFERENCE:-}
+REFERENCE=${REFERENCE#"${REFERENCE%%[![:space:]]*}"}
+REFERENCE=${REFERENCE%"${REFERENCE##*[![:space:]]}"}
+reference_chars=$(printf '%s' "$REFERENCE" | LC_ALL=C tr -d '\200-\277' | wc -c | tr -d ' ')
+if [ "$reference_chars" -gt 200 ]; then
+    die "DUMPTRIAGE_REFERENCE is $reference_chars characters; the most the service takes is 200" 2
+fi
 
 if [ ${#DIRS[@]} -eq 0 ]; then
     DIRS=("$HOME/Library/Logs/DiagnosticReports" "/Library/Logs/DiagnosticReports")
@@ -934,7 +948,8 @@ upload() {
         {
             printf 'header = "Authorization: Bearer %s"\n' "$KEY"
             [ -n "$sha_header" ] && printf 'header = "%s"\n' "$sha_header"
-        } | curl -sS -K - -H 'Expect:' -F "file=@$file" -w '\n%{http_code}' "${API_URL%/}/api/v1/dumps"
+        } | curl -sS -K - -H 'Expect:' ${REFERENCE:+--form-string "reference=$REFERENCE"} -F "file=@$file" \
+            -w '\n%{http_code}' "${API_URL%/}/api/v1/dumps"
     )
     status=$(printf '%s\n' "$response" | tail -n 1)
     body=$(printf '%s\n' "$response" | sed '$d')

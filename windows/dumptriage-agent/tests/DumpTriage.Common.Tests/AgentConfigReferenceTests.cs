@@ -22,6 +22,24 @@ public class AgentConfigReferenceTests
         }
     }
 
+    [Fact]
+    public async Task Saving_the_config_writes_the_label_as_set_and_nothing_derived_from_it()
+    {
+        // ConfigLoader.SaveAsync runs on every --set-api-key-stdin, so it must keep the label and add nothing.
+        var path = Path.Combine(Path.GetTempPath(), "dt-cfg-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            await ConfigLoader.SaveAsync(path, new AgentConfig { Reference = "client=Acme" });
+            var json = File.ReadAllText(path);
+            Assert.Contains("\"reference\": \"client=Acme\"", json);
+            Assert.DoesNotContain("referenceToSend", json, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData("")]

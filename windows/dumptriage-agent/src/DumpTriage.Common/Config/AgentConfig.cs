@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using DumpTriage.Common.Policy;
 
 namespace DumpTriage.Common.Config;
@@ -26,7 +27,8 @@ public sealed class AgentConfig
     /// <summary>The most characters the service takes in <see cref="Reference"/>; it refuses more with a 422 that fails every dump.</summary>
     public const int ReferenceMaxLength = 200;
 
-    /// <summary>The reference to send, trimmed, or null for none.</summary>
+    /// <summary>The reference to send, trimmed, or null for none. Not a setting, so never written to config.json.</summary>
+    [JsonIgnore]
     public string? ReferenceToSend => string.IsNullOrWhiteSpace(Reference) ? null : Reference.Trim();
 
     /// <summary>
