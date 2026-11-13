@@ -1,0 +1,2 @@
+# cmd.exe misreads some LF-only batch files (labels, multi-line blocks), so a .cmd keeps CRLF in every checkout (#80).
+*.cmd text eol=crlf

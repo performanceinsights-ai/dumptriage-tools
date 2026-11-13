@@ -7,9 +7,10 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-  # A change to this file builds everything without publishing, so a broken package shows up before a tag.
+  # A change to this file or the Windows installer builds everything without publishing (and runs Install.cmd from
+  # the built zip), so a broken package shows up before a tag.
   pull_request:
-    paths: [".github/workflows/release.yml"]
+    paths: [".github/workflows/release.yml", "windows/dumptriage-agent/installer/**"]
 
 permissions:
   contents: read
@@ -33,8 +34,30 @@ jobs:
           dotnet publish src/DumpTriageTray -c Release -r win-x64 --self-contained -o "$out\tray"
           Copy-Item -Recurse installer -Destination "$out\installer"
           Remove-Item -Recurse -Force "$out\installer\linux" -ErrorAction SilentlyContinue
+          # The double-click launcher sits at the zip root, beside agent\, tray\ and installer\ (#80).
+          Move-Item "$out\installer\Install.cmd" "$out\Install.cmd"
           Copy-Item README.md, ..\..\LICENSE -Destination $out
           Compress-Archive -Path "$out\*" -DestinationPath "$env:RUNNER_TEMP\dumptriage-agent-windows-x64.zip"
+      - name: Install.cmd installs the agent from the extracted zip, uninstall.ps1 removes it (#80)
+        shell: pwsh
+        run: |
+          $dir = "$env:RUNNER_TEMP\zip-check"
+          Expand-Archive "$env:RUNNER_TEMP\dumptriage-agent-windows-x64.zip" -DestinationPath $dir
+          # The runner is already elevated, so this takes Install.cmd's install path, not the UAC relaunch. A key file
+          # (passed on to install.ps1) instead of the masked prompt, which reads the console, not stdin, and would hang
+          # here; empty stdin answers the closing `pause`. Runner paths have no spaces, so nothing is quoted.
+          $keyFile = "$env:RUNNER_TEMP\ci-key.txt"
+          Set-Content -Path $keyFile -Value "dts_ci_not_a_real_key" -NoNewline
+          $noInput = New-Item -ItemType File "$env:RUNNER_TEMP\no-input.txt" -Force
+          $run = Start-Process cmd.exe -ArgumentList "/c $dir\Install.cmd -ApiKeyFile $keyFile" -RedirectStandardInput $noInput -NoNewWindow -Wait -PassThru
+          if ($run.ExitCode -ne 0) { throw "Install.cmd exited with $($run.ExitCode)" }
+          if (Test-Path $keyFile) { throw "install.ps1 did not store the key (the key file is still there)" }
+          if ((Get-Content -Raw "$env:ProgramData\DumpTriage\config.json") -match 'dts_ci_not_a_real_key') { throw "the key is in config.json in plaintext" }
+          $service = Get-Service DumpTriageAgent
+          if ($service.Status -ne 'Running') { throw "DumpTriageAgent is $($service.Status), not Running" }
+          Get-ScheduledTask -TaskName DumpTriageTray | Out-Null
+          & "$dir\installer\uninstall.ps1" -RemoveData
+          if (Get-Service DumpTriageAgent -ErrorAction SilentlyContinue) { throw "uninstall.ps1 left the service" }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-agent

@@ -82,8 +82,24 @@ curl -X DELETE https://api.performanceinsights.ai/api/v1/customers/me/api-keys/<
   -H "Authorization: Bearer <primary key>"
 ```
 
+From the release zip (`dumptriage-agent-windows-x64.zip`): extract the whole
+zip, then double-click **`Install.cmd`** in the extracted folder. It asks for
+administrator rights, then runs `installer\install.ps1` with the PowerShell
+execution policy bypassed for that one process (no setting on the machine
+changes), so nobody has to open PowerShell. The window stays open at the end
+so you can read the result; run it again to replace the API key. From an
+elevated prompt or an RMM tool, arguments are passed on to `install.ps1`
+(`Install.cmd -ApiKeyFile key.txt`). Where a Group Policy or Smart App Control refuses
+unsigned scripts, it still fails: the scripts and binaries are not signed yet
+(#22), so on such a machine the install goes through IT. A signed
+point-and-click installer is #79.
+
+From an elevated PowerShell prompt, which is what `Install.cmd` runs (in the
+zip the folders are `.\agent` and `.\tray`; from a source build, the publish
+folders):
+
 ```powershell
-.\installer\install.ps1 -AgentPublishDir .\publish\agent -TrayPublishDir .\publish\tray
+powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\install.ps1 -AgentPublishDir .\publish\agent -TrayPublishDir .\publish\tray
 ```
 
 On a first install the script asks for the API key at a masked prompt. For an
@@ -310,5 +326,5 @@ the release) takes one capture in file mode while you reproduce the problem, wri
   mode on unattended machines) — scoped out of v1.
 - Central-copy failures aren't retried; only the API submission has retry/
   backoff via the queue.
-- No MSI — `installer/install.ps1` is the v1 install path. A WiX MSI is a
-  reasonable follow-up once this is validated in the field.
+- No MSI — `installer/install.ps1` (started by `Install.cmd` in the zip) is the
+  v1 install path. A signed MSI or setup.exe is #79, after signing (#22).
