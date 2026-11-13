@@ -7,9 +7,10 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-  # A change to this file builds everything without publishing, so a broken package shows up before a tag.
+  # A change to this file or the Windows installer builds everything without publishing (and runs Install.cmd from
+  # the built zip), so a broken package shows up before a tag.
   pull_request:
-    paths: [".github/workflows/release.yml"]
+    paths: [".github/workflows/release.yml", "windows/dumptriage-agent/installer/**"]
 
 permissions:
   contents: read
