@@ -36,15 +36,22 @@ rem The zip's files carry the downloaded-from-the-internet mark; clear it on the
 rem installed exes don't meet a SmartScreen prompt when started by hand.
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPath (Join-Path $env:DT_ROOT 'installer'), (Join-Path $env:DT_ROOT 'agent'), (Join-Path $env:DT_ROOT 'tray') -Recurse -File | Unblock-File"
 
+rem Arguments go on to install.ps1 (an RMM tool already running as administrator can pass its key-file option); a UAC
+rem relaunch passes none.
+set "DT_ARGS=%*"
+if /i "%~1"=="--elevated" set "DT_ARGS="
+
 rem A first install asks for the key (install.ps1's masked prompt); a reinstall keeps it unless asked to replace it.
 set "DT_KEY="
+if defined DT_ARGS goto :install
 sc.exe query DumpTriageAgent >nul 2>&1
 if not errorlevel 1 (
     choice /c YN /n /m "The DumpTriage agent is already installed. Enter a new API key? [Y/N] "
     if not errorlevel 2 set "DT_KEY=-PromptForApiKey"
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%DT_ROOT%installer\install.ps1" -AgentPublishDir "%DT_ROOT%agent" -TrayPublishDir "%DT_ROOT%tray" %DT_KEY%
+:install
+powershell -NoProfile -ExecutionPolicy Bypass -File "%DT_ROOT%installer\install.ps1" -AgentPublishDir "%DT_ROOT%agent" -TrayPublishDir "%DT_ROOT%tray" %DT_KEY% %DT_ARGS%
 set "DT_EXIT=%errorlevel%"
 
 echo.

@@ -87,7 +87,9 @@ zip, then double-click **`Install.cmd`** in the extracted folder. It asks for
 administrator rights, then runs `installer\install.ps1` with the PowerShell
 execution policy bypassed for that one process (no setting on the machine
 changes), so nobody has to open PowerShell. The window stays open at the end
-so you can read the result. Where a Group Policy or Smart App Control refuses
+so you can read the result; run it again to replace the API key. From an
+elevated prompt or an RMM tool, arguments are passed on to `install.ps1`
+(`Install.cmd -ApiKeyFile key.txt`). Where a Group Policy or Smart App Control refuses
 unsigned scripts, it still fails: the scripts and binaries are not signed yet
 (#22), so on such a machine the install goes through IT. A signed
 point-and-click installer is #79.

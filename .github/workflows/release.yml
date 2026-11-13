@@ -43,11 +43,16 @@ jobs:
         run: |
           $dir = "$env:RUNNER_TEMP\zip-check"
           Expand-Archive "$env:RUNNER_TEMP\dumptriage-agent-windows-x64.zip" -DestinationPath $dir
-          # The runner is already elevated, so this takes Install.cmd's install path, not the UAC relaunch. Empty
-          # stdin answers its closing `pause`; with no key given the agent installs and waits for one.
+          # The runner is already elevated, so this takes Install.cmd's install path, not the UAC relaunch. A key file
+          # (passed on to install.ps1) instead of the masked prompt, which reads the console, not stdin, and would hang
+          # here; empty stdin answers the closing `pause`. Runner paths have no spaces, so nothing is quoted.
+          $keyFile = "$env:RUNNER_TEMP\ci-key.txt"
+          Set-Content -Path $keyFile -Value "dts_ci_not_a_real_key" -NoNewline
           $noInput = New-Item -ItemType File "$env:RUNNER_TEMP\no-input.txt" -Force
-          $run = Start-Process cmd.exe -ArgumentList '/c', "`"$dir\Install.cmd`"" -RedirectStandardInput $noInput -NoNewWindow -Wait -PassThru
+          $run = Start-Process cmd.exe -ArgumentList "/c $dir\Install.cmd -ApiKeyFile $keyFile" -RedirectStandardInput $noInput -NoNewWindow -Wait -PassThru
           if ($run.ExitCode -ne 0) { throw "Install.cmd exited with $($run.ExitCode)" }
+          if (Test-Path $keyFile) { throw "install.ps1 did not store the key (the key file is still there)" }
+          if ((Get-Content -Raw "$env:ProgramData\DumpTriage\config.json") -match 'dts_ci_not_a_real_key') { throw "the key is in config.json in plaintext" }
           $service = Get-Service DumpTriageAgent
           if ($service.Status -ne 'Running') { throw "DumpTriageAgent is $($service.Status), not Running" }
           Get-ScheduledTask -TaskName DumpTriageTray | Out-Null
