@@ -2,7 +2,12 @@
 # Installs the DumpTriage Linux agent as a background service.
 #
 #   installer/install.sh [--api-key-file FILE | --api-key-stdin] [--policy MODE]
-#                        [--api-url URL] [--watch PATH]... [--method METHOD] [--with-perfetto] [--dry-run]
+#                        [--api-url URL] [--watch PATH]... [--reference TEXT] [--method METHOD] [--with-perfetto]
+#                        [--dry-run]
+#
+# --reference sets your own label for this host's dumps, at most 200 characters (e.g. "client=Acme"): sent with every
+#   upload and echoed in the report webhook, so one receiver can route each report to a client or ticket. It is kept in plain
+#   text (not hashed like the hostname), so keep machine and user names out of it. --reference "" removes it.
 #
 # --with-perfetto also installs `tracebox` (Perfetto's all-in-one recorder) beside the agent, for tracing.backend "perfetto":
 #   the release pinned in installer/perfetto.pin, downloaded over HTTPS and refused unless its SHA-256 is the one kept in that
@@ -19,7 +24,7 @@
 # Re-running upgrades the agent and keeps config.json, changing only the fields given as options.
 set -euo pipefail
 
-policy="" api_url="" method=auto key_file="" key_stdin=0 dry=0 with_perfetto=0
+policy="" api_url="" reference="" reference_set=0 method=auto key_file="" key_stdin=0 dry=0 with_perfetto=0
 watch=()
 here=$(cd "$(dirname "$0")" && pwd)
 agent_src=$here/../dumptriage_agent.py
@@ -34,6 +39,7 @@ while (($#)); do
     --policy) policy=${2:?}; shift 2 ;;
     --api-url) api_url=${2:?}; shift 2 ;;
     --watch) watch+=("${2:?}"); shift 2 ;;
+    --reference) (($# > 1)) || die "--reference needs a value"; reference=$2 reference_set=1; shift 2 ;;
     --method) method=${2:?}; shift 2 ;;
     --with-perfetto) with_perfetto=1; shift ;;
     --dry-run) dry=1; shift ;;
@@ -56,6 +62,23 @@ else
 fi
 agent=$lib/dumptriage_agent.py
 cli=$bin/dumptriage-agent
+
+# The label to keep (--reference, or on a reinstall without it the stored one), checked with the agent's own
+# config_reference before anything changes: the agent refuses to start on one the service would refuse.
+python3 -I - "$agent_src" "$reference_set" "$reference" "$cfg/config.json" <<'PY' || exit 1
+import importlib.util, json, os, sys
+src, reference_set, reference, path = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("dumptriage_agent", src)
+agent = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(agent)
+where = "--reference"
+if reference_set != "1":
+    reference, where = (json.load(open(path)).get("reference") if os.path.exists(path) else None), path
+try:
+    agent.config_reference(reference)
+except ValueError as e:
+    sys.exit(f"install.sh: {where}: {e}")
+PY
 
 if [[ $method == auto ]]; then
   if ((EUID == 0)) && [[ -d /run/systemd/system ]]; then method=systemd-system
@@ -131,9 +154,9 @@ fi
 
 # Config: keep what exists, set only the fields given.
 if ((!dry)); then
-  python3 - "$cfg/config.json" "$policy" "$api_url" "${watch[@]+"${watch[@]}"}" <<'PY'
+  python3 - "$cfg/config.json" "$policy" "$api_url" "$reference_set" "$reference" "${watch[@]+"${watch[@]}"}" <<'PY'
 import json, os, sys
-path, policy, api_url, *watch = sys.argv[1:]
+path, policy, api_url, reference_set, reference, *watch = sys.argv[1:]
 cfg = json.load(open(path)) if os.path.exists(path) else {}
 if policy:
     cfg.setdefault("policy", {})["mode"] = policy
@@ -141,6 +164,11 @@ elif "policy" not in cfg:
     cfg["policy"] = {"mode": "AskFirst"}
 if api_url:
     cfg["apiBaseUrl"] = api_url
+if reference_set == "1":
+    if reference.strip():
+        cfg["reference"] = reference.strip()
+    else:
+        cfg.pop("reference", None)
 if watch:
     cfg["watchedPaths"] = watch
 elif "watchedPaths" not in cfg and os.geteuid() != 0:
@@ -166,6 +194,8 @@ Wants=network-online.target
 ExecStart=$cli run
 Restart=always
 RestartSec=10
+# A config the agent refuses (EX_CONFIG): restarting changes nothing until it is edited.
+RestartPreventExitStatus=78
 Nice=10
 IOSchedulingClass=idle
 NoNewPrivileges=yes

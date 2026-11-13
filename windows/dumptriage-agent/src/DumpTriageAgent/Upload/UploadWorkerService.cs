@@ -326,7 +326,7 @@ public sealed class UploadWorkerService : BackgroundService
                 ? await _apiClient.UploadTraceAsync(
                     record.FilePath, record.Manifest ?? "{}", apiKey, hostnameHash, record.Sha256 ?? record.Id, stoppingToken)
                 : await _apiClient.UploadDumpAsync(
-                    record.FilePath, apiKey, hostnameHash, record.Sha256 ?? record.Id, stoppingToken);
+                    record.FilePath, apiKey, hostnameHash, record.Sha256 ?? record.Id, _config.ReferenceToSend, stoppingToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

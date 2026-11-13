@@ -18,6 +18,9 @@ internal sealed class FakeServer : HttpMessageHandler
 {
     public List<(HttpRequestMessage Request, long BodyBytes)> Requests { get; } = new();
 
+    /// <summary>Each request's body as text, in order (the dump bytes come out garbled; the form fields read fine).</summary>
+    public List<string> Bodies { get; } = new();
+
     public Func<HttpRequestMessage, Task<HttpResponseMessage>> Respond { get; set; } =
         _ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.Created) { Content = new StringContent("{}") });
 
@@ -33,6 +36,7 @@ internal sealed class FakeServer : HttpMessageHandler
     {
         var body = request.Content is null ? Array.Empty<byte>() : await request.Content.ReadAsByteArrayAsync(cancellationToken);
         Requests.Add((request, body.LongLength));
+        Bodies.Add(System.Text.Encoding.UTF8.GetString(body));
         return await Respond(request);
     }
 }
@@ -62,7 +66,7 @@ internal sealed class WorkerHarness : IAsyncDisposable
     /// flushes. True: a fresh install, which waits for its first slot (dumptriage-tools#9).
     /// </param>
     public static async Task<WorkerHarness> CreateAsync(
-        CentralCopyConfig? centralCopy = null, BatchingConfig? batching = null, bool firstRun = false)
+        CentralCopyConfig? centralCopy = null, BatchingConfig? batching = null, bool firstRun = false, string? reference = null)
     {
         var dir = Path.Combine(Path.GetTempPath(), "dt-agent-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
@@ -76,6 +80,7 @@ internal sealed class WorkerHarness : IAsyncDisposable
         var config = new AgentConfig
         {
             ProtectedApiKey = "dts_key",
+            Reference = reference,
             CentralCopy = centralCopy ?? new CentralCopyConfig(),
             Policy = new AgentPolicyConfig { Batching = batching ?? new BatchingConfig() },
         };

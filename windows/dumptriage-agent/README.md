@@ -136,6 +136,7 @@ first; delete it and reinstall.
 {
   "apiBaseUrl": "https://api.performanceinsights.ai",
   "sendHostname": true,
+  "reference": "client=Acme",     // optional; see below
   "watchedPaths": ["%LOCALAPPDATA%\\CrashDumps", "%WINDIR%\\Minidump", "%WINDIR%"],
   "watchedFilters": ["*.dmp", "MEMORY.DMP"],
   "startupScanMaxAgeDays": 30,    // on start, also look at dumps already there from the last N days; 0 = off
@@ -179,6 +180,20 @@ each with the time the service has left to wait for it.
 { "dumpType": "KernelMode", "action": "Ask" },
 { "pathGlob": "C:\\Dumps\\*", "action": "Submit" }
 ```
+
+`reference` is your own label for this machine's dumps, at most 200 characters,
+sent with each upload and echoed in the report webhook (see
+[`rmm/README.md`](../../rmm/README.md#one-receiver-for-every-client-reference)).
+It is kept in plain text (not hashed like the hostname), so keep machine and user
+names out of it. Not sent with traces. Set it at install with
+`-Reference 'client=Acme'` (`-Reference ''` removes it; a reinstall without it
+keeps the one set). `Install.cmd` and an RMM's command line pass the words on to
+PowerShell as they are, so use double quotes there:
+`.\Install.cmd -ApiKeyFile C:\Temp\key.txt -Reference "client=Acme;ticket=INC-4021"`
+(single quotes would become part of the label). Over 200 characters, the
+installer refuses it (also one already in config.json, on a reinstall that keeps
+it), and the service refuses to start and says why in the event log, rather than
+have every upload refused.
 
 `centralCopy`, when enabled, copies every approved dump to
 `destinationPath\<hostname>\` (a plain file copy — works for a UNC share or a

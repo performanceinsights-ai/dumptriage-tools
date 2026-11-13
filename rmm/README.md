@@ -62,11 +62,9 @@ The [API reference](https://performanceinsights.ai/api-docs/) has the rest.
 | OS | Use | Notes |
 |---|---|---|
 | Windows | [`ninjaone/Invoke-DumpTriageCollect.ps1`](ninjaone/Invoke-DumpTriageCollect.ps1) | Runs in any RMM that can run PowerShell as SYSTEM, not only NinjaOne. Outside NinjaOne it reads the key from `DUMPTRIAGE_API_KEY`; set `DUMPTRIAGE_REFERENCE` or pass `-Reference`. Exit codes 0 to 3 tell the RMM what happened. It writes the link with `Ninja-Property-Set` only where that exists, so in another RMM read the link from its output |
-| Windows, always on | [`windows/dumptriage-agent`](../windows/dumptriage-agent/README.md) | A service that watches for dumps. Unattended install with `-ApiKeyFile` |
-| Linux | [`linux/dumptriage-agent`](../linux/dumptriage-agent/README.md) | A service or cron job, installed unattended with `--api-key-file` or `--api-key-stdin`. Or the `curl` above over the files in `/var/crash` |
-| macOS | the `curl` above | [`macos/dumptriage-collect.sh`](../macos/dumptriage-collect.sh) asks before it sends, so it is not for unattended runs |
-
-The two agents do not take a `reference` yet, and the macOS script does not either.
+| Windows, always on | [`windows/dumptriage-agent`](../windows/dumptriage-agent/README.md) | A service that watches for dumps. Unattended install with `-ApiKeyFile`; `-Reference` sets the label |
+| Linux | [`linux/dumptriage-agent`](../linux/dumptriage-agent/README.md) | A service or cron job, installed unattended with `--api-key-file` or `--api-key-stdin`; `--reference` sets the label. Or the `curl` above over the files in `/var/crash` |
+| macOS | the `curl` above | [`macos/dumptriage-collect.sh`](../macos/dumptriage-collect.sh) asks before it sends, so it is not for unattended runs. It sends `DUMPTRIAGE_REFERENCE` as the label |
 
 ## One receiver for every client: `reference`
 

@@ -55,7 +55,8 @@ public sealed record UploadResult(
 /// <summary>
 /// Streams a dump file to POST /api/v1/dumps, matching the request shape the
 /// web UI already uses (service/frontend/src/api/client.ts:131-154):
-/// multipart/form-data with a "file" field and an optional "hostname" field,
+/// multipart/form-data with a "file" field and optional "hostname" and
+/// "reference" fields,
 /// bearer auth with the customer's API key. No chunked/resumable upload
 /// exists server-side yet, so this streams from disk in one shot rather than
 /// buffering — dumps can be tens of GB.
@@ -80,8 +81,9 @@ public sealed class DumpTriageApiClient
         string apiKey,
         string? hostnameHash,
         string? expectedSha256 = null,
+        string? reference = null,
         CancellationToken cancellationToken = default) =>
-        UploadAsync("/api/v1/dumps", filePath, apiKey, hostnameHash, expectedSha256, manifest: null, "application/octet-stream", cancellationToken);
+        UploadAsync("/api/v1/dumps", filePath, apiKey, hostnameHash, expectedSha256, manifest: null, reference, "application/octet-stream", cancellationToken);
 
     /// <summary>
     /// A captured performance trace (website#1999): POST /api/v1/traces with the zip as "file" and its manifest.json as
@@ -94,7 +96,7 @@ public sealed class DumpTriageApiClient
         string? hostnameHash,
         string? expectedSha256 = null,
         CancellationToken cancellationToken = default) =>
-        UploadAsync("/api/v1/traces", filePath, apiKey, hostnameHash, expectedSha256, manifestJson, "application/zip", cancellationToken);
+        UploadAsync("/api/v1/traces", filePath, apiKey, hostnameHash, expectedSha256, manifestJson, reference: null, "application/zip", cancellationToken);
 
     private async Task<UploadResult> UploadAsync(
         string route,
@@ -103,6 +105,7 @@ public sealed class DumpTriageApiClient
         string? hostnameHash,
         string? expectedSha256,
         string? manifest,
+        string? reference,
         string contentType,
         CancellationToken cancellationToken)
     {
@@ -131,6 +134,11 @@ public sealed class DumpTriageApiClient
         if (manifest is not null)
         {
             content.Add(new StringContent(manifest), "manifest");
+        }
+        if (!string.IsNullOrEmpty(reference))
+        {
+            // Before the file, so the service can refuse a bad one without reading the dump.
+            content.Add(new StringContent(reference), "reference");
         }
         content.Add(streamContent, "file", Path.GetFileName(filePath));
 

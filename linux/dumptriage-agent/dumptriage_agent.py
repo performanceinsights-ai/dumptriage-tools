@@ -250,6 +250,10 @@ def open_dump(path, roots):
 DEFAULT_CONFIG = {
     "apiBaseUrl": "https://api.performanceinsights.ai",
     "sendHostname": True,
+    # Your own label for this host's dumps (website#3581, #77), e.g. "client=Acme": sent as the upload's `reference` and
+    # echoed in the report webhook, so one receiver can route each report. Kept in plain text, unlike the hostname, so
+    # no machine or user names.
+    "reference": None,
     "watchedPaths": ["/var/crash", "/var/lib/systemd/coredump"],
     "pollSeconds": 5,
     "stableSeconds": 10,
@@ -272,6 +276,23 @@ DEFAULT_CONFIG = {
         "limits": {"maxDurationSec": 60, "maxDiskMB": 512, "maxOverheadPercent": 2, "cooldownMin": 60, "dailyCap": 4},
     },
 }
+
+
+REFERENCE_MAX = 200  # characters, as the service counts them (website#3581)
+EX_CONFIG = 78  # sysexits.h; the systemd unit does not restart on it (RestartPreventExitStatus)
+
+
+def config_reference(value):
+    """The `reference` to send, trimmed (None for none). Refused here, at config load, when the service would refuse it
+    (422 reference_too_long, which fails every dump for good)."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("reference must be text")
+    value = value.strip()
+    if len(value) > REFERENCE_MAX:
+        raise ValueError(f"reference is {len(value)} characters; the most the service takes is {REFERENCE_MAX}")
+    return value or None
 
 
 def merge(base, over):
@@ -489,15 +510,17 @@ def outcome_for(status, body, retry_after_header, rejected):
     return TRANSIENT, status, body, None
 
 
-def upload_dump(base_url, api_key, path, hostname, name=None, timeout=1800):
+def upload_dump(base_url, api_key, path, hostname, name=None, timeout=1800, reference=None):
     """Stream one file to POST /api/v1/dumps as multipart/form-data (same request
     as the web uploader and the Windows agent), named `name` (default: the path's
-    basename). Returns (outcome, status, message, retry_after)."""
+    basename), with the `reference` label when one is set. Returns (outcome, status, message, retry_after)."""
     u = urllib.parse.urlsplit(base_url)
     boundary = uuid.uuid4().hex
     pre = b""
     if hostname:
         pre += (f'--{boundary}\r\nContent-Disposition: form-data; name="hostname"\r\n\r\n{hostname}\r\n').encode()
+    if reference:  # before the file, so the service can refuse a bad one without reading the dump
+        pre += (f'--{boundary}\r\nContent-Disposition: form-data; name="reference"\r\n\r\n{reference}\r\n').encode()
     name = (name or os.path.basename(path)).replace('"', "")
     pre += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
             "Content-Type: application/octet-stream\r\n\r\n").encode()
@@ -1319,6 +1342,7 @@ class Agent:
         self.ignored = set()  # (path, size, mtime_ns) already sniffed as not-a-dump
         self.untrusted = set()  # (watched root, problem) already logged by candidates
         self.hostname = socket.gethostname() if config["sendHostname"] else None
+        self.reference = config_reference(config.get("reference"))
         self.queue.recover()
         # Files older than the agent's first run are left alone (#17): a fresh install mustn't upload
         # every old core already lying around. A queue that already existed (an upgrade) has seen
@@ -1532,7 +1556,8 @@ class Agent:
                     # The uploader opens this again: /proc/self/fd/N is the file already opened
                     # (safely), whatever the path points at by now.
                     path, name = f"/proc/self/fd/{f.fileno()}", os.path.basename(r["file_path"])
-                outcome, status, msg, *rest = self.uploader(self.cfg["apiBaseUrl"], key, path, self.hostname, name)
+                outcome, status, msg, *rest = self.uploader(self.cfg["apiBaseUrl"], key, path, self.hostname, name,
+                                                            reference=self.reference)
                 retry_after = rest[0] if rest else None
         except NotWatched as e:
             outcome, status, msg, retry_after = REJECTED, None, str(e), None
@@ -2067,6 +2092,11 @@ def main(argv=None):
         return 0
 
     cfg = load_config(config_dir / "config.json")
+    try:
+        config_reference(cfg.get("reference"))
+    except ValueError as e:
+        print(f"{config_dir / 'config.json'}: {e}", file=sys.stderr)
+        return EX_CONFIG
     if args.cmd == "trace-capture":
         if not cfg["tracing"]["enabled"]:
             print("tracing is off in the config", file=sys.stderr)

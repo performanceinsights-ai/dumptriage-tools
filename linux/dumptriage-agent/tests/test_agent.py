@@ -82,10 +82,11 @@ class PolicyTests(unittest.TestCase):
 
 class FakeUploader:
     def __init__(self, *outcomes):
-        self.outcomes, self.calls = list(outcomes), []
+        self.outcomes, self.calls, self.references = list(outcomes), [], []
 
-    def __call__(self, url, key, path, hostname, name):
+    def __call__(self, url, key, path, hostname, name, reference=None):
         self.calls.append((url, key, name, hostname, Path(path).read_bytes()))
+        self.references.append(reference)
         return self.outcomes.pop(0) if self.outcomes else (da.SUCCESS, 201, None)
 
 
@@ -125,6 +126,30 @@ class AgentTests(AgentTestBase):
         self.assertEqual(self.uploader.calls[0][1:3], ("dts_test", "core.a.1.2"))
         self.settle(a)  # not re-submitted
         self.assertEqual(len(self.uploader.calls), 1)
+
+    def test_sends_the_configured_reference_trimmed(self):  # #77
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent(reference="  client=Acme ")
+        self.settle(a)
+        self.assertEqual(self.uploader.references, ["client=Acme"])
+
+    def test_sends_no_reference_by_default(self):
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent()
+        self.settle(a)
+        self.assertEqual(self.uploader.references, [None])
+
+    def test_sends_no_reference_for_a_blank_one(self):
+        (self.watch / "core.a.1.2").write_bytes(USER_CORE)
+        a = self.agent(reference="   ")
+        self.settle(a)
+        self.assertEqual(self.uploader.references, [None])
+
+    def test_a_reference_the_service_would_refuse_stops_the_agent_at_load(self):
+        for bad in ("a" * 201, 42):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.agent(reference=bad)
+        self.assertEqual(da.config_reference("\U0001f600" * 200), "\U0001f600" * 200)  # characters, not bytes
 
     def test_walks_one_subdirectory_for_kdump_layout(self):
         d = self.watch / "202610071200"
@@ -340,6 +365,17 @@ class UploadTests(unittest.TestCase):
         self.assertIn(b'name="file"; filename="core.x.1.2"', seen["body"])
         self.assertIn(USER_CORE, seen["body"])
         self.assertTrue(seen["body"].endswith(b"--" + boundary + b"--\r\n"))
+        self.assertNotIn(b'name="reference"', seen["body"])
+
+    def test_multipart_carries_the_reference_before_the_file(self):  # #77
+        url, seen = self.serve(201)
+        p = Path(tempfile.mkdtemp()) / "core.x.1.2"
+        p.write_bytes(USER_CORE)
+        label = "client=Acme;ticket=INC-4021 \u00e9"
+        self.assertEqual(da.upload_dump(url, "k", str(p), None, reference=label)[0], da.SUCCESS)
+        part = b'name="reference"\r\n\r\n' + label.encode() + b"\r\n"
+        self.assertIn(part, seen["body"])
+        self.assertLess(seen["body"].index(part), seen["body"].index(b'name="file"'))
 
     def test_status_mapping(self):
         p = Path(tempfile.mkdtemp()) / "c"

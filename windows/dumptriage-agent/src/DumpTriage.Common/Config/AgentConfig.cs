@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using DumpTriage.Common.Policy;
 
 namespace DumpTriage.Common.Config;
@@ -14,6 +15,34 @@ public sealed class AgentConfig
     /// stored raw — see the "hostname" field in DumpTriageApiClient).
     /// </summary>
     public bool SendHostname { get; init; } = true;
+
+    /// <summary>
+    /// Your own label for this machine's dumps (website#3581, dumptriage-tools#77),
+    /// such as "client=Acme": sent as the upload's "reference" field and echoed
+    /// in the report webhook, so one receiver can route each report to a
+    /// client or ticket. Kept in plain text, not hashed like the hostname, so keep machine and user names out.
+    /// </summary>
+    public string? Reference { get; init; }
+
+    /// <summary>The most characters the service takes in <see cref="Reference"/>; it refuses more with a 422 that fails every dump.</summary>
+    public const int ReferenceMaxLength = 200;
+
+    /// <summary>The reference to send, trimmed, or null for none. Not a setting, so never written to config.json.</summary>
+    [JsonIgnore]
+    public string? ReferenceToSend => string.IsNullOrWhiteSpace(Reference) ? null : Reference.Trim();
+
+    /// <summary>
+    /// Why <see cref="Reference"/> can't be sent, or null when it can. Checked
+    /// when the service starts, not at upload. The service counts characters
+    /// (code points), so an emoji counts once, not as two UTF-16 units.
+    /// </summary>
+    public string? ReferenceProblem()
+    {
+        var length = ReferenceToSend?.EnumerateRunes().Count() ?? 0;
+        return length > ReferenceMaxLength
+            ? $"reference is {length} characters; the most the service takes is {ReferenceMaxLength}"
+            : null;
+    }
 
     public List<string> WatchedPaths { get; init; } = DefaultWatchedPaths();
 
