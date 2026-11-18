@@ -240,7 +240,9 @@ Start-Service -Name $ServiceName
 Write-Host "Installing per-user logon task for the tray helper..."
 $action = New-ScheduledTaskAction -Execute $TrayExe
 $trigger = New-ScheduledTaskTrigger -AtLogOn
-$principal = New-ScheduledTaskPrincipal -GroupId "Users" -RunLevel Limited
+# The well-known SID of BUILTIN\Users, not the name: "Users" only resolves on an English Windows ("Användare" on a Swedish
+# one) and Register-ScheduledTask fails with 0x80070534 (#89).
+$principal = New-ScheduledTaskPrincipal -GroupId "S-1-5-32-545" -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 

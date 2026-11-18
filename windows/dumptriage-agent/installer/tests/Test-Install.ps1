@@ -164,6 +164,11 @@ finally {
     Remove-Item -LiteralPath $configDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# The tray task's principal is a group, and a group name only resolves on a Windows in the same language (#89: "Users" fails
+# with 0x80070534 on a Swedish PC). It has to be the SID.
+$groupIds = [regex]::Matches($ast.Extent.Text, '-GroupId\s+"([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
+Assert-Equal (@($groupIds) -join ",") "S-1-5-32-545" "the tray task principal is the BUILTIN\Users SID, not a localized group name"
+
 if ($failures.Count -gt 0) {
     Write-Host ""
     $failures | ForEach-Object { Write-Host "FAIL: $_" }
