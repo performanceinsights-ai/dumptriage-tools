@@ -82,8 +82,30 @@ curl -X DELETE https://api.performanceinsights.ai/api/v1/customers/me/api-keys/<
   -H "Authorization: Bearer <primary key>"
 ```
 
+From the release zip (`dumptriage-agent-windows-x64.zip`): extract the whole
+zip, then double-click **`Install.cmd`** in the extracted folder. It asks for
+administrator rights, then runs `installer\install.ps1` with the PowerShell
+execution policy bypassed for that one process (no setting on the machine
+changes), so nobody has to open PowerShell. The window stays open at the end
+so you can read the result; run it again to replace the API key. If Windows
+warns about `Install.cmd` itself, the zip was extracted without being unblocked
+first (right-click the zip, Properties, Unblock). Arguments are passed on to
+`install.ps1`. From an RMM tool, run it as System from the extracted folder with
+a full path to the key file: `.\Install.cmd -ApiKeyFile C:\Temp\key.txt` (a
+user-context job would stop at the elevation prompt, and a relative path is read
+against the job's working folder, System32 for System) (#84). The scripts and
+binaries are not signed yet (#22), so two things still stop it: a Group Policy
+that forbids unsigned scripts (the install then goes through IT), and Smart App
+Control, on by default on unmanaged Windows 11 PCs, which blocks unsigned code
+whoever runs it (only signing fixes that). A signed point-and-click installer is
+#79.
+
+From an elevated PowerShell prompt, which is what `Install.cmd` runs (in the
+zip the folders are `.\agent` and `.\tray`; from a source build, the publish
+folders):
+
 ```powershell
-.\installer\install.ps1 -AgentPublishDir .\publish\agent -TrayPublishDir .\publish\tray
+powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\install.ps1 -AgentPublishDir .\publish\agent -TrayPublishDir .\publish\tray
 ```
 
 On a first install the script asks for the API key at a masked prompt. For an
@@ -116,6 +138,7 @@ first; delete it and reinstall.
 {
   "apiBaseUrl": "https://api.performanceinsights.ai",
   "sendHostname": true,
+  "reference": "client=Acme",     // optional; see below
   "watchedPaths": ["%LOCALAPPDATA%\\CrashDumps", "%WINDIR%\\Minidump", "%WINDIR%"],
   "watchedFilters": ["*.dmp", "MEMORY.DMP"],
   "startupScanMaxAgeDays": 30,    // on start, also look at dumps already there from the last N days; 0 = off
@@ -159,6 +182,20 @@ each with the time the service has left to wait for it.
 { "dumpType": "KernelMode", "action": "Ask" },
 { "pathGlob": "C:\\Dumps\\*", "action": "Submit" }
 ```
+
+`reference` is your own label for this machine's dumps, at most 200 characters,
+sent with each upload and echoed in the report webhook (see
+[`rmm/README.md`](../../rmm/README.md#one-receiver-for-every-client-reference)).
+It is kept in plain text (not hashed like the hostname), so keep machine and user
+names out of it. Not sent with traces. Set it at install with
+`-Reference 'client=Acme'` (`-Reference ''` removes it; a reinstall without it
+keeps the one set). `Install.cmd` and an RMM's command line pass the words on to
+PowerShell as they are, so use double quotes there:
+`.\Install.cmd -ApiKeyFile C:\Temp\key.txt -Reference "client=Acme;ticket=INC-4021"`
+(single quotes would become part of the label). Over 200 characters, the
+installer refuses it (also one already in config.json, on a reinstall that keeps
+it), and the service refuses to start and says why in the event log, rather than
+have every upload refused.
 
 `centralCopy`, when enabled, copies every approved dump to
 `destinationPath\<hostname>\` (a plain file copy — works for a UNC share or a
@@ -290,7 +327,10 @@ the release) takes one capture in file mode while you reproduce the problem, wri
   dump at once.
 - **Queue-wide holds**, which spend no retries and show in the tray: Terms
   of Service not accepted (15 minutes), API key rejected or account closed
-  (401/403, 1 hour), monthly quota used up (429, 6 hours).
+  (401/403, 1 hour), monthly quota used up (429 with no short `Retry-After`,
+  6 hours). A 429 with a `Retry-After` of 5 minutes or less (the account has
+  its limit of uploads in progress, or is over its API request rate) holds the
+  queue for that long instead, at least 5 seconds.
 - **Retry failed uploads** in the tray menu puts every `Failed` dump back in
   the queue.
 - A dump cut off mid-upload by a crash, reboot or service stop is requeued at
@@ -309,5 +349,5 @@ the release) takes one capture in file mode while you reproduce the problem, wri
   mode on unattended machines) — scoped out of v1.
 - Central-copy failures aren't retried; only the API submission has retry/
   backoff via the queue.
-- No MSI — `installer/install.ps1` is the v1 install path. A WiX MSI is a
-  reasonable follow-up once this is validated in the field.
+- No MSI — `installer/install.ps1` (started by `Install.cmd` in the zip) is the
+  v1 install path. A signed MSI or setup.exe is #79, after signing (#22).

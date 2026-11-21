@@ -212,6 +212,39 @@ assert_contains "$OUT" "Not sent."
 assert_eq "$(grep -c '^curl' "$LOG")" 0
 done_test
 
+setup the_reference_goes_with_each_report_before_the_file
+DUMPTRIAGE_REFERENCE="  client=Acme Corp;ticket=INC-4021 " run "y
+" --dir "$REPORTS" --all
+assert_eq "$CODE" 0
+assert_eq "$(grep -c '^curl.*\[--form-string\] \[reference=client=Acme Corp;ticket=INC-4021\] \[-F\] \[file=@' "$LOG")" 3
+done_test
+
+setup no_reference_sends_no_field
+DUMPTRIAGE_REFERENCE="   " run "y
+" --dir "$REPORTS" --all
+assert_eq "$CODE" 0
+assert_eq "$(grep -c '^curl' "$LOG")" 3
+assert_not_contains "$(cat "$LOG")" "reference="
+done_test
+
+setup a_reference_over_200_characters_is_refused_before_anything_is_listed
+DUMPTRIAGE_REFERENCE="$(printf 'a%.0s' $(seq 201))" run "" --dir "$REPORTS" --dry-run
+assert_eq "$CODE" 2
+assert_contains "$OUT" "DUMPTRIAGE_REFERENCE is 201 characters"
+assert_not_contains "$OUT" "napper"
+done_test
+
+setup a_long_reference_does_not_stop_a_trace_which_never_sends_it
+DUMPTRIAGE_REFERENCE="$(printf 'a%.0s' $(seq 201))" run "" --sample napper --dry-run
+assert_eq "$CODE" 0
+assert_not_contains "$OUT" "DUMPTRIAGE_REFERENCE"
+done_test
+
+setup a_reference_is_counted_in_characters_not_bytes
+DUMPTRIAGE_REFERENCE="$(printf '\303\251%.0s' $(seq 200))" run "" --dir "$REPORTS" --dry-run --all
+assert_eq "$CODE" 0
+done_test
+
 setup an_empty_choice_sends_nothing
 run "
 " --dir "$REPORTS"
@@ -322,6 +355,28 @@ assert_eq "$(grep -c '^curl' "$LOG")" 1
 assert_contains "$calls" "[file=@$T/dumptriage-spindump-"
 assert_not_contains "$OUT" "Which to send?"  # only the fresh spindump, no picker
 [ -z "$(ls "$T"/dumptriage-spindump-* 2>/dev/null)" ] || fail "the temporary spindump was not removed"
+done_test
+
+setup spindump_takes_an_optional_length
+run "y
+" --dir "$REPORTS" --spindump Xcode 30
+assert_eq "$CODE" 0
+assert_contains "$(cat "$LOG")" "sudo spindump Xcode 30 -file $T/dumptriage-spindump-"
+done_test
+
+setup spindump_length_after_a_pid
+run "" --dir "$REPORTS" --spindump 4242 60 --dry-run
+assert_eq "$CODE" 0
+assert_contains "$OUT" "Would take a spindump of 4242 (60 s, sudo)"
+done_test
+
+setup spindump_length_out_of_range_is_refused_before_sudo
+run "" --dir "$REPORTS" --spindump Xcode 9
+assert_eq "$CODE" 2
+assert_contains "$OUT" "--spindump seconds must be 10 to 60, not 9"
+run "" --dir "$REPORTS" --spindump Xcode 61
+assert_eq "$CODE" 2
+assert_eq "$(grep -c '^sudo' "$LOG")" 0
 done_test
 
 setup a_declined_spindump_is_removed_too

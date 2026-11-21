@@ -58,7 +58,9 @@ public class DumpWatcherServiceTests : IAsyncLifetime
         {
             all.AddRange(await _store.GetByStateAsync(state));
         }
-        return all;
+        // One read per state, so a record the watcher moves on between two reads (PendingApproval, then Queued) is
+        // listed under both (#82). Keep its later state.
+        return all.GroupBy(r => r.Id).Select(g => g.Last()).ToList();
     }
 
     [Fact]
@@ -397,7 +399,7 @@ public class DumpWatcherServiceTests : IAsyncLifetime
         await watcher.StartAsync(CancellationToken.None);
         try
         {
-            await WaitForAsync(async () => Assert.Single(await AllAsync()).State == DumpQueueState.Queued);
+            await WaitForAsync(async () => await AllAsync() is [{ State: DumpQueueState.Queued }]);
         }
         finally
         {

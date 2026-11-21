@@ -29,7 +29,7 @@ The installer picks how to run in the background:
 | `cron` | no systemd (or `--method cron`) | `run --once` every minute under `flock` (`/etc/cron.d` as root, the user crontab otherwise) |
 
 Override with `--method`. Re-running the installer upgrades the agent and keeps `config.json`; options given
-on the command line (`--policy`, `--api-url`, `--watch`) update just those fields. The key is read from
+on the command line (`--policy`, `--api-url`, `--watch`, `--reference`) update just those fields. The key is read from
 `--api-key-file` (deleted once stored) or stdin (`--api-key-stdin`), never from argv. `apiBaseUrl` must be https; plain `http://` is accepted only for this machine (`localhost`, `127.x.x.x`, `[::1]`), for a local test backend. Since dumptriage-tools#60 the agent (and `install.sh --api-url`) refuses to start with any other http URL, because it would send the API key and the dumps unencrypted: a self-hosted install still on plain http needs a TLS address before upgrading. `installer/uninstall.sh`
 removes the service, cron job and binaries; `--remove-data` also deletes config, key and queue.
 
@@ -62,6 +62,7 @@ Restart the service to apply a change (`systemctl restart dumptriage-agent`; cro
 {
   "apiBaseUrl": "https://api.performanceinsights.ai",
   "sendHostname": true,
+  "reference": "client=Acme",      // optional; see below
   "watchedPaths": ["/var/crash", "/var/lib/systemd/coredump"],  // user installs: ["/var/crash/dumptriage"]
   "pollSeconds": 5, "stableSeconds": 10, "maxRetries": 10,
   "policy": {
@@ -77,6 +78,13 @@ Restart the service to apply a change (`systemctl restart dumptriage-agent`; cro
 }
 ```
 
+`reference` is your own label for this machine's dumps, at most 200 characters, sent with each upload and echoed in
+the report webhook (see [`rmm/README.md`](../../rmm/README.md#one-receiver-for-every-client-reference)). It is kept in
+plain text (not hashed like the hostname), so keep machine and user names out of it. Not sent with traces. Set it at
+install with `--reference 'client=Acme'` (`--reference ""` removes it). Over 200 characters, the installer refuses it
+(also one already in config.json, on a reinstall that keeps it); the agent refuses to start (exit 78, which the systemd
+unit does not restart on), and every command but `set-api-key` refuses to run.
+
 Decision mode (`policy.mode`) decides whether a dump is submitted; timing (`policy.batching`) decides when an
 approved one is uploaded. Linux has no tray, so approvals are made on the command line:
 
@@ -91,7 +99,7 @@ dumptriage-agent status               # counts per state
 `AskFirst` and rule-`Ask` dumps wait `askTimeoutSeconds`, then take `askTimeoutDefaultAction` (Skip by
 default). `NotifyOnly` dumps wait for `approve` with no timeout. Each pending dump is logged to the journal
 (`journalctl -u dumptriage-agent`) with the exact command. Transient failures retry with exponential
-backoff (30 s doubling, capped at 1 h) up to `maxRetries`; a 400, 413 or 429 is final (`Failed`). A 401 or 403 means the key
+backoff (30 s doubling, capped at 1 h) up to `maxRetries`; a 400 or 413 is final (`Failed`). A 429 never fails a dump and spends no attempt: with a `Retry-After` of 5 minutes or less (too many uploads in progress, or over the API request rate) uploads wait that long; without one (the monthly quota) they wait 6 hours. A 401 or 403 means the key
 is wrong or revoked: no attempt is used up, and uploads pause for 10 minutes, doubling with each refusal in
 a row up to 6 hours (every attempt sends the whole dump). Storing a new key with `set-api-key` ends the
 pause. With `ScheduledTimeOfDay`, uploads happen only once a scheduled time has passed since the

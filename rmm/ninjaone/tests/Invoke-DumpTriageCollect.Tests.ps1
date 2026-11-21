@@ -62,6 +62,24 @@ Describe 'the script file' {
         $script:Ast.ScriptRequirements.RequiredPSVersion | Should -BeNullOrEmpty
     }
 
+    It 'reads the reference from DUMPTRIAGE_REFERENCE when run as a script' {
+        # The entry point, not the function: NinjaOne script variables arrive as environment variables.
+        $empty = Join-Path $TestDrive 'empty'
+        New-Item -ItemType Directory -Path $empty -Force | Out-Null
+        $run = {
+            param($Reference)
+            $env:DUMPTRIAGE_REFERENCE = $Reference
+            try {
+                & pwsh -NoProfile -NonInteractive -File $script:ScriptPath -MinidumpDir $empty -MemoryDmpPath (Join-Path $empty 'MEMORY.DMP') `
+                    -StatePath (Join-Path $empty 'state.json') | Out-Null
+                return $LASTEXITCODE
+            } finally { Remove-Item Env:DUMPTRIAGE_REFERENCE -ErrorAction SilentlyContinue }
+        }
+
+        (& $run ('x' * 201)) | Should -Be 1
+        (& $run 'client=Acme') | Should -Be 0
+    }
+
     It 'turns off Expect: 100-continue for the upload' {
         # .NET Framework's HttpClient sends it by default and the API answers
         # an upload carrying it with 417, retried forever (website#1801).
@@ -233,6 +251,45 @@ Describe 'Invoke-DumpTriageCollect' {
 
         Should -Invoke Send-DumpTriageUpload -Times 0 -Exactly
         $script:StatePath | Should -Not -Exist
+    }
+
+    It 'sends the trimmed reference' {
+        New-FakeDump -Dir $script:Minidumps -Name 'a.dmp' | Out-Null
+        Mock Send-DumpTriageUpload { New-UploadResponse }
+
+        Invoke-DumpTriageCollect @Run -Reference ' client=Acme;ticket=INC-4021 ' | Should -Be 0
+
+        Should -Invoke Send-DumpTriageUpload -Times 1 -Exactly -ParameterFilter { $Reference -eq 'client=Acme;ticket=INC-4021' }
+    }
+
+    It 'sends no reference when none is given' {
+        New-FakeDump -Dir $script:Minidumps -Name 'a.dmp' | Out-Null
+        Mock Send-DumpTriageUpload { New-UploadResponse }
+
+        Invoke-DumpTriageCollect @Run | Should -Be 0
+
+        Should -Invoke Send-DumpTriageUpload -Times 1 -Exactly -ParameterFilter { -not $Reference }
+    }
+
+    It 'exits 1 and uploads nothing when the reference is over 200 characters' {
+        New-FakeDump -Dir $script:Minidumps -Name 'a.dmp' | Out-Null
+        Mock Send-DumpTriageUpload { New-UploadResponse }
+
+        Invoke-DumpTriageCollect @Run -Reference ('x' * 201) | Should -Be 1
+        Invoke-DumpTriageCollect @Run -Reference ('x' * 200) | Should -Be 0
+
+        Should -Invoke Send-DumpTriageUpload -Times 1 -Exactly
+    }
+
+    It 'counts characters, not UTF-16 units, against the 200 limit' {
+        New-FakeDump -Dir $script:Minidumps -Name 'a.dmp' | Out-Null
+        Mock Send-DumpTriageUpload { New-UploadResponse }
+        $emoji = [char]::ConvertFromUtf32(0x1F600)
+
+        Invoke-DumpTriageCollect @Run -Reference ($emoji * 200) | Should -Be 0
+        Invoke-DumpTriageCollect @Run -Reference ($emoji * 201) | Should -Be 1
+
+        Should -Invoke Send-DumpTriageUpload -Times 1 -Exactly
     }
 
     It 'exits 1 without a key and uploads nothing' {

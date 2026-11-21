@@ -16,6 +16,7 @@ flight recorder runs under the daemon, a trigger on /proc metrics takes a snapsh
 stacks on the host and queued like a dump (held for approval by default), then uploaded to POST /api/v1/traces.
 """
 import argparse
+import email.utils
 import errno
 import fnmatch
 import hashlib
@@ -250,6 +251,10 @@ def open_dump(path, roots):
 DEFAULT_CONFIG = {
     "apiBaseUrl": "https://api.performanceinsights.ai",
     "sendHostname": True,
+    # Your own label for this host's dumps (website#3581, #77), e.g. "client=Acme": sent as the upload's `reference` and
+    # echoed in the report webhook, so one receiver can route each report. Kept in plain text, unlike the hostname, so
+    # no machine or user names.
+    "reference": None,
     "watchedPaths": ["/var/crash", "/var/lib/systemd/coredump"],
     "pollSeconds": 5,
     "stableSeconds": 10,
@@ -272,6 +277,23 @@ DEFAULT_CONFIG = {
         "limits": {"maxDurationSec": 60, "maxDiskMB": 512, "maxOverheadPercent": 2, "cooldownMin": 60, "dailyCap": 4},
     },
 }
+
+
+REFERENCE_MAX = 200  # characters, as the service counts them (website#3581)
+EX_CONFIG = 78  # sysexits.h; the systemd unit does not restart on it (RestartPreventExitStatus)
+
+
+def config_reference(value):
+    """The `reference` to send, trimmed (None for none). Refused here, at config load, when the service would refuse it
+    (422 reference_too_long, which fails every dump for good)."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("reference must be text")
+    value = value.strip()
+    if len(value) > REFERENCE_MAX:
+        raise ValueError(f"reference is {len(value)} characters; the most the service takes is {REFERENCE_MAX}")
+    return value or None
 
 
 def merge(base, over):
@@ -478,20 +500,72 @@ class Queue:
 # --- upload ------------------------------------------------------------------
 
 SUCCESS, REJECTED, QUOTA, AUTH, TRANSIENT = "success", "rejected", "quota", "auth", "transient"
+# QUOTA is a 413, the plan's per-dump size: the same bytes get the same answer, so the dump fails. A 429 is never that
+# (#73). HOLD: a 429 with no short Retry-After, the monthly quota, which resets: the queue waits QUOTA_HOLD_SECONDS and
+# the dump stays queued. BUSY: a 429 with a Retry-After of at most SHORT_RETRY_AFTER_MAX seconds (the account has too
+# many uploads in progress, or is over its API request rate): the queue waits that long. Neither is the dump's fault,
+# so neither spends a retry. An uploader returns (outcome, status, message, retry_after): the Retry-After in seconds
+# for these two, else None. (Fakes in tests may return the first three only.)
+HOLD, BUSY = "hold", "busy"
 # The agent's own config is wrong (an insecure apiBaseUrl): not the dump's fault, so no attempt is used, and not the
 # key's, so no key pause either (dumptriage-tools#60).
 CONFIG = "config"
 AUTH_BACKOFF_SECONDS = 600
+QUOTA_HOLD_SECONDS = 6 * 3600
+SHORT_RETRY_AFTER_MAX = 300
+MIN_BUSY_HOLD_SECONDS = 5
 
 
-def upload_dump(base_url, api_key, path, hostname, name=None, timeout=1800):
+def parse_retry_after(value, now=None):
+    """Seconds from a Retry-After header (delta-seconds or an HTTP date), or None if it is missing or unreadable."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    if re.fullmatch(r"[0-9]+", value):  # not str.isdigit(): that accepts "²", which int() refuses
+        return int(value)
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0, int((when - (now or datetime.now(timezone.utc))).total_seconds()))
+
+
+def classify_429(retry_after_header):
+    """(outcome, retry_after_seconds) for a 429: BUSY for a short Retry-After, else HOLD."""
+    seconds = parse_retry_after(retry_after_header)
+    if seconds is not None and seconds <= SHORT_RETRY_AFTER_MAX:
+        return BUSY, seconds
+    return HOLD, seconds
+
+
+def outcome_for(status, body, retry_after_header, rejected):
+    """(outcome, status, message, retry_after) for an upload's response; `rejected` are the statuses that fail the file."""
+    if status == 201:
+        return SUCCESS, 201, None, None
+    if status in rejected:
+        return REJECTED, status, body, None
+    if status == 429:
+        outcome, retry_after = classify_429(retry_after_header)
+        return outcome, 429, body, retry_after
+    if status == 413:
+        return QUOTA, status, body, None
+    if status in (401, 403):
+        return AUTH, status, body, None
+    return TRANSIENT, status, body, None
+
+
+def upload_dump(base_url, api_key, path, hostname, name=None, timeout=1800, reference=None):
     """Stream one file to POST /api/v1/dumps as multipart/form-data (same request
     as the web uploader and the Windows agent), named `name` (default: the path's
-    basename). Returns (outcome, status, message)."""
+    basename), with the `reference` label when one is set. Returns (outcome, status, message, retry_after)."""
     boundary = uuid.uuid4().hex
     pre = b""
     if hostname:
         pre += (f'--{boundary}\r\nContent-Disposition: form-data; name="hostname"\r\n\r\n{hostname}\r\n').encode()
+    if reference:  # before the file, so the service can refuse a bad one without reading the dump
+        pre += (f'--{boundary}\r\nContent-Disposition: form-data; name="reference"\r\n\r\n{reference}\r\n').encode()
     name = form_value(name or os.path.basename(path))
     pre += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
             "Content-Type: application/octet-stream\r\n\r\n").encode()
@@ -500,7 +574,7 @@ def upload_dump(base_url, api_key, path, hostname, name=None, timeout=1800):
     try:
         conn, prefix = api_connection(base_url, timeout)
     except ValueError as e:  # `run` refuses such a config first; this is the last guard
-        return CONFIG, None, str(e)
+        return CONFIG, None, str(e), None
     try:
         conn.putrequest("POST", prefix + "/api/v1/dumps")
         conn.putheader("Authorization", f"Bearer {api_key}")
@@ -512,21 +586,19 @@ def upload_dump(base_url, api_key, path, hostname, name=None, timeout=1800):
             while chunk := f.read(1 << 20):
                 conn.send(chunk)
         conn.send(post)
+    except (BrokenPipeError, ConnectionResetError):
+        pass  # the server answered without reading the whole body (a 429 for the account's uploads in progress): read it
+    except (OSError, http.client.HTTPException) as e:
+        conn.close()
+        return TRANSIENT, None, str(e), None
+    try:
         resp = conn.getresponse()
         body = resp.read().decode("utf-8", "replace")[:500]
     except (OSError, http.client.HTTPException) as e:
-        return TRANSIENT, None, str(e)
+        return TRANSIENT, None, str(e), None
     finally:
         conn.close()
-    if resp.status == 201:
-        return SUCCESS, 201, None
-    if resp.status == 400:
-        return REJECTED, 400, body
-    if resp.status in (413, 429):
-        return QUOTA, resp.status, body
-    if resp.status in (401, 403):
-        return AUTH, resp.status, body
-    return TRANSIENT, resp.status, body
+    return outcome_for(resp.status, body, resp.getheader("Retry-After"), rejected=(400,))
 
 
 # --- stability -----------------------------------------------------------------
@@ -908,7 +980,7 @@ def fold_perf_script(lines, window_sec=None):
 
 def upload_trace(base_url, api_key, path, manifest_json, hostname, name="trace.folded", timeout=600, content_type="text/plain"):
     """POST /api/v1/traces as multipart/form-data: the manifest.json text, the optional hostname and the folded
-    stacks as `file`. Returns (outcome, status, message), like upload_dump."""
+    stacks as `file`. Returns (outcome, status, message, retry_after), like upload_dump."""
     boundary = uuid.uuid4().hex
     pre = b""
     for field, value in (("manifest", manifest_json), ("hostname", hostname)):
@@ -922,7 +994,7 @@ def upload_trace(base_url, api_key, path, manifest_json, hostname, name="trace.f
     try:
         conn, prefix = api_connection(base_url, timeout)
     except ValueError as e:  # `run` refuses such a config first; this is the last guard
-        return CONFIG, None, str(e)
+        return CONFIG, None, str(e), None
     try:
         conn.putrequest("POST", prefix + "/api/v1/traces")
         conn.putheader("Authorization", f"Bearer {api_key}")
@@ -934,21 +1006,19 @@ def upload_trace(base_url, api_key, path, manifest_json, hostname, name="trace.f
             while chunk := f.read(1 << 20):
                 conn.send(chunk)
         conn.send(post)
+    except (BrokenPipeError, ConnectionResetError):
+        pass  # the server answered without reading the whole body (a 429 for the account's uploads in progress): read it
+    except (OSError, http.client.HTTPException) as e:
+        conn.close()
+        return TRANSIENT, None, str(e), None
+    try:
         resp = conn.getresponse()
         body = resp.read().decode("utf-8", "replace")[:500]
     except (OSError, http.client.HTTPException) as e:
-        return TRANSIENT, None, str(e)
+        return TRANSIENT, None, str(e), None
     finally:
         conn.close()
-    if resp.status == 201:
-        return SUCCESS, 201, None
-    if resp.status in (400, 422):
-        return REJECTED, resp.status, body
-    if resp.status in (413, 429):
-        return QUOTA, resp.status, body
-    if resp.status in (401, 403):
-        return AUTH, resp.status, body
-    return TRANSIENT, resp.status, body
+    return outcome_for(resp.status, body, resp.getheader("Retry-After"), rejected=(400, 422))
 
 
 # The recorder
@@ -1320,6 +1390,7 @@ class Agent:
         self.ignored = set()  # (path, size, mtime_ns) already sniffed as not-a-dump
         self.untrusted = set()  # (watched root, problem) already logged by candidates
         self.hostname = socket.gethostname() if config["sendHostname"] else None
+        self.reference = config_reference(config.get("reference"))
         self.queue.recover()
         # Files older than the agent's first run are left alone (#17): a fresh install mustn't upload
         # every old core already lying around. A queue that already existed (an upgrade) has seen
@@ -1467,17 +1538,23 @@ class Agent:
         self.used_key_stamp = self.key_stamp()  # before reading the key, so a key stored in between isn't blamed
         key = self.api_key()
         due = [r for r in self.queue.in_state(QUEUED) if not r["next_attempt_utc"] or datetime.fromisoformat(r["next_attempt_utc"]) <= now]
+        due = [r for r in due if not self.upload_held(now, r["kind"])]  # the service said 429 (#73)
         if due and not key:
             log.error("no API key at %s; run `dumptriage-agent set-api-key`", self.config_dir / "api-key")
             return
         refused = False
         for r in due:
-            if self.submit_one(r, key) == AUTH:
+            if self.upload_held(now, r["kind"]):
+                continue  # a quota hold an earlier row of this tick set for its kind
+            outcome = self.submit_one(r, key)
+            if outcome in (AUTH, BUSY):
                 refused = True
                 break  # the rest would be refused too
+            if outcome == HOLD:
+                refused = True  # no more of this kind (its quota), the other kind goes on
         if batching["mode"] == "ScheduledTimeOfDay" and not refused:
-            # The slot is used, even if nothing was due. Not when the key was refused, or (returns
-            # above) during an auth pause or without a key: then it is taken once that clears.
+            # The slot is used, even if nothing was due. Not when the key was refused or the service said 429,
+            # or (returns above) during an auth pause, a hold or without a key: then it is taken once that clears.
             self.queue.set_meta("last_flush_utc", iso(now))
 
     def key_stamp(self):
@@ -1495,6 +1572,16 @@ class Agent:
         if self.queue.meta("auth_refused_key_stamp") != self.key_stamp():
             return False
         return True
+
+    def upload_held(self, now, kind):
+        """After a 429 (#73), uploads wait: every kind for a BUSY answer's Retry-After (the account's uploads in progress
+        and request rate are shared), one kind for QUOTA_HOLD_SECONDS after its monthly quota (a trace quota says
+        nothing about the dump quota)."""
+        for key in ("upload_hold_until_utc", f"quota_hold_{kind}_until_utc"):
+            until = self.queue.meta(key)
+            if until and datetime.fromisoformat(until) > now:
+                return True
+        return False
 
     def roots(self):
         return [root_path(r) for r in self.cfg["watchedPaths"]]
@@ -1517,17 +1604,19 @@ class Agent:
                     # The uploader opens this again: /proc/self/fd/N is the file already opened
                     # (safely), whatever the path points at by now.
                     path, name = f"/proc/self/fd/{f.fileno()}", os.path.basename(r["file_path"])
-                outcome, status, msg = self.uploader(self.cfg["apiBaseUrl"], key, path, self.hostname, name)
+                outcome, status, msg, *rest = self.uploader(self.cfg["apiBaseUrl"], key, path, self.hostname, name,
+                                                            reference=self.reference)
+                retry_after = rest[0] if rest else None
         except NotWatched as e:
-            outcome, status, msg = REJECTED, None, str(e)
+            outcome, status, msg, retry_after = REJECTED, None, str(e), None
         except (OSError, subprocess.SubprocessError, lzma.LZMAError) as e:
-            outcome, status, msg = TRANSIENT, None, str(e)
+            outcome, status, msg, retry_after = TRANSIENT, None, str(e), None
         finally:
             if spool:
                 spool.unlink(missing_ok=True)
-        return self.record_outcome(r, outcome, status, msg)
+        return self.record_outcome(r, outcome, status, msg, retry_after)
 
-    def record_outcome(self, r, outcome, status, msg):
+    def record_outcome(self, r, outcome, status, msg, retry_after=None):
         """What an upload's outcome does to the row: submitted, failed, retried later, or the key paused."""
         if outcome == SUCCESS:
             log.info("submitted %s", r["file_path"])
@@ -1539,6 +1628,17 @@ class Agent:
         elif outcome == CONFIG:
             log.error("%s %s not sent: %s", r["kind"], r["file_path"], msg)
             self.queue.update(r["id"], state=QUEUED, last_error=msg)
+        elif outcome in (BUSY, HOLD):
+            # Not the dump's fault and no attempt used (#73): a 429 is the account's limit of uploads in progress or
+            # request rate (wait the Retry-After) or the monthly quota (resets). The dump stays queued and the whole
+            # queue waits, since each try may send the whole dump.
+            if outcome == BUSY:
+                wait, key = max(MIN_BUSY_HOLD_SECONDS, min(retry_after or 0, SHORT_RETRY_AFTER_MAX)), "upload_hold_until_utc"
+            else:
+                wait, key = QUOTA_HOLD_SECONDS, f"quota_hold_{r['kind']}_until_utc"
+            log.warning("%s %s not accepted (%s): %s; uploads wait %d s", r["kind"], r["file_path"], status, msg, wait)
+            self.queue.update(r["id"], state=QUEUED, last_error=f"{status}: {msg}")
+            self.queue.set_meta(key, iso(self.clock() + timedelta(seconds=wait)))
         elif outcome == AUTH:
             # Not the dump's fault and no attempt used: the key is wrong, revoked or rotated.
             stamp = self.used_key_stamp  # the key this upload used, not one stored meanwhile
@@ -1952,11 +2052,11 @@ class Agent:
             return self.record_outcome(r, REJECTED, None, "the folded stacks file is gone")
         self.queue.update(r["id"], state=SUBMITTING)
         binary = r["dump_type"] == PERFETTO_TRACE_TYPE
-        outcome, status, msg = self.trace_uploader(self.cfg["apiBaseUrl"], key, str(path), r["manifest"], self.hostname, path.name,
-                                                   content_type="application/octet-stream" if binary else "text/plain")
+        outcome, status, msg, *rest = self.trace_uploader(self.cfg["apiBaseUrl"], key, str(path), r["manifest"], self.hostname, path.name,
+                                                          content_type="application/octet-stream" if binary else "text/plain")
         if outcome == AUTH and status == 403 and ("traces_disabled" in (msg or "") or "not enabled" in (msg or "")):
             outcome = TRANSIENT  # the service has traces off: not the key's fault, try again later
-        result = self.record_outcome(r, outcome, status, msg)
+        result = self.record_outcome(r, outcome, status, msg, rest[0] if rest else None)
         if outcome == SUCCESS:
             path.unlink(missing_ok=True)
         return result
@@ -2049,6 +2149,11 @@ def main(argv=None):
             raise SystemExit(insecure_api_url_message(cfg["apiBaseUrl"]))
         print(f"warning: {insecure_api_url_message(cfg['apiBaseUrl'])}; the agent won't send until it is",
               file=sys.stderr)
+    try:
+        config_reference(cfg.get("reference"))
+    except ValueError as e:
+        print(f"{config_dir / 'config.json'}: {e}", file=sys.stderr)
+        return EX_CONFIG
     if args.cmd == "trace-capture":
         if not cfg["tracing"]["enabled"]:
             print("tracing is off in the config", file=sys.stderr)

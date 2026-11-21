@@ -107,6 +107,68 @@ finally {
     Remove-Item -Path $emptyFile -ErrorAction SilentlyContinue
 }
 
+# Install.cmd, the double-click launcher at the zip root (#80): it must start this script with the zip's folders and
+# a process-only bypass, never pass a key, keep CRLF (cmd.exe misreads some LF-only batch files) and land at the root.
+$launcherPath = Join-Path $PSScriptRoot "../Install.cmd"
+$launcher = [System.IO.File]::ReadAllText((Resolve-Path $launcherPath))
+$installLine = 'powershell -NoProfile -ExecutionPolicy Bypass -File "%DT_ROOT%installer\install.ps1" -AgentPublishDir "%DT_ROOT%agent" -TrayPublishDir "%DT_ROOT%tray" %DT_KEY% %DT_ARGS%'
+Assert-Equal $launcher.Contains($installLine) $true "Install.cmd runs install.ps1 with the zip's agent and tray folders and a process-only bypass"
+Assert-Equal (@('AgentPublishDir', 'TrayPublishDir', 'PromptForApiKey') | Where-Object { $paramNames -notcontains $_ }) $null "the parameters Install.cmd passes exist in install.ps1"
+Assert-Equal ($launcher -match '(?i)-ApiKey|dts_') $false "Install.cmd passes no API key (install.ps1 prompts for it)"
+# The UAC relaunch starts cmd.exe with the path in doubled quotes: the .cmd's own runas verb (cmd /C "%1") loses the
+# quotes on a path with ( ) or &, such as a second download's "dumptriage-agent-windows-x64 (1)".
+Assert-Equal $launcher.Contains("-FilePath `$env:ComSpec -ArgumentList ('/c ' + `$q + `$q + `$env:DT_SELF + `$q + ' --elevated' + `$q) -Verb RunAs -Wait -PassThru -ErrorAction Stop; exit `$p.ExitCode } catch {") $true "the UAC relaunch runs cmd.exe on the doubled-quoted path and waits for it"
+Assert-Equal ($launcher -match '(?i)Set-ExecutionPolicy') $false "Install.cmd changes no execution policy setting"
+Assert-Equal ($launcher -match '(?<!\r)\n') $false "Install.cmd has CRLF line endings"
+$release = Get-Content -Raw (Join-Path $PSScriptRoot "../../../../.github/workflows/release.yml")
+Assert-Equal $release.Contains('Move-Item "$out\installer\Install.cmd" "$out\Install.cmd"') $true "release.yml puts Install.cmd at the zip root"
+
+# -Reference (dumptriage-tools#77): counted as the service counts it, and written into config.json without touching the rest.
+foreach ($name in @("Get-ReferenceLength", "Set-ConfigReference")) {
+    $f = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true) |
+        Select-Object -First 1
+    if (-not $f) { throw "$name not found in $script" }
+    Invoke-Expression $f.Extent.Text
+}
+Assert-Equal (Get-ReferenceLength "  client=Acme ") 11 "the reference is trimmed before it is counted"
+Assert-Equal (Get-ReferenceLength ([string]::Concat(@([char]::ConvertFromUtf32(0x1F600)) * 200))) 200 "an emoji counts once, as the service counts it"
+Assert-Equal ($ast.Extent.Text -match "\(Get-ReferenceLength \`$Reference\) -gt \`$ReferenceMaxLength\) \{\s*throw") $true "a -Reference over 200 characters is refused"
+Assert-Equal ($ast.Extent.Text -match "\(Get-ReferenceLength \`$stored\) -gt \`$ReferenceMaxLength\) \{\s*throw") $true "a reinstall that keeps a stored label over 200 characters is refused too"
+# Windows PowerShell 5.1's Get-Content reads a BOM-less file as the ANSI code page; written back as UTF-8 that garbles it.
+$setFn = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "Set-ConfigReference" }, $true) | Select-Object -First 1
+Assert-Equal ($setFn.Extent.Text -match 'Get-Content\s+-') $false "Set-ConfigReference reads config.json as UTF-8 (ReadAllText), not with Get-Content"
+
+$configDir = Join-Path ([System.IO.Path]::GetTempPath()) "install-test-cfg-$([guid]::NewGuid())"
+$configPath = Join-Path $configDir "config.json"
+try {
+    Set-ConfigReference -ConfigPath $configPath -Reference " client=Acme "
+    Assert-Equal ((Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json).reference) "client=Acme" "a first install writes the label, trimmed"
+
+    Set-Content -LiteralPath $configPath -NoNewline -Value '{"apiBaseUrl":"https://x.example","protectedApiKey":"AQAA","policy":{"mode":"RuleBased","rules":[{"dumpType":"Kernel","action":"Ask"}]},"tracing":{"triggers":[{"name":"cpu","type":"cpuPercent","threshold":90}]},"reference":"old"}'
+    Set-ConfigReference -ConfigPath $configPath -Reference "client=Beta;ticket=INC-1"
+    $raw = Get-Content -LiteralPath $configPath -Raw
+    $after = $raw | ConvertFrom-Json
+    Assert-Equal $after.reference "client=Beta;ticket=INC-1" "a reinstall replaces the label"
+    Assert-Equal "$($after.protectedApiKey)|$($after.policy.rules[0].dumpType)|$($after.tracing.triggers[0].threshold)" "AQAA|Kernel|90" "and keeps the key, the rules and the triggers"
+    Assert-Equal ([IO.File]::ReadAllBytes($configPath)[0]) ([byte][char]'{') "config.json is written without a byte-order mark"
+
+    [IO.File]::WriteAllText($configPath, '{"watchedPaths":["D:\\Soci\u00e9t\u00e9"]}', [Text.UTF8Encoding]::new($false))
+    Set-ConfigReference -ConfigPath $configPath -Reference "client=Caf$([char]0xE9)"
+    $after = [IO.File]::ReadAllText($configPath) | ConvertFrom-Json
+    Assert-Equal "$($after.watchedPaths[0])|$($after.reference)" "D:\Soci$([char]0xE9)t$([char]0xE9)|client=Caf$([char]0xE9)" "non-ASCII paths and labels come through unchanged"
+
+    Set-ConfigReference -ConfigPath $configPath -Reference ""
+    Assert-Equal ((Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json).PSObject.Properties.Name -contains "reference") $false "-Reference '' removes it"
+}
+finally {
+    Remove-Item -LiteralPath $configDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# The tray task's principal is a group, and a group name only resolves on a Windows in the same language (#89: "Users" fails
+# with 0x80070534 on a Swedish PC). It has to be the SID.
+$groupIds = [regex]::Matches($ast.Extent.Text, '-GroupId\s+"([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
+Assert-Equal (@($groupIds) -join ",") "S-1-5-32-545" "the tray task principal is the BUILTIN\Users SID, not a localized group name"
+
 if ($failures.Count -gt 0) {
     Write-Host ""
     $failures | ForEach-Object { Write-Host "FAIL: $_" }

@@ -10,6 +10,20 @@ namespace DumpTriageAgent.Tests;
 public class UploadWorkerServiceTests
 {
     [Fact]
+    public async Task The_configured_reference_goes_with_every_dump_upload()
+    {
+        // dumptriage-tools#77: the label the report webhook echoes (website#3581).
+        await using var h = await WorkerHarness.CreateAsync(reference: " client=Acme ");
+        await h.AddDumpAsync("a.dmp");
+
+        await h.Worker.TickAsync(CancellationToken.None);
+
+        var body = Assert.Single(h.Server.Bodies);
+        Assert.Contains("name=reference", body);
+        Assert.Contains("\r\n\r\nclient=Acme\r\n", body); // trimmed
+    }
+
+    [Fact]
     public async Task Manual_submit_while_paused_queues_the_dump_without_uploading()
     {
         // website#1492: a manual submit ran fire-and-forget straight from the pipe
@@ -90,6 +104,51 @@ public class UploadWorkerServiceTests
 
         await h.Worker.TickAsync(CancellationToken.None);
         Assert.Single(h.Server.Requests); // still held
+    }
+
+    [Fact]
+    public async Task A_short_429_holds_the_queue_for_its_Retry_After_without_spending_retries()
+    {
+        // dumptriage-tools#73: the website's uploads-in-progress 429 (Retry-After 60) was held for 6 hours as a spent quota.
+        await using var h = await WorkerHarness.CreateAsync();
+        var first = await h.AddDumpAsync("a.dmp");
+        var second = await h.AddDumpAsync("b.dmp");
+        h.Server.RespondWith(
+            HttpStatusCode.TooManyRequests,
+            "{\"detail\":\"this account already has 4 uploads in progress; wait for one to finish, then retry\"}",
+            retryAfter: "60");
+
+        await h.Worker.TickAsync(CancellationToken.None);
+
+        Assert.Single(h.Server.Requests);
+        foreach (var record in new[] { first, second })
+        {
+            var reloaded = await h.ReloadAsync(record);
+            Assert.Equal(DumpQueueState.Queued, reloaded.State);
+            Assert.Equal(0, reloaded.RetryCount);
+        }
+        var now = DateTimeOffset.UtcNow;
+        var hold = h.State.ActiveUploadHold(now);
+        Assert.NotNull(hold);
+        Assert.Contains("retry in 60 s", hold.Reason);
+        Assert.InRange((hold.UntilUtc - now).TotalSeconds, 50, 61); // a minute, not 6 hours
+
+        await h.Worker.TickAsync(CancellationToken.None);
+        Assert.Single(h.Server.Requests); // still waiting
+    }
+
+    [Theory]
+    [InlineData(null, 5)]
+    [InlineData(0, 5)]
+    [InlineData(2, 5)]
+    [InlineData(60, 60)]
+    [InlineData(300, 300)]
+    [InlineData(301, 300)]
+    public void The_wait_after_a_short_429_stays_between_five_seconds_and_five_minutes(int? seconds, int expected)
+    {
+        var wait = UploadWorkerService.RateLimitHoldFor(seconds is null ? null : TimeSpan.FromSeconds(seconds.Value));
+
+        Assert.Equal(TimeSpan.FromSeconds(expected), wait);
     }
 
     [Fact]

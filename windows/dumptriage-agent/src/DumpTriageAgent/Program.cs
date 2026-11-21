@@ -102,6 +102,12 @@ try
         Log.Fatal("apiBaseUrl must be an https URL (plain http only to this machine), got {ApiBaseUrl}", config.ApiBaseUrl);
         return 1;
     }
+    if (config.ReferenceProblem() is { } referenceProblem)
+    {
+        // Every upload would be refused for good (422 reference_too_long): stop here, where it shows.
+        Log.Fatal("{ConfigPath}: {Problem}", configPath, referenceProblem);
+        return 1;
+    }
     var queueStore = await DumpQueueStore.OpenAsync(
         dbPath, new Serilog.Extensions.Logging.SerilogLoggerFactory(Log.Logger).CreateLogger<DumpQueueStore>());
 

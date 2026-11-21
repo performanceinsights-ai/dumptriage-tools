@@ -22,6 +22,7 @@ jobs:
       - run: bash -n linux/configure-dumps.sh linux/configure-tracing.sh linux/dumptriage-agent/installer/*.sh
       - run: bash linux/tests/test_configure_tracing.sh
       - run: bash linux/tests/test_install_perfetto.sh
+      - run: bash linux/tests/test_install_reference.sh
 
   windows-agent-common:
     runs-on: ubuntu-latest

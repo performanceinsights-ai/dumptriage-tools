@@ -18,16 +18,25 @@ internal sealed class FakeServer : HttpMessageHandler
 {
     public List<(HttpRequestMessage Request, long BodyBytes)> Requests { get; } = new();
 
+    /// <summary>Each request's body as text, in order (the dump bytes come out garbled; the form fields read fine).</summary>
+    public List<string> Bodies { get; } = new();
+
     public Func<HttpRequestMessage, Task<HttpResponseMessage>> Respond { get; set; } =
         _ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.Created) { Content = new StringContent("{}") });
 
-    public void RespondWith(HttpStatusCode status, string body = "{}") =>
-        Respond = _ => Task.FromResult(new HttpResponseMessage(status) { Content = new StringContent(body) });
+    public void RespondWith(HttpStatusCode status, string body = "{}", string? retryAfter = null) =>
+        Respond = _ =>
+        {
+            var response = new HttpResponseMessage(status) { Content = new StringContent(body) };
+            if (retryAfter is not null) response.Headers.TryAddWithoutValidation("Retry-After", retryAfter);
+            return Task.FromResult(response);
+        };
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         var body = request.Content is null ? Array.Empty<byte>() : await request.Content.ReadAsByteArrayAsync(cancellationToken);
         Requests.Add((request, body.LongLength));
+        Bodies.Add(System.Text.Encoding.UTF8.GetString(body));
         return await Respond(request);
     }
 }
@@ -57,7 +66,7 @@ internal sealed class WorkerHarness : IAsyncDisposable
     /// flushes. True: a fresh install, which waits for its first slot (dumptriage-tools#9).
     /// </param>
     public static async Task<WorkerHarness> CreateAsync(
-        CentralCopyConfig? centralCopy = null, BatchingConfig? batching = null, bool firstRun = false)
+        CentralCopyConfig? centralCopy = null, BatchingConfig? batching = null, bool firstRun = false, string? reference = null)
     {
         var dir = Path.Combine(Path.GetTempPath(), "dt-agent-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
@@ -71,6 +80,7 @@ internal sealed class WorkerHarness : IAsyncDisposable
         var config = new AgentConfig
         {
             ProtectedApiKey = "dts_key",
+            Reference = reference,
             CentralCopy = centralCopy ?? new CentralCopyConfig(),
             Policy = new AgentPolicyConfig { Batching = batching ?? new BatchingConfig() },
         };
