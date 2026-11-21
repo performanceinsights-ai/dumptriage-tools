@@ -95,6 +95,13 @@ Log.Logger = new LoggerConfiguration()
 try
 {
     var config = await ConfigLoader.LoadOrCreateDefaultAsync(configPath);
+    // The service is what sends the key and the dumps: it won't start toward a plain-http host (dumptriage-tools#60).
+    // --set-api-key-stdin above still works, so a key can be stored while the URL is being fixed.
+    if (!AgentConfig.IsSecureApiUrl(config.ApiBaseUrl))
+    {
+        Log.Fatal("apiBaseUrl must be an https URL (plain http only to this machine), got {ApiBaseUrl}", config.ApiBaseUrl);
+        return 1;
+    }
     if (config.ReferenceProblem() is { } referenceProblem)
     {
         // Every upload would be refused for good (422 reference_too_long): stop here, where it shows.

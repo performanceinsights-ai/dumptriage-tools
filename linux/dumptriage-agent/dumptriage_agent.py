@@ -21,6 +21,7 @@ import errno
 import fnmatch
 import hashlib
 import http.client
+import ipaddress
 import json
 import logging
 import lzma
@@ -308,6 +309,48 @@ def load_config(path):
     return DEFAULT_CONFIG
 
 
+def insecure_api_url_message(url):
+    return f"apiBaseUrl must be an https URL (plain http only to this machine), got {url!r}"
+
+
+def secure_api_url(url):
+    """https, or plain http to this machine only (a local test backend): the API key and the dump travel in the
+    request, so anything else would send them in clear (dumptriage-tools#60). Invoke-DumpTriageCollect.ps1's
+    Test-ApiBaseUrl is the same rule; install.sh calls this one."""
+    if not isinstance(url, str):
+        return False
+    try:
+        u = urllib.parse.urlsplit(url)  # a malformed [host] raises here
+        u.port  # and a malformed port here, not halfway into an upload
+    except ValueError:
+        return False
+    if u.scheme == "https" and u.hostname:
+        return True
+    if u.scheme != "http" or not u.hostname:
+        return False
+    if u.hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(u.hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def api_connection(base_url, timeout):
+    if not secure_api_url(base_url):
+        raise ValueError(f"refusing to send the API key: {insecure_api_url_message(base_url)}")
+    u = urllib.parse.urlsplit(base_url)
+    conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+    # An IPv6 literal keeps its brackets: bare, http.client would read "::1"'s last ":1" as the port.
+    host = f"[{u.hostname}]" if ":" in u.hostname else u.hostname
+    return conn_cls(host, u.port, timeout=timeout), u.path.rstrip("/")
+
+
+def form_value(value):
+    """A multipart header value: no quote, CR or LF, so a file or host name can't end the header early."""
+    return value.replace('"', "").replace("\r", "").replace("\n", "")
+
+
 def default_dirs():
     if os.geteuid() == 0:
         return Path("/etc/dumptriage"), Path("/var/lib/dumptriage")
@@ -464,6 +507,9 @@ SUCCESS, REJECTED, QUOTA, AUTH, TRANSIENT = "success", "rejected", "quota", "aut
 # so neither spends a retry. An uploader returns (outcome, status, message, retry_after): the Retry-After in seconds
 # for these two, else None. (Fakes in tests may return the first three only.)
 HOLD, BUSY = "hold", "busy"
+# The agent's own config is wrong (an insecure apiBaseUrl): not the dump's fault, so no attempt is used, and not the
+# key's, so no key pause either (dumptriage-tools#60).
+CONFIG = "config"
 AUTH_BACKOFF_SECONDS = 600
 QUOTA_HOLD_SECONDS = 6 * 3600
 SHORT_RETRY_AFTER_MAX = 300
@@ -514,22 +560,23 @@ def upload_dump(base_url, api_key, path, hostname, name=None, timeout=1800, refe
     """Stream one file to POST /api/v1/dumps as multipart/form-data (same request
     as the web uploader and the Windows agent), named `name` (default: the path's
     basename), with the `reference` label when one is set. Returns (outcome, status, message, retry_after)."""
-    u = urllib.parse.urlsplit(base_url)
     boundary = uuid.uuid4().hex
     pre = b""
     if hostname:
         pre += (f'--{boundary}\r\nContent-Disposition: form-data; name="hostname"\r\n\r\n{hostname}\r\n').encode()
     if reference:  # before the file, so the service can refuse a bad one without reading the dump
         pre += (f'--{boundary}\r\nContent-Disposition: form-data; name="reference"\r\n\r\n{reference}\r\n').encode()
-    name = (name or os.path.basename(path)).replace('"', "")
+    name = form_value(name or os.path.basename(path))
     pre += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
             "Content-Type: application/octet-stream\r\n\r\n").encode()
     post = f"\r\n--{boundary}--\r\n".encode()
     size = os.path.getsize(path)
-    conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
-    conn = conn_cls(u.hostname, u.port, timeout=timeout)
     try:
-        conn.putrequest("POST", (u.path.rstrip("/") or "") + "/api/v1/dumps")
+        conn, prefix = api_connection(base_url, timeout)
+    except ValueError as e:  # `run` refuses such a config first; this is the last guard
+        return CONFIG, None, str(e), None
+    try:
+        conn.putrequest("POST", prefix + "/api/v1/dumps")
         conn.putheader("Authorization", f"Bearer {api_key}")
         conn.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
         conn.putheader("Content-Length", str(len(pre) + size + len(post)))
@@ -934,21 +981,22 @@ def fold_perf_script(lines, window_sec=None):
 def upload_trace(base_url, api_key, path, manifest_json, hostname, name="trace.folded", timeout=600, content_type="text/plain"):
     """POST /api/v1/traces as multipart/form-data: the manifest.json text, the optional hostname and the folded
     stacks as `file`. Returns (outcome, status, message, retry_after), like upload_dump."""
-    u = urllib.parse.urlsplit(base_url)
     boundary = uuid.uuid4().hex
     pre = b""
     for field, value in (("manifest", manifest_json), ("hostname", hostname)):
         if value:
             pre += f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"\r\n\r\n{value}\r\n'.encode()
-    name = name.replace('"', "")
+    name = form_value(name)
     pre += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
             f"Content-Type: {content_type}\r\n\r\n").encode()
     post = f"\r\n--{boundary}--\r\n".encode()
     size = os.path.getsize(path)
-    conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
-    conn = conn_cls(u.hostname, u.port, timeout=timeout)
     try:
-        conn.putrequest("POST", (u.path.rstrip("/") or "") + "/api/v1/traces")
+        conn, prefix = api_connection(base_url, timeout)
+    except ValueError as e:  # `run` refuses such a config first; this is the last guard
+        return CONFIG, None, str(e), None
+    try:
+        conn.putrequest("POST", prefix + "/api/v1/traces")
         conn.putheader("Authorization", f"Bearer {api_key}")
         conn.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
         conn.putheader("Content-Length", str(len(pre) + size + len(post)))
@@ -1577,6 +1625,9 @@ class Agent:
         elif outcome in (REJECTED, QUOTA):
             log.warning("%s %s rejected (%s): %s", r["kind"], r["file_path"], status, msg)
             self.queue.update(r["id"], state=FAILED, last_error=f"{status}: {msg}")
+        elif outcome == CONFIG:
+            log.error("%s %s not sent: %s", r["kind"], r["file_path"], msg)
+            self.queue.update(r["id"], state=QUEUED, last_error=msg)
         elif outcome in (BUSY, HOLD):
             # Not the dump's fault and no attempt used (#73): a 429 is the account's limit of uploads in progress or
             # request rate (wait the Retry-After) or the monthly quota (resets). The dump stays queued and the whole
@@ -2092,6 +2143,12 @@ def main(argv=None):
         return 0
 
     cfg = load_config(config_dir / "config.json")
+    if not secure_api_url(cfg["apiBaseUrl"]):
+        # The daemon is what sends: it refuses to start. The other commands only read or change the local queue.
+        if args.cmd == "run":
+            raise SystemExit(insecure_api_url_message(cfg["apiBaseUrl"]))
+        print(f"warning: {insecure_api_url_message(cfg['apiBaseUrl'])}; the agent won't send until it is",
+              file=sys.stderr)
     try:
         config_reference(cfg.get("reference"))
     except ValueError as e:
