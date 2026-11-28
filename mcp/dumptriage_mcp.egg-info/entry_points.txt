@@ -1,2 +1,0 @@
-[console_scripts]
-dumptriage-mcp = dumptriage_mcp.__main__:main
