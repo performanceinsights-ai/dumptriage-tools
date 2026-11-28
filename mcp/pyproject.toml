@@ -1,0 +1,25 @@
+[project]
+name = "dumptriage-mcp"
+version = "0.1.0"
+description = "MCP server for DumpTriage: upload crash dumps and read root-cause reports from a coding agent"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+# Same cap as mcp-linux and mcp-windbg: a breaking SDK major must not land unannounced.
+dependencies = ["mcp>=2.1.1,<3.0.0", "httpx>=0.27,<1.0"]
+
+[project.scripts]
+dumptriage-mcp = "dumptriage_mcp.__main__:main"
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["dumptriage_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

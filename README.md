@@ -38,6 +38,11 @@ notify only, or rules), and upload them to the DumpTriage API.
 An agent needs an API key from [DumpTriage](https://performanceinsights.ai/); the
 [API docs](https://performanceinsights.ai/api-docs/) describe the endpoints it uses.
 
+## Coding agents
+
+[`mcp/`](mcp/): an MCP server for Claude Code, Cursor, Codex and other MCP clients. The agent uploads a dump from your
+disk, waits for the analysis and reads the report. Set up with one `claude mcp add` line ([setup](mcp/README.md)).
+
 ## Downloads
 
 Every [release](https://github.com/performanceinsights-ai/dumptriage-tools/releases/latest) carries each script
@@ -78,6 +83,7 @@ dotnet test windows/dumptriage-agent/tests/DumpTriageAgent.Tests
 pwsh -NoProfile -File windows/dumptriage-agent/installer/tests/Test-Install.ps1
 bash macos/tests/test_collect.sh
 bash linux/tests/test_configure_tracing.sh
+(cd mcp && python3 -m pytest tests -q)   # needs mcp, httpx, pytest and pytest-asyncio installed
 bash linux/tests/test_install_perfetto.sh
 pwsh -NoProfile -File rmm/ninjaone/tests/Run-Tests.ps1
 ```
